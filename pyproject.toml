@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trading-system"
+version = "0.1.0"
+description = "AI-assisted market analysis and paper-trading research system (Day 1 foundation)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pandas==3.0.5",
+    "numpy==2.4.6",
+    "SQLAlchemy==2.0.52",
+    "python-dotenv==1.2.3",
+    "requests==2.34.2",
+    "tabulate==0.10.0",
+    "pydantic==2.13.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==9.1.1"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
