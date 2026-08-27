@@ -134,6 +134,135 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_providers(args: argparse.Namespace) -> int:
+    from tabulate import tabulate
+    from .data.provider_exports import get_provider
+
+    rows = []
+    for name in ("binance", "stooq", "fyers"):
+        try:
+            p = get_provider(name)
+            rows.append([name, p.name, p.has_historical, p.is_real_time])
+        except Exception as e:  # pragma: no cover
+            rows.append([name, "ERROR", "-", str(e)[:40]])
+    print(tabulate(rows, headers=["provider", "name", "historical", "real_time"],
+                  tablefmt="github"))
+    return 0
+
+
+def _cmd_instruments(args: argparse.Namespace) -> int:
+    from tabulate import tabulate
+    from .india import InstrumentRegistry, to_fyers_symbol
+
+    reg = InstrumentRegistry()
+    rows = []
+    for instr in reg._by_key.values():
+        fy = to_fyers_symbol(instr)
+        rows.append([instr.key, instr.instrument_type.value, fy])
+    print(tabulate(rows, headers=["internal", "type", "fyers_symbol"], tablefmt="github"))
+    return 0
+
+
+def _cmd_ingest_india(args: argparse.Namespace) -> int:
+    from tabulate import tabulate
+    from .data.provider_exports import get_provider
+    from .india import InstrumentRegistry
+
+    provider = get_provider(args.provider or settings.market.provider)
+    reg = InstrumentRegistry()
+    symbols = args.symbols.split(",") if args.symbols else []
+    tf = args.timeframe or "1d"
+    limit = args.limit
+
+    print(f"Ingesting Indian market data via '{provider.name}' "
+          f"(provider credentials required for live FYERS)...")
+    results = []
+    for sym in symbols:
+        instr = reg.resolve(sym)
+        fy_sym = None
+        try:
+            fy_sym = provider._fyers_symbol(sym) if hasattr(provider, "_fyers_symbol") else sym
+        except Exception:
+            fy_sym = sym
+        # Historical fetch requires auth for FYERS; Binance works without.
+        try:
+            df = provider.get_historical(sym, tf, limit)
+            received = len(df)
+            rows = [
+                {
+                    "symbol": sym,
+                    "timeframe": tf,
+                    "timestamp": ts,
+                    "open": float(r["open"]),
+                    "high": float(r["high"]),
+                    "low": float(r["low"]),
+                    "close": float(r["close"]),
+                    "volume": float(r["volume"]),
+                    "provider": provider.name,
+                    "exchange": instr.internal.exchange,
+                }
+                for ts, r in df.iterrows()
+            ]
+            inserted = _store().upsert_many(rows)
+            results.append({
+                "symbol": sym, "fyers": fy_sym, "received": received,
+                "inserted": inserted, "error": None,
+            })
+        except Exception as e:
+            results.append({
+                "symbol": sym, "fyers": fy_sym, "received": 0,
+                "inserted": 0, "error": f"{type(e).__name__}: {e}",
+            })
+    print("\n" + tabulate(results, headers="keys", tablefmt="github") + "\n")
+    failed = [r for r in results if r["error"]]
+    if failed:
+        for r in failed:
+            print(f"FAILED {r['symbol']}: {r['error']}", file=sys.stderr)
+        return 1
+    print("Indian-market ingestion complete (use 'status' to verify).")
+    return 0
+
+
+def _cmd_live(args: argparse.Namespace) -> int:
+    """Connect to FYERS live data, normalize + log events, then shut down.
+
+    Does NOT place orders. Requires FYERS_CLIENT_ID + FYERS_ACCESS_TOKEN in env.
+    If credentials are absent, exits with a clear, controlled message.
+    """
+    import time as _time
+    from .data.provider_exports import get_provider
+
+    provider = get_provider(args.provider or "fyers")
+    if not getattr(provider, "is_authenticated", False):
+        print("FYERS runtime verification blocked because credentials were not "
+              "available (set FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN).")
+        return 1
+
+    print(f"Connecting to FYERS live for: {args.symbols} (max {args.duration}s)...")
+    received = {"n": 0}
+
+    def on_event(ev):
+        received["n"] += 1
+        print(f"  [{ev.timestamp.isoformat()}] {ev.symbol} "
+              f"ltp={ev.ltp} high={ev.high} low={ev.low} close={ev.close} vol={ev.volume}")
+
+    try:
+        sock = provider.connect_live(
+            symbols=args.symbols.split(","), on_event=on_event,
+            timeframe=args.timeframe or "1m", lite_mode=args.lite,
+        )
+    except Exception as e:
+        print(f"LIVE CONNECT FAILED: {e}")
+        return 1
+
+    try:
+        _time.sleep(args.duration)
+    finally:
+        sock.close()
+    print(f"Live session ended. Events received: {received['n']}.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="trading_system")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -157,6 +286,22 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="Show config (no secrets) and stored counts")
 
+    sub.add_parser("providers", help="List available market-data providers")
+    sub.add_parser("instruments", help="List known Indian instruments + FYERS symbols")
+
+    p_in = sub.add_parser("ingest-india", help="Ingest Indian-market historical data")
+    p_in.add_argument("--symbols", required=True, help="Comma-separated INTERNAL symbols, e.g. NSE:RELIANCE,NSE:NIFTY50")
+    p_in.add_argument("--timeframe", default="1d")
+    p_in.add_argument("--limit", type=int, default=365)
+    p_in.add_argument("--provider", default="fyers")
+
+    p_lv = sub.add_parser("live", help="Connect FYERS live data (no orders placed)")
+    p_lv.add_argument("--symbols", required=True, help="Comma-separated INTERNAL symbols")
+    p_lv.add_argument("--timeframe", default="1m")
+    p_lv.add_argument("--duration", type=int, default=15, help="seconds to run")
+    p_lv.add_argument("--lite", action="store_true", help="Lite (LTP-only) mode")
+    p_lv.add_argument("--provider", default="fyers")
+
     args = parser.parse_args(argv)
     configure_logging()
     if args.command == "ingest":
@@ -167,6 +312,14 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_ai_analyze(args)
     if args.command == "status":
         return _cmd_status(args)
+    if args.command == "providers":
+        return _cmd_providers(args)
+    if args.command == "instruments":
+        return _cmd_instruments(args)
+    if args.command == "ingest-india":
+        return _cmd_ingest_india(args)
+    if args.command == "live":
+        return _cmd_live(args)
     parser.print_help()
     return 1
 

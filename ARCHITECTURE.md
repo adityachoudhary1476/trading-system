@@ -29,13 +29,22 @@ data source.
                  │   • idempotent upsert (no duplicates)        │
                  └───────────────────────┬─────────────────────┘
                                          ▼
-                 ┌─────────────────────────────────────────────┐
-   QUANT /       │  quant.py  +  indicators.py                 │
-   INDICATORS    │   returns, vol, drawdown, volume stats      │
-                 │   SMA/EMA/RSI/MACD/Bollinger/ATR             │
-                 │   (deterministic, tested)                    │
-                 └───────────────────────┬─────────────────────┘
-                                         ▼
+   ┌─────────────────────────────────────────────┐
+   INDIAN MARKET  │  india.FYERSMarketDataProvider (primary)   │
+   DATA           │  + instruments / symbol_map / calendar     │
+   (primary)      │  + CandleAggregator / events               │
+                  └───────────────────────┬─────────────────────┘
+                                          ▼
+                  ┌─────────────────────────────────────────────┐
+   (dev/test)     │  BinanceProvider / StooqProvider            │
+                  └───────────────────────┬─────────────────────┘
+                                          ▼
+                 NORMALIZED OHLCV (tz-aware UTC) ──► VALIDATION ──► STORAGE
+                                          ▼
+                 QUANT / INDICATORS ─► MARKET SNAPSHOT ─► AI ANALYST ─► SIGNAL
+                                          ▼
+   RISK MGMT ─► BACKTESTER ─► PAPER TRADING ─► TELEGRAM / DASHBOARD
+   (Day 3+)      (Day 3+)       (Day 3+)          (wired/disabled)
                  ┌─────────────────────────────────────────────┐
    SNAPSHOT      │  models.snapshot.MarketSnapshot (Pydantic)  │
    (structured)  │   validated, tz-aware, NO-LOOK-AHEAD        │
@@ -83,7 +92,8 @@ data source.
 | Package | Responsibility | Day 1 state |
 |---|---|---|
 | `config/` | Settings, env-driven config, logging | done |
-| `data/` | Provider interface, Binance/Stooq, validation, ingestion pipeline | done |
+| `india/` | Indian market layer: FYERS adapter, instrument model, symbol normalization, market calendar, candle aggregator, normalized events | Day 3 |
+| `data/` | Provider interface, Binance/Stooq/FYERS adapters, validation, ingestion pipeline | done |
 | `storage/` | SQLAlchemy SQLite store, idempotent upsert | done |
 | `analysis/` | Quant metrics + analysis pipeline | done |
 | `indicators/` | Technical indicators | done |

@@ -24,13 +24,39 @@ engine.
 
 ## Current data limitations
 
-- **Crypto only** (Binance). No equities/forex yet.
-- Binance klines: the latest candle is the live/open bar; treat it as
-  *near-real-time but provisional*. We do not claim millisecond real-time.
-- Free public endpoint: generous rate limits (weight-based, ~6000/min) but
-  subject to Binance terms. Not for commercial redistribution of the raw feed.
-- Only daily (`1d`) ingestion was exercised end-to-end; other intervals are
-  supported by the provider but untested at scale.
+- **Primary target is now Indian markets (FYERS).** Binance remains the dev/test provider.
+- FYERS historical (`/history`) is **not real-time** — it is for historical candles only.
+- FYERS **pricing/data-feed fee is UNVERIFIED** as of Day 3; do not assume free. Requires an active FYERS account.
+- Live WebSocket requires `FYERS_CLIENT_ID` + `FYERS_ACCESS_TOKEN` (OAuth2). Not tested live on Day 3 (no credentials in env).
+- Only daily (`1d`) ingestion was exercised via fixtures; other intervals are supported by mapping but untested against the live API.
+- SEBI algo rules: order placement (future work) requires a validated static IP; data-only use is unaffected.
+
+## Indian-market setup
+
+```bash
+pip install -r requirements.txt
+cp .env.example .env
+# Edit .env: set MARKET_DATA_PROVIDER=fyers and (for live data) FYERS_CLIENT_ID / FYERS_ACCESS_TOKEN
+PYTHONPATH=src python -m trading_system providers        # confirm fyers is registered
+PYTHONPATH=src python -m trading_system instruments      # see NSE:SYMBOL -> FYERS symbol map
+```
+
+Ingestion (requires FYERS credentials for live Indian data; Binance works without):
+```bash
+PYTHONPATH=src python -m trading_system ingest-india --symbols NSE:RELIANCE,NSE:NIFTY50 --timeframe 1d
+```
+
+Live data (no orders placed):
+```bash
+PYTHONPATH=src python -m trading_system live --symbols NSE:SBIN --duration 15
+# Without credentials it prints: "FYERS runtime verification blocked because credentials were not available."
+```
+
+## Running tests
+
+```bash
+pytest            # 80 tests, must pass
+```
 
 ## Installation
 

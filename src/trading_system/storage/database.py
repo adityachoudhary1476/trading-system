@@ -42,6 +42,7 @@ class OHLCVRecord(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     symbol = Column(String(32), nullable=False, index=True)
     timeframe = Column(String(8), nullable=False, index=True)
+    exchange = Column(String(16), nullable=True, index=True)
     timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     open = Column(Float, nullable=False)
     high = Column(Float, nullable=False)
