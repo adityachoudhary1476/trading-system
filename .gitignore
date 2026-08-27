@@ -12,6 +12,7 @@ venv/
 
 # Secrets — never commit
 .env
+.env.backup
 
 # Data & logs (local artifacts)
 data/*.db
@@ -19,6 +20,8 @@ data/*.db-journal
 data/*.sqlite
 logs/*.log
 logs/*.log.*
+fyersDataSocket.log
+*.log
 
 # Test / tooling caches
 .pytest_cache/

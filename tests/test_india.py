@@ -21,7 +21,7 @@ from trading_system.india import (
     InternalMarketEvent,
     EventType,
 )
-from trading_system.india.fyers import FYERSMarketDataProvider
+from trading_system.india.fyers import FYERSMarketDataProvider, FyersDataSocket
 from trading_system.data.provider_exports import get_provider
 from trading_system.data.validation import validate_ohlcv
 from zoneinfo import ZoneInfo
@@ -161,9 +161,13 @@ def test_fyers_historical_normalization_shape(monkeypatch):
     assert report.ok
 
 
-def test_fyers_requires_auth_for_live():
-    prov = FYERSMarketDataProvider()  # no creds
+def test_fyers_requires_auth_for_live(monkeypatch):
+    monkeypatch.delenv("FYERS_CLIENT_ID", raising=False)
+    monkeypatch.delenv("FYERS_ACCESS_TOKEN", raising=False)
+
+    prov = FYERSMarketDataProvider()
     assert not prov.is_authenticated
+
     with pytest.raises(RuntimeError):
         prov.connect_live(["NSE:SBIN"], on_event=lambda e: None)
 
@@ -177,9 +181,15 @@ def test_fyers_symbol_resolution_without_creds():
 
 def test_fyers_ws_message_normalization(monkeypatch):
     prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
-    # A symbolUpdate-style message (best-effort shape).
-    msg = {"T": "t", "symbol": "NSE:SBIN-EQ", "v": {"lp": 555.5, "o": 550, "h": 560, "l": 548, "c": 555, "vol": 123}}
-    ev = prov._normalize_ws(msg, ["NSE:SBIN-EQ"])
+    # Build a socket-like object (bypass the real-SDK __init__).
+    sock = object.__new__(FyersDataSocket)
+    sock._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+    sock.provider = prov
+    sock.on_event = None
+    # Real SDK-decoded market dict (binary protobuf -> plain dict).
+    msg = {"symbol": "NSE:SBIN-EQ", "ltp": 555.5, "open_price": 550.0,
+           "high_price": 560.0, "low_price": 548.0, "vol_traded_today": 123.0, "type": "sf"}
+    ev = sock._normalize(msg)
     assert isinstance(ev, InternalMarketEvent)
     assert ev.symbol == "NSE:SBIN"
     assert ev.ltp == 555.5
@@ -188,9 +198,14 @@ def test_fyers_ws_message_normalization(monkeypatch):
 
 def test_fyers_ws_control_frame_skipped():
     prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
-    # Auth/subscribe/heartbeat frames must return None.
-    assert prov._normalize_ws({"T": "c", "authorization": "x"}, []) is None
-    assert prov._normalize_ws({"T": "h"}, []) is None
+    sock = object.__new__(FyersDataSocket)
+    sock._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+    sock.provider = prov
+    sock.on_event = None
+    # Control/response frames (no symbol / no price) must return None.
+    assert sock._normalize({"type": "ack"}) is None
+    assert sock._normalize({"type": "auth_ack"}) is None
+    assert sock._normalize("garbage") is None
 
 
 # --- Provider abstraction integrity ---

@@ -36,6 +36,7 @@ from .closed_candle_pipeline import (
     CandleState,
 )
 from .data_health import DataHealthMonitor, FeedStatus
+from .live_pipeline import LiveMarketPipeline, bootstrap_historical
 
 __all__ = [
     "Exchange",
@@ -74,4 +75,6 @@ __all__ = [
     "CandleState",
     "DataHealthMonitor",
     "FeedStatus",
+    "LiveMarketPipeline",
+    "bootstrap_historical",
 ]

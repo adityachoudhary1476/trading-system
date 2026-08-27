@@ -100,6 +100,30 @@ class CandleAggregator:
         """The currently-forming (provisional) bar. Never treat as closed."""
         return self._current
 
+    def seed_bar(
+        self,
+        start: datetime,
+        open: float,
+        high: float,
+        low: float,
+        close: float,
+        volume: float = 0.0,
+    ) -> None:
+        """Inject an already-closed bar (e.g. from historical bootstrap).
+
+        Appended to the completed queue so downstream snapshots reflect real
+        OHLC without re-aggregating from ticks. The current provisional bar is
+        left untouched so live ticks continue from the last close.
+        """
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=__import__("datetime").timezone.utc)
+        self._completed.append(
+            AggregatedBar(
+                start=start, open=open, high=high, low=low, close=close,
+                volume=volume, ticks=1,
+            )
+        )
+
     def flush_completed(self) -> list[AggregatedBar]:
         out = list(self._completed)
         self._completed.clear()

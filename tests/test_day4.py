@@ -309,55 +309,46 @@ def test_health_monitor_lifecycle():
 # --------------------------------------------------------------------------- #
 # WebSocket reconnection (deterministic, no real socket)
 # --------------------------------------------------------------------------- #
-def _make_socket(max_retries=2):
+def _make_socket():
+    """Build a FyersDataSocket whose real-SDK constructor is bypassed.
+
+    The production socket wraps the official fyers_apiv3 SDK (binary protobuf).
+    For deterministic tests we stub only the normalization + lifecycle hooks —
+    we do NOT open a network connection and we do NOT re-implement reconnect (the
+    SDK owns reconnect with bounded backoff).
+    """
     prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
-    # auto_connect=False so __init__ does not open a network socket.
-    sock = FyersDataSocket(
-        client_id="X-100", access_token="tok", provider=prov,
-        symbols=["NSE:SBIN-EQ"], on_event=lambda e: None,
-        auto_connect=False, max_retries=max_retries,
-    )
+    sock = object.__new__(FyersDataSocket)
+    sock._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+    sock.provider = prov
+    sock.on_event = lambda e: None
+    sock._closed = False
+    sock._on_connect_cb = None
+    sock._on_disconnect_cb = None
+    sock._on_auth_error_cb = None
+    sock._on_invalid_cb = None
     return sock
-
-
-class _FakeWS:
-    def __init__(self):
-        self.sent = []
-
-    def send(self, payload):
-        self.sent.append(payload)
-
-
-def test_ws_auth_and_subscribe_on_open():
-    sock = _make_socket()
-    ws = _FakeWS()
-    sock._on_open(ws)
-    assert any("authorization" in s for s in ws.sent)
 
 
 def test_ws_normalizes_symbol_update():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    sock._on_message(None, str(fyers_ws_symbol_update()).replace("'", '"'))
+    sock._on_sdk_message(fyers_ws_symbol_update())
     assert len(received) == 1
     assert received[0].symbol == "NSE:SBIN"
+    assert received[0].ltp == 123.45
 
 
 def test_ws_drops_malformed_json():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    sock._on_message(None, fyers_ws_malformed())
-    assert received == []  # malformed dropped, no crash
-
-
-def test_ws_skips_heartbeat_and_auth_ack():
-    sock = _make_socket()
-    received = []
-    sock.on_event = lambda e: received.append(e)
-    sock._on_message(None, str(fyers_ws_heartbeat()).replace("'", '"'))
-    sock._on_message(None, str(fyers_ws_auth_ack()).replace("'", '"'))
+    # non-dict / control frames are skipped, never crash
+    assert sock._normalize("not-a-dict") is None
+    sock._on_sdk_message(fyers_ws_malformed())  # dict without 'symbol'
+    sock._on_sdk_message(fyers_ws_heartbeat())  # control frame
+    sock._on_sdk_message(fyers_ws_auth_ack())   # control frame
     assert received == []
 
 
@@ -365,28 +356,30 @@ def test_ws_unknown_type_skipped():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    sock._on_message(None, str(fyers_ws_unknown_type()).replace("'", '"'))
+    sock._on_sdk_message(fyers_ws_unknown_type())
     assert received == []
 
 
-def test_ws_reconnect_exponential_backoff_and_cap(monkeypatch):
-    sock = _make_socket(max_retries=2)
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    # Prevent actual socket re-open from doing network work.
-    monkeypatch.setattr(sock, "_open", lambda: None)
-    sock._schedule_reconnect()  # attempt 1
-    sock._schedule_reconnect()  # attempt 2
-    sock._schedule_reconnect()  # attempt 3 -> exceeds cap, no more sleep
-    assert sleeps == [1, 2]  # 2**0, 2**1 (capped, no aggressive spin)
-    assert sock._attempt == 2
+def test_ws_lifecycle_hooks_drive_health():
+    from trading_system.india.data_health import DataHealthMonitor, FeedStatus
+    sock = _make_socket()
+    hm = DataHealthMonitor()
+    sock.on_connect_cb(hm.on_connect)
+    sock.on_disconnect_cb(hm.on_disconnect)
+    sock.on_auth_error_cb(hm.on_auth_error)
+    sock._on_sdk_connect()
+    assert hm.status == FeedStatus.HEALTHY
+    sock._on_sdk_close({"code": 1, "message": "closed"})
+    assert hm.status == FeedStatus.DISCONNECTED
+    # SDK surfaces auth failure via OnError with type AUTH_TYPE.
+    sock._on_sdk_error({"type": "AUTH_TYPE", "code": 803})
+    assert hm.status == FeedStatus.AUTH_ERROR
 
 
-def test_ws_close_does_not_reconnect_when_closed_flag_set(monkeypatch):
-    sock = _make_socket(max_retries=2)
-    sleeps = []
-    monkeypatch.setattr(time, "sleep", lambda s: sleeps.append(s))
-    monkeypatch.setattr(sock, "_open", lambda: None)
-    sock._closed = True
-    sock._on_close(None)  # should not schedule reconnect
-    assert sleeps == []
+def test_ws_reconnect_owned_by_sdk_no_spin():
+    """Our socket must not implement its own reconnect spin loop (SDK does)."""
+    sock = _make_socket()
+    assert not hasattr(sock, "_schedule_reconnect")
+    # Double close should not raise or loop.
+    sock._on_sdk_close({"code": 1})
+    sock._on_sdk_close({"code": 1})

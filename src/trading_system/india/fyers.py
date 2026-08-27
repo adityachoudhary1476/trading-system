@@ -97,6 +97,18 @@ class FYERSMarketDataProvider(MarketDataProvider):
             return instr.provider_symbol
         return to_fyers_symbol(instr)
 
+    def _registry_lookup_internal(self, fyers_symbol: str) -> str:
+        """Reverse-map a FYERS wire symbol to an internal key (best effort)."""
+        for instr in self.registry._by_key.values():
+            if instr.provider_symbol == fyers_symbol:
+                return instr.key
+        try:
+            from .symbol_map import from_fyers_symbol
+
+            return from_fyers_symbol(fyers_symbol).key
+        except Exception:
+            return fyers_symbol
+
     # --- historical ---------------------------------------------------------
     def get_historical(
         self,
@@ -157,18 +169,32 @@ class FYERSMarketDataProvider(MarketDataProvider):
     # --- REST helper --------------------------------------------------------
     def _get(self, path: str, params: dict) -> dict:
         url = f"{_DATA_BASE}{path}"
+        headers = {
+            "Authorization": f"{self.client_id}:{self.access_token}",
+        }
+    
         last_err: Optional[Exception] = None
+    
         for attempt in range(self.max_retries):
             try:
-                resp = requests.get(url, params=params, timeout=self.timeout)
+                resp = requests.get(
+                    url,
+                    params=params,
+                    headers=headers,
+                    timeout=self.timeout,
+                )
+    
                 if resp.status_code == 429:
                     time.sleep(2 ** attempt)
                     continue
+    
                 resp.raise_for_status()
                 return resp.json()
+    
             except (requests.RequestException, ValueError) as e:
                 last_err = e
                 time.sleep(1.5 * (attempt + 1))
+    
         raise RuntimeError(f"FYERS request failed after retries: {last_err}")
 
     # --- WebSocket (live) ---------------------------------------------------
@@ -203,11 +229,23 @@ class FYERSMarketDataProvider(MarketDataProvider):
 
 
 class FyersDataSocket:
-    """Thin wrapper around websocket-client for FYERS data socket v2.
+    """Live FYERS data socket, backed by the official ``fyers_apiv3`` SDK.
 
-    Handles auth, subscription, heartbeat, stale-data detection, reconnect with
-    exponential backoff, malformed-message skipping, and normalization into
-    InternalMarketEvent. The AI is never called from this hot path.
+    The real FYERS v3 *data* WebSocket is **binary protobuf**
+    (``wss://socket.fyers.in/hsm/v1-5/prod``): auth is a binary HSM token frame,
+    subscription is binary, and market messages are protobuf ``MarketFeed`` blobs
+    that the SDK decodes into plain dicts (with ``precision``/``multiplier`` already
+    applied). Hand-rolling that framing over raw ``websocket-client`` would never
+    connect, so we deliberately use the vendor SDK as the transport and keep ALL
+    provider-specific behavior inside this file. The SDK also provides its own
+    exponential-backoff reconnect, so we do not re-implement a spin loop.
+
+    What this class owns:
+      * translating internal symbols -> FYERS symbols for subscription,
+      * normalizing the SDK's decoded dict into ``InternalMarketEvent``,
+      * forwarding normalized events to the caller's ``on_event`` callback,
+      * exposing health hooks (on_connect / on_disconnect / on_error).
+    It does NOT call the AI or place orders.
     """
 
     def __init__(
@@ -223,159 +261,163 @@ class FyersDataSocket:
         auto_connect: bool = True,
     ) -> None:
         try:
-            import websocket  # websocket-client
-        except ImportError as e:
+            from fyers_apiv3.FyersWebsocket import data_ws  # official SDK
+        except ImportError as e:  # pragma: no cover - SDK expected installed
             raise RuntimeError(
-                "websocket-client is required for FYERS live data: pip install websocket-client"
+                "fyers_apiv3 is required for FYERS live data: pip install fyers_apiv3"
             ) from e
+
+        if not client_id or not access_token:
+            raise RuntimeError(
+                "FYERS live data requires FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN."
+            )
 
         self.client_id = client_id
         self.access_token = access_token
         self.provider = provider
-        self.symbols = symbols
+        self.internal_symbols = list(symbols)
+        # FYERS wire symbols (e.g. NSE:SBIN-EQ) for subscription.
+        self.fyers_symbols = [provider._fyers_symbol(s) for s in symbols]
         self.on_event = on_event
         self.timeframe = timeframe
         self.lite_mode = lite_mode
         self.max_retries = max_retries
-        self._ws = None
         self._closed = False
-        self._last_msg_ts: Optional[float] = None
-        self._attempt = 0
-        self._ws_mod = websocket
-        self._reconnecting = False
+
+        # The SDK takes the *access token* (not client_id:token) and decodes the
+        # HSM key from it internally. reconnect=True gives bounded backoff.
+        self._ws = data_ws.FyersDataSocket(
+            access_token=access_token,
+            litemode=lite_mode,
+            reconnect=True,
+            reconnect_retry=max_retries,
+            on_message=self._on_sdk_message,
+            on_error=self._on_sdk_error,
+            on_connect=self._on_sdk_connect,
+            on_close=self._on_sdk_close,
+        )
+        # Map by FYERS symbol so reverse-lookup is O(1) in the hot path.
+        self._fy_to_internal = dict(zip(self.fyers_symbols, self.internal_symbols))
         if auto_connect:
-            self._open()
+            self.connect()
 
-    def _auth_frame(self) -> dict:
-        return {
-            "T": "c",
-            "authorization": f"{self.client_id}:{self.access_token}",
-            "src": "py-trading-system",
-            "id": int(time.time()),
-        }
-
-    def _subscribe_frame(self) -> dict:
-        return {"T": "t", "symbols": self.symbols}
-
-    def _open(self) -> None:
-        # Lazy import at connect time keeps import cost out of the hot path.
-        self._ws = self._ws_mod.WebSocketApp(
-            _WS_URL,
-            on_open=self._on_open,
-            on_message=self._on_message,
-            on_error=self._on_error,
-            on_close=self._on_close,
-        )
-        # run_forever with auto-reconnect handled by our own logic (no aggressive loop).
-        import threading
-
-        self._thread = threading.Thread(
-            target=self._ws.run_forever, kwargs={"ping_interval": 20}, daemon=True
-        )
-        self._thread.start()
-
-    def _on_open(self, ws):
-        log.info("FYERS WS open; authenticating")
-        if ws is not None:
-            ws.send(str(self._auth_frame()).replace("'", '"'))
-            ws.send(str(self._subscribe_frame()).replace("'", '"'))
-
-    def _on_message(self, ws, raw: str):
-        self._last_msg_ts = time.time()
-        try:
-            import json
-
-            msg = json.loads(raw)
-        except json.JSONDecodeError:
-            log.warning("FYERS WS malformed message dropped")
+    # -- connection control --------------------------------------------------
+    def connect(self) -> None:
+        if self._closed:
             return
-        event = self.provider._normalize_ws(msg, self.symbols)
-        if event is not None:
+        # SDK subscribe expects the FYERS wire symbols.
+        self._ws.subscribe(self.fyers_symbols, data_type="SymbolUpdate", channel=11)
+        self._ws.connect()
+        log.info("FYERS WS connecting to %d symbol(s)", len(self.fyers_symbols))
+
+    def _on_sdk_connect(self) -> None:
+        log.info("FYERS WS connected & authenticated")
+        if self._on_connect_cb:
+            self._on_connect_cb()
+
+    def _on_sdk_close(self, message: dict | None = None) -> None:
+        log.info("FYERS WS closed: %s", message)
+        if self._closed:
+            return
+        if self._on_disconnect_cb:
+            self._on_disconnect_cb()
+
+    def _on_sdk_error(self, message) -> None:
+        log.error("FYERS WS error: %s", message)
+        # The SDK surfaces auth failures as OnError dicts (type=AUTH_TYPE).
+        msg = message if isinstance(message, dict) else {}
+        if msg.get("type") in ("auth", "AUTH_TYPE") or msg.get("code") in (
+            801, 802, 803, 804, 805,
+        ):
+            if self._on_auth_error_cb:
+                self._on_auth_error_cb()
+        # Malformed/invalid data also arrive here; route to invalid-data hook.
+        elif self._on_invalid_cb:
+            self._on_invalid_cb()
+
+    def _on_sdk_message(self, data: dict) -> None:
+        event = self._normalize(data)
+        if event is not None and self.on_event is not None:
             self.on_event(event)
 
-    def _on_error(self, ws, error):
-        log.error("FYERS WS error: %s", error)
+    # -- health/lifecycle callbacks (set by the live pipeline) ----------------
+    _on_connect_cb = None
+    _on_disconnect_cb = None
+    _on_auth_error_cb = None
+    _on_invalid_cb = None
 
-    def _on_close(self, ws, *args):
-        log.info("FYERS WS closed")
-        if self._closed:
-            return
-        self._schedule_reconnect()
+    def on_connect_cb(self, cb) -> None:
+        self._on_connect_cb = cb
 
-    def _schedule_reconnect(self) -> None:
-        """Exponential backoff reconnect (capped). No aggressive spin."""
-        if self._attempt >= self.max_retries:
-            log.error("FYERS WS max retries reached; giving up")
-            return
-        backoff = min(30, 2 ** self._attempt)
-        self._attempt += 1
-        log.info("FYERS WS reconnect in %ss (attempt %d)", backoff, self._attempt)
-        time.sleep(backoff)
-        if self._closed:
-            return
-        try:
-            self._open()
-        except Exception as e:
-            log.error("FYERS WS reconnect failed: %s", e)
+    def on_disconnect_cb(self, cb) -> None:
+        self._on_disconnect_cb = cb
 
-    def stale(self, now: Optional[float] = None) -> bool:
-        now = now or time.time()
-        if self._last_msg_ts is None:
-            return False
-        return (now - self._last_msg_ts) > 60  # no data for 60s -> stale
+    def on_auth_error_cb(self, cb) -> None:
+        self._on_auth_error_cb = cb
+
+    def on_invalid_cb(self, cb) -> None:
+        self._on_invalid_cb = cb
 
     def close(self) -> None:
         self._closed = True
-        if self._ws is not None:
+        try:
+            self._ws.close_connection()
+        except Exception as e:  # pragma: no cover - best effort
+            log.debug("FYERS WS close error: %s", e)
+
+    # -- normalization (provider-specific) ------------------------------------
+    def _normalize(self, data: dict) -> Optional[InternalMarketEvent]:
+        """Map an SDK-decoded FYERS market dict to a normalized InternalMarketEvent.
+
+        The SDK dict shape (decoded, precision/multiplier applied):
+          litemode : {"symbol": "NSE:SBIN-EQ", "ltp": <float>, "type": "sf", ...}
+          full     : {"symbol", "ltp", "open_price", "high_price", "low_price",
+                      "vol_traded_today", "prev_close_price", "ch", "chp", "type", ...}
+        Control/response frames (no "symbol" or no price) are skipped.
+        """
+        if not isinstance(data, dict):
+            return None
+        fy_sym = data.get("symbol")
+        if not fy_sym:
+            # ack / subscription-response / heartbeat frames: nothing to emit.
+            return None
+        internal = self._fy_to_internal.get(fy_sym)
+        if internal is None:
+            # Reverse-map via registry / best-effort (e.g. unknown index).
             try:
-                self._ws.close()
+                internal = self.provider._registry_lookup_internal(fy_sym)
             except Exception:
-                pass
+                internal = fy_sym
+        exchange = internal.split(":", 1)[0] if ":" in internal else (
+            fy_sym.split(":", 1)[0] if ":" in fy_sym else ""
+        )
+        ltp = _to_float(data.get("ltp"))
+        if ltp is None:
+            return None  # no price yet -> skip (don't emit empty event)
+        ts = datetime.now(timezone.utc)
+        return InternalMarketEvent(
+            event_type=EventType.QUOTE,
+            symbol=internal,
+            exchange=exchange,
+            provider_symbol=fy_sym,
+            timestamp=ts,
+            ltp=ltp,
+            open=_to_float(data.get("open_price")),
+            high=_to_float(data.get("high_price")),
+            low=_to_float(data.get("low_price")),
+            close=ltp,  # FYERS quote has no separate "close"; close == last price
+            volume=_to_float(data.get("vol_traded_today")),
+            raw=data,
+        )
 
 
-# --- WS message normalization (provider-specific) ----------------------------
-def _normalize_ws(self, msg: dict, symbols: list[str]) -> Optional[InternalMarketEvent]:
-    """Map a FYERS socket message to an InternalMarketEvent (best-effort)."""
-    # FYERS symbolUpdate / ltp messages vary; handle the documented shape and
-    # skip control frames (T=c, T=t, T=h heartbeat).
-    t = msg.get("T")
-    if t in ("c", "h", "sub", "unsub"):
+def _to_float(x) -> Optional[float]:
+    if x is None:
         return None
-    # SymbolUpdate: msg has "symbols" list of [symbol, ltp, ...] or "v" payloads.
-    sym_field = msg.get("symbol") or (msg.get("symbols") or [None])[0] if isinstance(msg.get("symbols"), list) else msg.get("symbol")
-    if sym_field is None:
-        return None
-    internal = self.registry.resolve(sym_field).key if False else _lookup_internal(self, sym_field)
-    v = msg.get("v", msg)
-    ts = datetime.now(timezone.utc)
-    return InternalMarketEvent(
-        event_type=EventType.QUOTE,
-        symbol=internal,
-        exchange=internal.split(":")[0],
-        provider_symbol=sym_field,
-        timestamp=ts,
-        ltp=float(v.get("lp", v.get("ltp", 0))) if isinstance(v, dict) else None,
-        open=float(v["o"]) if isinstance(v, dict) and "o" in v else None,
-        high=float(v["h"]) if isinstance(v, dict) and "h" in v else None,
-        low=float(v["l"]) if isinstance(v, dict) and "l" in v else None,
-        close=float(v["c"]) if isinstance(v, dict) and "c" in v else None,
-        volume=float(v.get("v", 0)) if isinstance(v, dict) else 0.0,
-        raw=msg,
-    )
-
-
-def _lookup_internal(self, fyers_symbol: str) -> str:
-    # Reverse map via registry if known; else best-effort parse.
-    for instr in self.registry._by_key.values():
-        if instr.provider_symbol == fyers_symbol:
-            return instr.key
     try:
-        from .symbol_map import from_fyers_symbol
-
-        return from_fyers_symbol(fyers_symbol).key
-    except Exception:
-        return fyers_symbol
-
-
-# Attach instance method (kept here to avoid clutter in the class above).
-FYERSMarketDataProvider._normalize_ws = _normalize_ws
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if f != f:  # NaN
+        return None
+    return f

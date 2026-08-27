@@ -34,35 +34,46 @@ def fyers_history_error() -> dict:
     return {"s": "error", "code": -1, "message": "Invalid symbol"}
 
 
-def fyers_ws_symbol_update(symbol: str = "NSE:SBIN-EQ", ltp: float = 555.5) -> dict:
-    """SymbolUpdate-style quote message (best-effort shape per docs)."""
+def fyers_ws_symbol_update(symbol: str = "NSE:SBIN-EQ", ltp: float = 123.45) -> dict:
+    """Full-mode market dict as decoded by the official fyers_apiv3 SDK.
+
+    The real FYERS v3 data socket is binary protobuf; the SDK decodes it into a
+    dict with precision/multiplier already applied. Keys (full mode):
+    symbol, ltp, open_price, high_price, low_price, vol_traded_today, ...
+    """
     return {
-        "T": "t",
         "symbol": symbol,
-        "v": {"lp": ltp, "o": 550.0, "h": 560.0, "l": 548.0, "c": 555.0, "vol": 12345},
+        "ltp": ltp,
+        "open_price": 121.0,
+        "high_price": 124.0,
+        "low_price": 120.5,
+        "vol_traded_today": 98765,
+        "prev_close_price": 122.0,
+        "type": "sf",
     }
 
 
-def fyers_ws_lite(symbol: str = "NSE:SBIN-EQ", ltp: float = 555.5) -> dict:
-    """Lite (LTP-only) message."""
-    return {"T": "t", "symbol": symbol, "v": {"lp": ltp}}
+def fyers_ws_lite(symbol: str = "NSE:SBIN-EQ", ltp: float = 123.45) -> dict:
+    """Lite (LTP-only) dict as decoded by the SDK."""
+    return {"symbol": symbol, "ltp": ltp, "type": "sf"}
 
 
 def fyers_ws_heartbeat() -> dict:
-    return {"T": "h"}
+    # SDK control/response frames carry no "symbol" -> skipped by _normalize.
+    return {"type": "ack"}
 
 
 def fyers_ws_auth_ack() -> dict:
-    return {"T": "c", "authorization": "APPID:TOKEN"}
+    return {"type": "auth_ack"}
 
 
-def fyers_ws_malformed() -> str:
-    # Not valid JSON -> exercises the malformed-message path.
-    return "{not valid json"
+def fyers_ws_malformed() -> dict:
+    # Decoded dict missing the price/control frame -> skipped (no crash).
+    return {"type": "subscribed"}
 
 
 def fyers_ws_unknown_type() -> dict:
-    return {"T": "z", "foo": "bar"}
+    return {"foo": "bar"}
 
 
 # --- Instrument master fixtures (documented CSV-style structure) -------------

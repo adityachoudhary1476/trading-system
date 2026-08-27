@@ -60,6 +60,8 @@ class MarketConfig:
     lookback_bars: int = field(default_factory=lambda: _get_int("LOOKBACK_BARS", 365))
     # AI analysis cadence: build a snapshot every N closed bars (NOT per tick).
     analysis_interval_bars: int = field(default_factory=lambda: _get_int("ANALYSIS_INTERVAL_BARS", 1))
+    # Feed is considered STALE if no event arrives within this many seconds.
+    stale_seconds: int = field(default_factory=lambda: _get_int("STALE_SECONDS", 60))
 
 
 @dataclass

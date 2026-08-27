@@ -50,6 +50,8 @@ Live data (no orders placed):
 ```bash
 PYTHONPATH=src python -m trading_system live --symbols NSE:SBIN --duration 15
 # Without credentials it prints: "FYERS runtime verification blocked because credentials were not available."
+PYTHONPATH=src python -m trading_system live-verify --symbols NSE:SBIN --duration 20
+# REAL market-data verification only (data WS, no orders). For live ticks, run during NSE hours.
 ```
 
 ## CLI (Day 4)

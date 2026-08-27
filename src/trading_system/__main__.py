@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 
 import pandas as pd
 
@@ -324,6 +325,72 @@ def _cmd_data_health(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_live_verify(args: argparse.Namespace) -> int:
+    """REAL FYERS market-data verification only. Does NOT place orders.
+
+    Connects using .env credentials, subscribes to one liquid NSE symbol (NSE:SBIN
+    by default), prints normalized events + feed health for a bounded period, then
+    exits. This is data-only verification; no order API is called.
+    """
+    from .india.fyers import FYERSMarketDataProvider
+    from .india.live_pipeline import LiveMarketPipeline
+
+    print("=" * 70)
+    print("FYERS LIVE-VERIFY  —  REAL MARKET-DATA VERIFICATION ONLY")
+    print("This command does NOT place orders or call any brokerage execution API.")
+    print("=" * 70)
+
+    prov = FYERSMarketDataProvider()
+    if not prov.is_authenticated:
+        print("ERROR: FYERS credentials not found in environment (.env).")
+        print("Set FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN, then retry.")
+        return 2
+
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    timeframe = args.timeframe
+    duration = args.duration
+
+    pipe = LiveMarketPipeline(symbols=symbols, timeframe=timeframe)
+    events: list = []
+
+    def on_event(ev):
+        events.append(ev)
+        print(
+            f"  {ev.timestamp.isoformat()}  {ev.symbol:12s}  LTP={ev.ltp}"
+            f"  provider={ev.provider_symbol}"
+        )
+
+    def on_snapshot(symbol, snap):
+        print(f"  [snapshot] {symbol} @ {snap.timestamp.isoformat()} "
+              f"latest={snap.latest_price}")
+
+    pipe.on_snapshot(on_snapshot)
+    pipe.start()
+
+    try:
+        socket = prov.connect_live(symbols, on_event=on_event, timeframe=timeframe)
+    except Exception as e:
+        print(f"FYERS connect failed: {e}")
+        return 1
+    pipe.attach_socket(socket)
+
+    print(f"Subscribed to {symbols}; running for {duration}s (Ctrl-C to stop early)...")
+    try:
+        import time
+
+        time.sleep(duration)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+    finally:
+        pipe.stop()
+
+    print("-" * 70)
+    print(f"Events received : {len(events)}")
+    print(f"Feed health     : {pipe.health_snapshot()}")
+    print("Live-verify complete. No orders were placed.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="trading_system")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -368,6 +435,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("market-status", help="Feed health + stored-data quality")
     sub.add_parser("data-health", help="Alias of market-status")
 
+    p_lv2 = sub.add_parser(
+        "live-verify",
+        help="REAL FYERS market-data verification only (no orders placed)",
+    )
+    p_lv2.add_argument("--symbols", default="NSE:SBIN", help="Comma-separated INTERNAL symbols")
+    p_lv2.add_argument("--timeframe", default="1m")
+    p_lv2.add_argument("--duration", type=int, default=20, help="seconds to run")
+
     args = parser.parse_args(argv)
     configure_logging()
     if args.command == "ingest":
@@ -390,6 +465,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_instrument_search(args)
     if args.command in ("market-status", "data-health"):
         return _cmd_data_health(args)
+    if args.command == "live-verify":
+        return _cmd_live_verify(args)
     parser.print_help()
     return 1
 
