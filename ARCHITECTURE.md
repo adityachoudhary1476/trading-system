@@ -37,14 +37,27 @@ data source.
                  └───────────────────────┬─────────────────────┘
                                          ▼
                  ┌─────────────────────────────────────────────┐
-   AI ANALYST    │  models.MarketView (contract only, Day 2)   │
-   (future)      │   receives structured context → structured  │
-                 │   analysis (market_view, confidence, risks)  │
-                 │   NO trading authority.                      │
+   SNAPSHOT      │  models.snapshot.MarketSnapshot (Pydantic)  │
+   (structured)  │   validated, tz-aware, NO-LOOK-AHEAD        │
+                 │   only closed-bar history reaches the AI    │
                  └───────────────────────┬─────────────────────┘
                                          ▼
-   SIGNAL GEN ─► RISK MGMT ─► PAPER TRADING ─► TELEGRAM / DASHBOARD
-   (Day 2+)      (Day 2+)       (Day 2+)         (wired/disabled)
+                 ┌─────────────────────────────────────────────┐
+   AI ANALYST    │  ModelProvider.analyze(snapshot) -> View    │
+   (Day 2)       │   • LocalRuleModel (offline, tested)        │
+                 │   • OpenAICompatibleProvider (impl, untested)│
+                 │   returns validated MarketView (interpretation│
+                 │   ONLY — never an order, size, or risk override)│
+                 └───────────────────────┬─────────────────────┘
+                                         ▼
+                 ┌─────────────────────────────────────────────┐
+   SIGNAL ENGINE │  signals.generate_signal(snapshot, view)     │
+   (Day 2)       │   deterministic LONG/SHORT/HOLD + reason    │
+                 │   AI confidence = analytical gate only      │
+                 └───────────────────────┬─────────────────────┘
+                                         ▼
+   RISK MGMT ─► BACKTESTER ─► PAPER TRADING ─► TELEGRAM / DASHBOARD
+   (Day 3)       (Day 3)       (Day 3)          (wired/disabled)
 ```
 
 ## Key design decisions
@@ -74,8 +87,8 @@ data source.
 | `storage/` | SQLAlchemy SQLite store, idempotent upsert | done |
 | `analysis/` | Quant metrics + analysis pipeline | done |
 | `indicators/` | Technical indicators | done |
-| `models/` | `MarketView` contract for future AI analyst | contract only |
-| `signals/` | Signal dataclass | placeholder |
+| `models/` | `MarketSnapshot`, `MarketView`, `ModelProvider` (LocalRule + OpenAI-compatible), analyst orchestration | Day 2 |
+| `signals/` | Deterministic signal engine (LONG/SHORT/HOLD) | Day 2 |
 | `risk/` | Risk manager contract | placeholder |
 | `backtesting/` | Backtest result contract | placeholder |
 | `paper_trading/` | Paper account contract | placeholder |
