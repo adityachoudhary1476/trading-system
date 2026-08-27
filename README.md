@@ -52,10 +52,40 @@ PYTHONPATH=src python -m trading_system live --symbols NSE:SBIN --duration 15
 # Without credentials it prints: "FYERS runtime verification blocked because credentials were not available."
 ```
 
+## CLI (Day 4)
+
+```bash
+PYTHONPATH=src python -m trading_system providers          # list data providers
+PYTHONPATH=src python -m trading_system instruments         # NSE:SYMBOL -> FYERS map
+PYTHONPATH=src python -m trading_system instrument-search BANK   # search registry
+PYTHONPATH=src python -m trading_system ingest-india --symbols NSE:RELIANCE,NSE:NIFTY50 --timeframe 1d
+PYTHONPATH=src python -m trading_system market-status       # feed health + stored quality
+PYTHONPATH=src python -m trading_system live --symbols NSE:SBIN --duration 15
+# Without FYERS creds the live command prints:
+#   "FYERS runtime verification blocked because credentials were not available."
+```
+
+**Live FYERS connectivity is NOT claimed.** All live behavior is gated on
+`FYERS_CLIENT_ID` + `FYERS_ACCESS_TOKEN`; without them the `live` command exits
+with a clear message (no fabricated stream). Historical chunking, instrument
+parsing, market calendar, event bus, closed-candle pipeline, and data-health
+monitor are all implemented and unit-tested offline (106 tests).
+
+## Current data limitations
+
+- **Primary target is now Indian markets (FYERS).** Binance remains the dev/test provider.
+- FYERS historical (`/history`) is **not real-time** — historical candles only.
+- FYERS **pricing/data-feed fee is UNVERIFIED**; requires an active FYERS account.
+- Live WebSocket requires credentials (OAuth2). Not tested live on Day 4.
+- Only daily (`1d`) ingestion exercised via fixtures; other intervals supported by
+  mapping but untested against the live API.
+- SEBI algo rules: order placement (future work) requires a validated static IP;
+  data-only use is unaffected.
+
 ## Running tests
 
 ```bash
-pytest            # 80 tests, must pass
+pytest            # 106 tests, must pass
 ```
 
 ## Installation

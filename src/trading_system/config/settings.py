@@ -43,7 +43,11 @@ Timeframe = Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"]
 
 @dataclass
 class MarketConfig:
-    provider: str = field(default_factory=lambda: os.getenv("DATA_PROVIDER", "binance"))
+    # Target market: "crypto" (Binance dev/test) or "india" (FYERS primary).
+    market: str = field(default_factory=lambda: os.getenv("MARKET", "india"))
+    provider: str = field(default_factory=lambda: os.getenv("MARKET_DATA_PROVIDER", "fyers"))
+    default_exchange: str = field(default_factory=lambda: os.getenv("DEFAULT_EXCHANGE", "NSE"))
+    timezone: str = field(default_factory=lambda: os.getenv("TIMEZONE", "Asia/Kolkata"))
     symbols: list[str] = field(
         default_factory=lambda: [
             s.strip() for s in os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()
@@ -54,6 +58,8 @@ class MarketConfig:
     )
     # Number of most-recent bars to pull on a default ingestion.
     lookback_bars: int = field(default_factory=lambda: _get_int("LOOKBACK_BARS", 365))
+    # AI analysis cadence: build a snapshot every N closed bars (NOT per tick).
+    analysis_interval_bars: int = field(default_factory=lambda: _get_int("ANALYSIS_INTERVAL_BARS", 1))
 
 
 @dataclass
@@ -124,10 +130,14 @@ class Settings:
     def summary(self) -> dict:
         """A redaction-safe view for logging (no secrets)."""
         return {
+            "market": self.market.market,
             "data_provider": self.market.provider,
+            "default_exchange": self.market.default_exchange,
+            "timezone": self.market.timezone,
             "symbols": self.market.symbols,
             "timeframe": self.market.timeframe,
             "lookback_bars": self.market.lookback_bars,
+            "analysis_interval_bars": self.market.analysis_interval_bars,
             "db_url": self.storage.db_url,
             "log_level": self.logging.level,
             "ai_provider": self.ai.provider,

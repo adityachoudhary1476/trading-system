@@ -24,7 +24,7 @@ class MarketSnapshot(BaseModel):
     last_bar_timestamp: datetime
 
     latest_price: float = Field(gt=0)
-    last_return: float = 0.0  # single-bar return of the decision bar
+    last_return: Optional[float] = 0.0  # single-bar return of the decision bar; None if no prior bar
 
     sma_20: Optional[float] = None
     sma_50: Optional[float] = None
@@ -100,6 +100,18 @@ def build_snapshot_from_df(
     if df is None or len(df) == 0:
         raise ValueError("cannot build snapshot from empty frame")
 
+    def _f(x):
+        # Indicators that can't be computed (too little data) become None, never NaN.
+        if x is None:
+            return None
+        try:
+            xf = float(x)
+        except (TypeError, ValueError):
+            return None
+        if xf != xf:  # NaN
+            return None
+        return xf
+
     work = df.copy().sort_index()
     if "rsi_14" not in work.columns:
         work = add_all_indicators(work)
@@ -116,7 +128,7 @@ def build_snapshot_from_df(
     vstats = volume_stats(work["volume"], 20)
 
     recent = closes.tail(lookback_closes).tolist()
-    sma20 = float(last["sma_20"]) if "sma_20" in work.columns else None
+    sma20 = _f(last["sma_20"]) if "sma_20" in work.columns else None
     price_vs = None
     if sma20:
         price_vs = (float(last["close"]) - sma20) / sma20
@@ -126,30 +138,22 @@ def build_snapshot_from_df(
         timeframe=timeframe,
         timestamp=last_ts,
         last_bar_timestamp=last_ts,
-        latest_price=float(last["close"]),
-        last_return=float(rets.iloc[-1]) if not rets.empty else 0.0,
+        latest_price=_f(last["close"]),
+        last_return=_f(rets.iloc[-1]) if not rets.empty else 0.0,
         sma_20=sma20,
-        sma_50=float(last["sma_50"]) if "sma_50" in work.columns else None,
-        ema_12=float(last["ema_12"]) if "ema_12" in work.columns else None,
-        rsi_14=float(last["rsi_14"]) if "rsi_14" in work.columns else None,
-        macd=float(last["macd"]) if "macd" in work.columns else None,
-        macd_signal=float(last["macd_signal"]) if "macd_signal" in work.columns else None,
-        macd_hist=float(last["macd_hist"]) if "macd_hist" in work.columns else None,
-        atr_14=float(last["atr_14"]) if "atr_14" in work.columns else None,
-        bollinger_upper=float(last["bb_upper"]) if "bb_upper" in work.columns else None,
-        bollinger_lower=float(last["bb_lower"]) if "bb_lower" in work.columns else None,
-        volatility_annualized=vol,
-        max_drawdown=float(dd.min()) if not dd.empty else None,
-        volume_ma=(
-            float(vstats["volume_ma"].iloc[-1])
-            if "volume_ma" in vstats.columns
-            else None
-        ),
-        volume_z=(
-            float(vstats["volume_z"].iloc[-1])
-            if "volume_z" in vstats.columns
-            else None
-        ),
+        sma_50=_f(last["sma_50"]) if "sma_50" in work.columns else None,
+        ema_12=_f(last["ema_12"]) if "ema_12" in work.columns else None,
+        rsi_14=_f(last["rsi_14"]) if "rsi_14" in work.columns else None,
+        macd=_f(last["macd"]) if "macd" in work.columns else None,
+        macd_signal=_f(last["macd_signal"]) if "macd_signal" in work.columns else None,
+        macd_hist=_f(last["macd_hist"]) if "macd_hist" in work.columns else None,
+        atr_14=_f(last["atr_14"]) if "atr_14" in work.columns else None,
+        bollinger_upper=_f(last["bb_upper"]) if "bb_upper" in work.columns else None,
+        bollinger_lower=_f(last["bb_lower"]) if "bb_lower" in work.columns else None,
+        volatility_annualized=_f(vol),
+        max_drawdown=_f(dd.min()) if not dd.empty else None,
+        volume_ma=_f(vstats["volume_ma"].iloc[-1]) if "volume_ma" in vstats.columns else None,
+        volume_z=_f(vstats["volume_z"].iloc[-1]) if "volume_z" in vstats.columns else None,
         price_vs_sma20=price_vs,
         recent_closes=[float(x) for x in recent],
         data_points=int(len(work)),

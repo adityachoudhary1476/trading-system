@@ -1,21 +1,20 @@
-"""Indian market session / trading-calendar abstraction.
+"""Indian market session / trading-calendar abstraction (Day 4 hardened).
 
 Encapsulates NSE/BSE equity session rules so session logic never leaks into the
-rest of the app. Key facts (NSE equities):
-  * Timezone: Asia/Kolkata (UTC+5:30, no DST).
-  * Weekdays Mon-Fri; Saturday/Sunday closed.
-  * Regular equity session: 09:15-15:30 IST. (Pre-open 09:00-09:15, but we treat
-    the continuous session as 09:15-15:30 for candle completeness.)
-  * Index derivatives (NIFTY/BANKNIFTY) trade until 15:30; some expiries to 16:00,
-    but we keep the conservative 15:30 equity close for the default calendar.
-  * Muhurat trading and other special sessions are NOT modeled (out of scope);
-    is_open returns False on such edge cases unless added later.
+rest of the app. Day 4 additions over Day 3:
+  * Explicit session phases: PRE_MARKET, REGULAR, POST_MARKET, CLOSED, HOLIDAY.
+  * Holiday registry hook: holidays are NOT hard-coded here. A `TradingCalendar`
+    can be given a set of holiday dates (e.g. loaded from a provider/file later).
+  * Timezone stays Asia/Kolkata (UTC+5:30, no DST).
 
-This module is deterministic and timezone-correct.
+Sources: NSE public session timings (pre-open 09:00-09:15, regular 09:15-15:30,
+post-close 15:30-16:00). These are the standard equity sessions; index derivatives
+may differ slightly but we keep the conservative equity boundaries as default.
 """
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
+from dataclasses import dataclass, field
 from enum import Enum
 
 from zoneinfo import ZoneInfo
@@ -23,63 +22,117 @@ from zoneinfo import ZoneInfo
 KOLKATA = ZoneInfo("Asia/Kolkata")
 
 
-class MarketState(str, Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    UNKNOWN = "unknown"
+class SessionPhase(str, Enum):
+    PRE_MARKET = "pre_market"      # 09:00-09:15 IST (order collection/ matching)
+    REGULAR = "regular"            # 09:15-15:30 IST (continuous trading)
+    POST_MARKET = "post_market"    # 15:30-16:00 IST (post-close)
+    CLOSED = "closed"              # outside trading hours / weekend
+    HOLIDAY = "holiday"            # exchange holiday (registry-provided)
 
 
-# Equity continuous session (IST).
-SESSION_OPEN = time(9, 15)
-SESSION_CLOSE = time(15, 30)
+# Default NSE equity session windows (IST).
+PRE_OPEN = (time(9, 0), time(9, 15))
+REGULAR = (time(9, 15), time(15, 30))
+POST_CLOSE = (time(15, 30), time(16, 0))
 
 
-def to_kolkata(dt_utc: datetime) -> datetime:
-    """Convert a (naive or tz-aware) UTC datetime to Asia/Kolkata."""
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=__import__("datetime").timezone.utc)
-    return dt_utc.astimezone(KOLKATA)
+@dataclass
+class TradingCalendar:
+    """Holiday-aware calendar. Holidays are injected, never hard-coded en masse."""
+
+    holidays: set[date] = field(default_factory=set)
+    pre_open: tuple[time, time] = PRE_OPEN
+    regular: tuple[time, time] = REGULAR
+    post_close: tuple[time, time] = POST_CLOSE
+
+    def is_holiday(self, dt: datetime) -> bool:
+        return self.to_kolkata(dt).date() in self.holidays
+
+    def add_holiday(self, d: date) -> None:
+        self.holidays.add(d)
+
+    def phase(self, dt_utc: datetime) -> SessionPhase:
+        k = self.to_kolkata(dt_utc)
+        if k.weekday() >= 5:  # Sat/Sun
+            return SessionPhase.CLOSED
+        if self.is_holiday(dt_utc):
+            return SessionPhase.HOLIDAY
+        t = k.time()
+        if self.pre_open[0] <= t < self.pre_open[1]:
+            return SessionPhase.PRE_MARKET
+        if self.regular[0] <= t <= self.regular[1]:
+            return SessionPhase.REGULAR
+        if self.post_close[0] <= t < self.post_close[1]:
+            return SessionPhase.POST_MARKET
+        return SessionPhase.CLOSED
+
+    # --- convenience predicates ------------------------------------------
+    def is_open(self, dt_utc: datetime) -> bool:
+        return self.phase(dt_utc) in (SessionPhase.REGULAR, SessionPhase.PRE_MARKET, SessionPhase.POST_MARKET)
+
+    def is_regular_session(self, dt_utc: datetime) -> bool:
+        return self.phase(dt_utc) == SessionPhase.REGULAR
+
+    def is_trading_day(self, dt_utc: datetime) -> bool:
+        p = self.phase(dt_utc)
+        return p not in (SessionPhase.CLOSED, SessionPhase.HOLIDAY)
+
+    # --- timezone helpers -------------------------------------------------
+    @staticmethod
+    def to_kolkata(dt: datetime) -> datetime:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=__import__("datetime").timezone.utc)
+        return dt.astimezone(KOLKATA)
+
+    def session_boundaries(self, dt_utc: datetime) -> tuple[datetime, datetime]:
+        """Return (open, close) of the nearest regular session for dt's day."""
+        k = self.to_kolkata(dt_utc)
+        if k.weekday() >= 5 or self.is_holiday(dt_utc):
+            # roll forward to next weekday that is not a holiday
+            cur = k + timedelta(days=1)
+            while cur.weekday() >= 5 or cur.date() in self.holidays:
+                cur = cur + timedelta(days=1)
+            k = cur
+        open_dt = k.replace(hour=REGULAR[0].hour, minute=REGULAR[0].minute, second=0, microsecond=0)
+        close_dt = k.replace(hour=REGULAR[1].hour, minute=REGULAR[1].minute, second=0, microsecond=0)
+        return open_dt, close_dt
+
+    def next_open(self, dt_utc: datetime) -> datetime:
+        open_dt, _ = self.session_boundaries(dt_utc)
+        if self.to_kolkata(dt_utc) >= open_dt:
+            return self.session_boundaries(dt_utc + timedelta(days=1))[0]
+        return open_dt
+
+
+# Default calendar singleton (no holidays) — preserves Day 3 function signatures.
+DEFAULT_CALENDAR = TradingCalendar()
+
+
+def to_kolkata(dt: datetime) -> datetime:
+    return TradingCalendar.to_kolkata(dt)
 
 
 def is_trading_day(dt: datetime) -> bool:
-    """True if the given instant falls on an NSE trading weekday."""
-    k = to_kolkata(dt)
-    return k.weekday() < 5  # Mon=0 .. Fri=4
+    return DEFAULT_CALENDAR.is_trading_day(dt)
 
 
-def market_state(dt_utc: datetime) -> MarketState:
-    """Return OPEN/CLOSED for the NSE equity session at the given instant."""
-    k = to_kolkata(dt_utc)
-    if k.weekday() >= 5:
-        return MarketState.CLOSED
-    t = k.time()
-    if SESSION_OPEN <= t <= SESSION_CLOSE:
-        return MarketState.OPEN
-    return MarketState.CLOSED
+def market_state(dt: datetime) -> str:
+    """Back-compat: OPEN/CLOSED for the regular session."""
+    p = DEFAULT_CALENDAR.phase(dt)
+    return "open" if p == SessionPhase.REGULAR else "closed"
 
 
-def is_within_session(dt_utc: datetime) -> bool:
-    return market_state(dt_utc) == MarketState.OPEN
+def is_within_session(dt: datetime) -> bool:
+    return DEFAULT_CALENDAR.is_regular_session(dt)
 
 
-def session_boundaries(dt_utc: datetime) -> tuple[datetime, datetime]:
-    """Return (session_open_kolkata, session_close_kolkata) for dt's trading day.
-
-    If dt is on a weekend, returns the boundaries of the *following* Monday.
-    """
-    k = to_kolkata(dt_utc)
-    if k.weekday() >= 5:
-        # shift to Monday
-        days = (7 - k.weekday()) % 7 or 7
-        k = k + timedelta(days=days)
-    open_dt = k.replace(hour=SESSION_OPEN.hour, minute=SESSION_OPEN.minute, second=0, microsecond=0)
-    close_dt = k.replace(hour=SESSION_CLOSE.hour, minute=SESSION_CLOSE.minute, second=0, microsecond=0)
-    return open_dt, close_dt
+def session_boundaries(dt: datetime) -> tuple[datetime, datetime]:
+    return DEFAULT_CALENDAR.session_boundaries(dt)
 
 
-def next_session_open(dt_utc: datetime) -> datetime:
-    open_dt, _ = session_boundaries(dt_utc)
-    if to_kolkata(dt_utc) >= open_dt:
-        # already past today's open -> next day's open
-        return session_boundaries(dt_utc + timedelta(days=1))[0]
-    return open_dt
+def next_session_open(dt: datetime) -> datetime:
+    return DEFAULT_CALENDAR.next_open(dt)
+
+
+def session_phase(dt: datetime) -> SessionPhase:
+    return DEFAULT_CALENDAR.phase(dt)

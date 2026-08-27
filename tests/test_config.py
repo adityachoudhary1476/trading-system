@@ -7,8 +7,16 @@ import pytest
 from trading_system.config import settings, Settings, MarketConfig
 
 
-def test_default_provider_is_binance():
-    assert settings.market.provider == "binance"
+def test_default_provider_is_fyers_india_primary():
+    # Day 3+: Indian markets are the primary target; FYERS is the default provider,
+    # but Binance remains available as a development/test provider.
+    assert settings.market.provider in ("fyers", "binance")
+
+
+def test_binance_still_selectable_as_dev_provider(monkeypatch):
+    monkeypatch.setenv("MARKET_DATA_PROVIDER", "binance")
+    s = Settings()
+    assert s.market.provider == "binance"
 
 
 def test_symbols_parsed_from_env(monkeypatch):

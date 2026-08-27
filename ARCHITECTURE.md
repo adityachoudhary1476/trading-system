@@ -92,7 +92,7 @@ data source.
 | Package | Responsibility | Day 1 state |
 |---|---|---|
 | `config/` | Settings, env-driven config, logging | done |
-| `india/` | Indian market layer: FYERS adapter, instrument model, symbol normalization, market calendar, candle aggregator, normalized events | Day 3 |
+| `india/` | Indian layer: FYERS adapter, instruments, symbol normalization, market calendar, candle aggregator, events, history chunking, instrument repo, event bus, closed-candle pipeline, data health | Day 4 |
 | `data/` | Provider interface, Binance/Stooq/FYERS adapters, validation, ingestion pipeline | done |
 | `storage/` | SQLAlchemy SQLite store, idempotent upsert | done |
 | `analysis/` | Quant metrics + analysis pipeline | done |

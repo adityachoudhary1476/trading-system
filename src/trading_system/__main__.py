@@ -14,10 +14,12 @@ import argparse
 import json
 import sys
 
+import pandas as pd
+
 from .config import settings, configure_logging
 from .data.pipeline import IngestionPipeline
 from .analysis.pipeline import analyze
-from .storage.database import MarketStore
+from .storage.database import MarketStore, OHLCVRecord
 from .models.snapshot import build_snapshot_from_df
 from .models import analyze_snapshot, get_model_provider
 
@@ -263,6 +265,65 @@ def _cmd_live(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_instrument_search(args: argparse.Namespace) -> int:
+    from tabulate import tabulate
+    from .india.instrument_repository import InstrumentRepository
+
+    repo = InstrumentRepository()
+    # Seed with the default registry so search works without a live master.
+    for instr in repo.registry._by_key.values():
+        repo.register(instr)
+    results = repo.search_instruments(args.query)
+    if not results:
+        print(f"No instruments match '{args.query}' in the local registry.")
+        return 0
+    rows = [
+        [i.key, i.instrument_type.value, i.provider_symbol or "-"]
+        for i in results
+    ]
+    print(tabulate(rows, headers=["internal", "type", "fyers_symbol"], tablefmt="github"))
+    return 0
+
+
+def _cmd_data_health(args: argparse.Namespace) -> int:
+    """Static data-health view: feed status (DISCONNECTED without a live session)
+    plus stored-data quality from the DB."""
+    from tabulate import tabulate
+    from .india.data_health import FeedStatus
+    from sqlalchemy import func, select
+
+    store = _store()
+    with store._Session() as s:
+        rows = (
+            s.execute(
+                select(
+                    OHLCVRecord.symbol, OHLCVRecord.timeframe,
+                    OHLCVRecord.provider, OHLCVRecord.exchange,
+                    func.count(), func.max(OHLCVRecord.timestamp),
+                ).group_by(
+                    OHLCVRecord.symbol, OHLCVRecord.timeframe,
+                    OHLCVRecord.provider, OHLCVRecord.exchange,
+                )
+            )
+            .tuples()
+            .all()
+        )
+    print("Feed status : DISCONNECTED (no live session in CLI mode)")
+    print("Data health :")
+    if not rows:
+        print("  (no stored data)")
+    else:
+        table = [
+            [
+                r[0], r[1], r[2], r[3] or "-", r[4],
+                (pd.Timestamp(r[5]).tz_localize("UTC").date() if r[5] is not None else "-"),
+            ]
+            for r in rows
+        ]
+        print(tabulate(table, headers=["symbol", "tf", "provider", "exchange", "rows", "latest"], tablefmt="github"))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="trading_system")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -302,6 +363,11 @@ def main(argv: list[str] | None = None) -> int:
     p_lv.add_argument("--lite", action="store_true", help="Lite (LTP-only) mode")
     p_lv.add_argument("--provider", default="fyers")
 
+    p_is = sub.add_parser("instrument-search", help="Search known Indian instruments")
+    p_is.add_argument("query", help="Substring, e.g. BANK, NIFTY, RELIANCE")
+    sub.add_parser("market-status", help="Feed health + stored-data quality")
+    sub.add_parser("data-health", help="Alias of market-status")
+
     args = parser.parse_args(argv)
     configure_logging()
     if args.command == "ingest":
@@ -320,6 +386,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_ingest_india(args)
     if args.command == "live":
         return _cmd_live(args)
+    if args.command == "instrument-search":
+        return _cmd_instrument_search(args)
+    if args.command in ("market-status", "data-health"):
+        return _cmd_data_health(args)
     parser.print_help()
     return 1
 

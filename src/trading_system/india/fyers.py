@@ -220,6 +220,7 @@ class FyersDataSocket:
         timeframe: str = "1m",
         lite_mode: bool = False,
         max_retries: int = 6,
+        auto_connect: bool = True,
     ) -> None:
         try:
             import websocket  # websocket-client
@@ -241,7 +242,9 @@ class FyersDataSocket:
         self._last_msg_ts: Optional[float] = None
         self._attempt = 0
         self._ws_mod = websocket
-        self._open()
+        self._reconnecting = False
+        if auto_connect:
+            self._open()
 
     def _auth_frame(self) -> dict:
         return {
@@ -273,8 +276,9 @@ class FyersDataSocket:
 
     def _on_open(self, ws):
         log.info("FYERS WS open; authenticating")
-        ws.send(str(self._auth_frame()).replace("'", '"'))
-        ws.send(str(self._subscribe_frame()).replace("'", '"'))
+        if ws is not None:
+            ws.send(str(self._auth_frame()).replace("'", '"'))
+            ws.send(str(self._subscribe_frame()).replace("'", '"'))
 
     def _on_message(self, ws, raw: str):
         self._last_msg_ts = time.time()
@@ -296,17 +300,23 @@ class FyersDataSocket:
         log.info("FYERS WS closed")
         if self._closed:
             return
-        if self._attempt < self.max_retries:
-            backoff = min(30, 2 ** self._attempt)
-            self._attempt += 1
-            log.info("FYERS WS reconnect in %ss (attempt %d)", backoff, self._attempt)
-            time.sleep(backoff)
-            try:
-                self._open()
-            except Exception as e:
-                log.error("FYERS WS reconnect failed: %s", e)
-        else:
+        self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Exponential backoff reconnect (capped). No aggressive spin."""
+        if self._attempt >= self.max_retries:
             log.error("FYERS WS max retries reached; giving up")
+            return
+        backoff = min(30, 2 ** self._attempt)
+        self._attempt += 1
+        log.info("FYERS WS reconnect in %ss (attempt %d)", backoff, self._attempt)
+        time.sleep(backoff)
+        if self._closed:
+            return
+        try:
+            self._open()
+        except Exception as e:
+            log.error("FYERS WS reconnect failed: %s", e)
 
     def stale(self, now: Optional[float] = None) -> bool:
         now = now or time.time()

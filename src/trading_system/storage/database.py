@@ -21,6 +21,7 @@ from sqlalchemy import (
     String,
     DateTime,
     UniqueConstraint,
+    Index,
     create_engine,
     select,
 )
@@ -49,7 +50,21 @@ class OHLCVRecord(Base):
     low = Column(Float, nullable=False)
     close = Column(Float, nullable=False)
     volume = Column(Float, nullable=False)
-    provider = Column(String(64), nullable=False)
+    provider = Column(String(64), nullable=False, index=True)
+
+    # Provider + exchange distinguish Binance vs FYERS vs future sources; together
+    # with (symbol, timeframe, timestamp) this makes duplicate candles impossible.
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol", "timeframe", "timestamp", "provider", "exchange",
+            name="uq_market_data_symbol_tf_ts_provider_exch",
+        ),
+        Index(
+            "ix_ohlcv_unique_lookup",
+            "symbol", "timeframe", "timestamp", "provider", "exchange",
+        ),
+        {"sqlite_autoincrement": True},
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - debug only
         return f"<OHLCV {self.symbol} {self.timeframe} {self.timestamp}>"
@@ -57,6 +72,19 @@ class OHLCVRecord(Base):
 
 def init_db(engine) -> None:
     Base.metadata.create_all(engine)
+    # SQLite-safe forward migration: add columns introduced after Day 1 without
+    # dropping existing data. create_all() does NOT add columns to existing tables.
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    existing = {c["name"] for c in inspector.get_columns("market_data")}
+    needed = {"exchange"}
+    with engine.begin() as conn:
+        for col in needed:
+            if col not in existing:
+                conn.execute(
+                    text(f"ALTER TABLE market_data ADD COLUMN {col} VARCHAR(16)")
+                )
 
 
 class MarketStore:
@@ -93,7 +121,7 @@ class MarketStore:
             ts = self._to_dt(r["timestamp"])
             rec = dict(r)
             rec["timestamp"] = ts
-            key = (r["symbol"], r["timeframe"], ts, r["provider"])
+            key = (r["symbol"], r["timeframe"], ts, r["provider"], r.get("exchange"))
             if key in seen:
                 continue
             seen.add(key)
@@ -103,16 +131,16 @@ class MarketStore:
         with self._Session() as session:
             existing = session.execute(
                 select(OHLCVRecord.symbol, OHLCVRecord.timeframe,
-                       OHLCVRecord.timestamp, OHLCVRecord.provider)
+                       OHLCVRecord.timestamp, OHLCVRecord.provider, OHLCVRecord.exchange)
             ).all()
             existing_keys = {
                 (e.symbol, e.timeframe,
-                 self._to_dt(e.timestamp), e.provider) for e in existing
+                 self._to_dt(e.timestamp), e.provider, e.exchange) for e in existing
             }
             to_add = [
                 OHLCVRecord(**r)
                 for r in norm
-                if (r["symbol"], r["timeframe"], r["timestamp"], r["provider"])
+                if (r["symbol"], r["timeframe"], r["timestamp"], r["provider"], r.get("exchange"))
                 not in existing_keys
             ]
             if to_add:
