@@ -65,6 +65,21 @@ class DataHealthMonitor:
         self.metrics.connected = False
         self.status = FeedStatus.AUTH_ERROR
 
+    def on_auth_status(self, status: str) -> None:
+        """Map an external AuthStatus (from india.token_manager) onto the monitor.
+
+        Only AUTH_OK clears the auth-error flag; everything else marks auth broken.
+        Existing DataHealthMonitor behavior (STALE/DISCONNECTED/INVALID_DATA) is intact.
+        """
+        if status == "auth_ok":
+            self.metrics.auth_ok = True
+            if self.metrics.connected:
+                self.status = FeedStatus.HEALTHY
+        else:
+            self.metrics.auth_ok = False
+            self.metrics.connected = False
+            self.status = FeedStatus.AUTH_ERROR
+
     def on_invalid(self) -> None:
         self.metrics.events_rejected += 1
         self.metrics.candles_rejected += 1

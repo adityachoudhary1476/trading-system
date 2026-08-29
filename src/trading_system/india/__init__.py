@@ -2,6 +2,7 @@
 from .instruments import (
     Exchange,
     InstrumentType,
+    OptionType,
     Instrument,
     InternalSymbol,
     InstrumentRegistry,
@@ -21,7 +22,15 @@ from .market_calendar import (
 )
 from .candle_aggregator import CandleAggregator, AggregatedBar, timeframe_minutes
 from .events import InternalMarketEvent, EventType
-from .fyers import FYERSMarketDataProvider, FyersDataSocket
+from .fyers import (
+    FYERSMarketDataProvider,
+    FyersDataSocket,
+    FYERSError,
+    FYERSAuthError,
+    FYERSAPIError,
+    FYERSRateLimitError,
+    FYERSNetworkError,
+)
 from .history_chunking import (
     ChunkedHistoricalFetcher,
     plan_chunks,
@@ -29,6 +38,8 @@ from .history_chunking import (
     DateChunk,
 )
 from .instrument_repository import InstrumentRepository
+from .derivatives import DerivativeRequest, to_fyers_derivative_symbol, from_fyers_derivative_symbol
+from .instrument_discovery import FyersInstrumentDiscovery
 from .event_bus import EventBus, EventConsumer
 from .closed_candle_pipeline import (
     ClosedCandlePipeline,
@@ -41,6 +52,7 @@ from .live_pipeline import LiveMarketPipeline, bootstrap_historical
 __all__ = [
     "Exchange",
     "InstrumentType",
+    "OptionType",
     "Instrument",
     "InternalSymbol",
     "InstrumentRegistry",
@@ -63,11 +75,20 @@ __all__ = [
     "EventType",
     "FYERSMarketDataProvider",
     "FyersDataSocket",
+    "FYERSError",
+    "FYERSAuthError",
+    "FYERSAPIError",
+    "FYERSRateLimitError",
+    "FYERSNetworkError",
     "ChunkedHistoricalFetcher",
     "plan_chunks",
     "combine_frames",
     "DateChunk",
     "InstrumentRepository",
+    "DerivativeRequest",
+    "to_fyers_derivative_symbol",
+    "from_fyers_derivative_symbol",
+    "FyersInstrumentDiscovery",
     "EventBus",
     "EventConsumer",
     "ClosedCandlePipeline",

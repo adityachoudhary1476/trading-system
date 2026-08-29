@@ -53,8 +53,10 @@ def test_plan_chunks_respects_minute_cap():
     start = pd.Timestamp("2024-01-01", tz="UTC")
     end = pd.Timestamp("2024-04-10", tz="UTC")  # ~100 days
     chunks = plan_chunks(start, end, "1m")  # 100d cap
-    # Each chunk span <= 100 days; combined == full coverage.
-    assert all((c.end - c.start).days + 1 <= 100 for c in chunks)
+    # Each chunk span (exclusive end) <= 100 days; combined == full coverage.
+    # Boundaries are exclusive (next chunk starts at prev end + 1 day) so there is
+    # no day of overlap that would double-count candles.
+    assert all((c.end - c.start).days <= 100 for c in chunks)
     assert chunks[0].start == start
     assert chunks[-1].end == end
 
@@ -63,7 +65,7 @@ def test_plan_chunks_respects_day_cap():
     start = pd.Timestamp("2022-01-01", tz="UTC")
     end = pd.Timestamp("2023-06-01", tz="UTC")  # >366 days
     chunks = plan_chunks(start, end, "1d")  # 366d cap
-    assert all((c.end - c.start).days + 1 <= 366 for c in chunks)
+    assert all((c.end - c.start).days <= 366 for c in chunks)
 
 
 def test_plan_chunks_adjacent_no_gap():

@@ -280,6 +280,74 @@ def validate_ohlcv(
     return ValidationReport(valid=valid, rejected=rejected, issues=issues)
 
 
+def validate_contract_identity(instrument) -> list[ValidationIssue]:
+    """Provider-independent sanity check of derivative contract metadata.
+
+    Catches malformed contract identity BEFORE any data is fetched/stored. This is
+    a structural check (not OHLC); it complements `validate_ohlcv`. Legitimate
+    derivative behavior (e.g. wide strike spacing, weekly expiries) is never
+    rejected — we only flag impossible metadata.
+
+    Parameters
+    ----------
+    instrument: trading_system.india.instruments.Instrument
+
+    Returns
+    -------
+    list[ValidationIssue]  (empty when the contract identity is valid)
+    """
+    issues: list[ValidationIssue] = []
+    itype = getattr(instrument, "instrument_type", None)
+    if itype is None:
+        return issues
+
+    from ..india.instruments import InstrumentType  # local import to avoid cycle
+
+    is_deriv = itype in (
+        InstrumentType.FUTURE, InstrumentType.OPTION_CE, InstrumentType.OPTION_PE
+    )
+    if not is_deriv:
+        return issues
+
+    if not getattr(instrument, "underlying", None):
+        _add_issue(
+            issues, "CONTRACT_META", "Derivative missing underlying", Severity.ERROR,
+        )
+    expiry = getattr(instrument, "expiry", None)
+    if expiry:
+        try:
+            exp = __import__("datetime").date.fromisoformat(expiry)
+            if exp < __import__("datetime").date.today():
+                # Expired contracts are not necessarily invalid to *represent*, but
+                # fetching live history for them is almost always a user error; warn.
+                _add_issue(
+                    issues, "EXPIRED_CONTRACT",
+                    f"Contract expiry {expiry} is in the past", Severity.WARNING,
+                )
+        except (ValueError, TypeError):
+            _add_issue(
+                issues, "BAD_EXPIRY", f"Expiry {expiry!r} is not ISO YYYY-MM-DD",
+                Severity.ERROR,
+            )
+    else:
+        _add_issue(issues, "CONTRACT_META", "Derivative missing expiry", Severity.ERROR)
+
+    if itype in (InstrumentType.OPTION_CE, InstrumentType.OPTION_PE):
+        strike = getattr(instrument, "strike", None)
+        if strike is None or strike <= 0:
+            _add_issue(
+                issues, "BAD_STRIKE", f"Option strike {strike!r} is missing/invalid",
+                Severity.ERROR,
+            )
+        ot = getattr(instrument, "option_type", None)
+        if ot not in ("CE", "PE"):
+            _add_issue(
+                issues, "BAD_OPTION_TYPE", f"Option type {ot!r} must be CE/PE",
+                Severity.ERROR,
+            )
+    return issues
+
+
 def assert_valid(report: ValidationReport) -> pd.DataFrame:
     """Return the valid frame, raising DataValidationError otherwise."""
     if not report.ok:

@@ -3,7 +3,7 @@ pandas==3.0.5
 numpy==2.4.6
 SQLAlchemy==2.0.52
 python-dotenv==1.2.3
-requests==2.34.2
+requests==2.31.0  # pinned to fyers-apiv3 3.1.16's required version (hard pin in its METADATA)
 tabulate==0.10.0
 pydantic==2.13.4
 pytest==9.1.1

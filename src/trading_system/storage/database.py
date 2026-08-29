@@ -44,6 +44,11 @@ class OHLCVRecord(Base):
     symbol = Column(String(32), nullable=False, index=True)
     timeframe = Column(String(8), nullable=False, index=True)
     exchange = Column(String(16), nullable=True, index=True)
+    # Canonical contract identity (EXCHANGE:UNDERLYING|EXPIRY|STRIKE|CE/PE/FUT) for
+    # derivatives; equals "exchange:symbol" for equity/index. Lets us guarantee two
+    # contracts with different expiries/strikes/option-types NEVER collide even if a
+    # provider ever returned an ambiguous symbol. Backfilled from symbol by default.
+    contract_id = Column(String(64), nullable=True, index=True)
     timestamp = Column(DateTime(timezone=True), nullable=False, index=True)
     open = Column(Float, nullable=False)
     high = Column(Float, nullable=False)
@@ -63,6 +68,10 @@ class OHLCVRecord(Base):
             "ix_ohlcv_unique_lookup",
             "symbol", "timeframe", "timestamp", "provider", "exchange",
         ),
+        Index(
+            "ix_ohlcv_contract_lookup",
+            "contract_id", "timeframe", "timestamp", "provider", "exchange",
+        ),
         {"sqlite_autoincrement": True},
     )
 
@@ -78,12 +87,12 @@ def init_db(engine) -> None:
 
     inspector = inspect(engine)
     existing = {c["name"] for c in inspector.get_columns("market_data")}
-    needed = {"exchange"}
+    needed = {"exchange", "contract_id"}
     with engine.begin() as conn:
         for col in needed:
             if col not in existing:
                 conn.execute(
-                    text(f"ALTER TABLE market_data ADD COLUMN {col} VARCHAR(16)")
+                    text(f"ALTER TABLE market_data ADD COLUMN {col} VARCHAR(64)")
                 )
 
 
@@ -119,9 +128,15 @@ class MarketStore:
         seen: set[tuple] = set()
         for r in rows:
             ts = self._to_dt(r["timestamp"])
+            # Contract identity guards against expiry/strike collisions for F&O.
+            contract = r.get("contract_id") or r.get("symbol")
             rec = dict(r)
             rec["timestamp"] = ts
-            key = (r["symbol"], r["timeframe"], ts, r["provider"], r.get("exchange"))
+            rec["contract_id"] = contract
+            key = (
+                r["symbol"], r["timeframe"], ts, r["provider"],
+                r.get("exchange"), contract,
+            )
             if key in seen:
                 continue
             seen.add(key)
@@ -130,18 +145,26 @@ class MarketStore:
         new_count = 0
         with self._Session() as session:
             existing = session.execute(
-                select(OHLCVRecord.symbol, OHLCVRecord.timeframe,
-                       OHLCVRecord.timestamp, OHLCVRecord.provider, OHLCVRecord.exchange)
+                select(
+                    OHLCVRecord.symbol, OHLCVRecord.timeframe,
+                    OHLCVRecord.timestamp, OHLCVRecord.provider,
+                    OHLCVRecord.exchange, OHLCVRecord.contract_id,
+                )
             ).all()
             existing_keys = {
-                (e.symbol, e.timeframe,
-                 self._to_dt(e.timestamp), e.provider, e.exchange) for e in existing
+                (
+                    e.symbol, e.timeframe,
+                    self._to_dt(e.timestamp), e.provider, e.exchange,
+                    e.contract_id or e.symbol,
+                ) for e in existing
             }
             to_add = [
                 OHLCVRecord(**r)
                 for r in norm
-                if (r["symbol"], r["timeframe"], r["timestamp"], r["provider"], r.get("exchange"))
-                not in existing_keys
+                if (
+                    r["symbol"], r["timeframe"], r["timestamp"], r["provider"],
+                    r.get("exchange"), r.get("contract_id") or r.get("symbol"),
+                ) not in existing_keys
             ]
             if to_add:
                 session.add_all(to_add)

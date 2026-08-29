@@ -1,17 +1,20 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { INSTRUMENTS, mockQuote, mockAIAnalysis } from "@/data/mock";
+import { INSTRUMENTS, mockQuote, mockAIAnalysis, WATCHLIST_SYMBOLS, mockOHLCV } from "@/data/mock";
 import { useApp } from "@/store/AppContext";
 import { Badge, EmptyState } from "@/components/ui";
+import { Sparkline } from "@/components/charts/Sparkline";
 import { fmtPrice, fmtSigned, fmtPct, fmtVolume } from "@/lib/format";
+import type { OHLCVBar } from "@/types";
 
-type Row = ReturnType<typeof mockQuote> & { trend: string; signal: string };
+type Row = ReturnType<typeof mockQuote> & { trend: string; signal: string; spark: number[] };
 
 function buildRows(): Row[] {
   return INSTRUMENTS.map((m) => {
     const q = mockQuote(m.symbol);
     const ai = mockAIAnalysis(m.symbol);
-    return { ...q, trend: ai.bias, signal: ai.signal };
+    const bars: OHLCVBar[] = mockOHLCV(m.symbol, "1D", 30);
+    return { ...q, trend: ai.bias, signal: ai.signal, spark: bars.map((b) => b.close) };
   });
 }
 
@@ -20,16 +23,22 @@ export function MarketsPage() {
   const { setSelectedSymbol } = useApp();
   const [q, setQ] = useState("");
   const [typeFilter, setTypeFilter] = useState<"all" | "index" | "equity">("all");
+  const [rows, setRows] = useState<Row[]>([]);
 
-  const rows = useMemo(buildRows, []);
-  const filtered = rows.filter((r) => {
-    const matchQ = `${r.symbol} ${r.name}`.toLowerCase().includes(q.toLowerCase());
-    const matchT = typeFilter === "all" ? true : r.instrumentType === typeFilter;
-    return matchQ && matchT;
-  });
+  useEffect(() => { setRows(buildRows()); }, []);
 
-  const indices = filtered.filter((r) => r.instrumentType === "index");
-  const equities = filtered.filter((r) => r.instrumentType === "equity");
+  const filtered = useMemo(
+    () =>
+      rows.filter((r) => {
+        const matchQ = `${r.symbol} ${r.name}`.toLowerCase().includes(q.toLowerCase());
+        const matchT = typeFilter === "all" ? true : r.instrumentType === typeFilter;
+        return matchQ && matchT;
+      }),
+    [rows, q, typeFilter],
+  );
+
+  const adv = filtered.filter((r) => r.change >= 0).length;
+  const dec = filtered.length - adv;
 
   const open = (sym: string) => {
     setSelectedSymbol(sym);
@@ -38,14 +47,24 @@ export function MarketsPage() {
 
   const Table = ({ title, data }: { title: string; data: Row[] }) => (
     <div className="panel" style={{ marginTop: 16 }}>
-      <div className="panel-head"><span className="panel-title">{title}</span></div>
+      <div className="panel-head">
+        <span className="panel-title">{title}</span>
+        <span className="faint" style={{ fontSize: 11 }}>{data.length} symbols</span>
+      </div>
       {data.length === 0 ? (
         <EmptyState title="No matches" hint="Try a different search term." />
       ) : (
         <table className="data">
           <thead>
             <tr>
-              <th>Symbol</th><th>Price</th><th>Change</th><th>Chg %</th><th>Volume</th><th>Trend</th><th>Signal</th>
+              <th>Symbol</th>
+              <th className="num">Price</th>
+              <th className="num">Change</th>
+              <th className="num">Chg %</th>
+              <th className="num">Volume</th>
+              <th className="spark-col">Trend</th>
+              <th>Trend</th>
+              <th>Signal</th>
             </tr>
           </thead>
           <tbody>
@@ -58,10 +77,13 @@ export function MarketsPage() {
                     <div style={{ fontWeight: 600 }}>{r.symbol.replace("NSE:", "")}</div>
                     <div className="faint" style={{ fontSize: 11 }}>{r.name}</div>
                   </td>
-                  <td>₹{fmtPrice(r.price)}</td>
-                  <td className={up ? "pos" : "neg"}>{fmtSigned(r.change)}</td>
-                  <td className={up ? "pos" : "neg"}>{fmtPct(r.changePct)}</td>
-                  <td>{fmtVolume(r.volume)}</td>
+                  <td className="num mono">₹{fmtPrice(r.price)}</td>
+                  <td className={`num mono ${up ? "pos" : "neg"}`}>{fmtSigned(r.change)}</td>
+                  <td className={`num mono ${up ? "pos" : "neg"}`}>{fmtPct(r.changePct)}</td>
+                  <td className="num mono">{fmtVolume(r.volume)}</td>
+                  <td className="spark-col">
+                    <Sparkline data={r.spark} positive={up} width={84} height={24} />
+                  </td>
                   <td><Badge kind={r.trend}>{r.trend}</Badge></td>
                   <td><Badge kind={r.signal}>{r.signal.replace("_", " ")}</Badge></td>
                 </tr>
@@ -99,9 +121,27 @@ export function MarketsPage() {
           </div>
         </div>
       </div>
-      <Table title="Indices" data={indices} />
-      <Table title="Equities" data={equities} />
+
+      <div className="grid cols-3" style={{ gap: 12 }}>
+        <div className="stat-card">
+          <span className="label">Instruments</span>
+          <span className="value">{filtered.length}</span>
+        </div>
+        <div className="stat-card">
+          <span className="label">Advancing</span>
+          <span className="value pos">{adv}</span>
+        </div>
+        <div className="stat-card">
+          <span className="label">Declining</span>
+          <span className="value neg">{dec}</span>
+        </div>
+      </div>
+
+      <Table title="Indices" data={filtered.filter((r) => r.instrumentType === "index")} />
+      <Table title="Equities" data={filtered.filter((r) => r.instrumentType === "equity")} />
       <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>Mock market data.</p>
     </>
   );
 }
+
+void WATCHLIST_SYMBOLS;

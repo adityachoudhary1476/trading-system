@@ -1,9 +1,8 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, useEffect } from "react";
 import { dataSource } from "@/data/MarketDataSource";
 import type { Signal, SignalDirection } from "@/types";
-import { useEffect } from "react";
 import { Badge, EmptyState } from "@/components/ui";
-import { fmtPrice, fmtPct, fmtDateTime } from "@/lib/format";
+import { fmtPrice, fmtDateTime } from "@/lib/format";
 
 const SIGNAL_FILTERS: ("all" | SignalDirection)[] = ["all", "long", "short", "hold", "no_signal"];
 
@@ -29,6 +28,12 @@ export function SignalsPage() {
       .filter((s) => (dir === "all" ? true : s.direction === dir))
       .filter((s) => (sym ? s.symbol === sym : true));
   }, [signals, dir, sym]);
+
+  const counts = useMemo(() => {
+    const c: Record<string, number> = { long: 0, short: 0, hold: 0, no_signal: 0 };
+    signals?.forEach((s) => { c[s.direction] = (c[s.direction] ?? 0) + 1; });
+    return c;
+  }, [signals]);
 
   if (!signals) {
     return (
@@ -62,6 +67,15 @@ export function SignalsPage() {
         </div>
       </div>
 
+      <div className="grid cols-4" style={{ gap: 12, marginBottom: 16 }}>
+        {(["long", "short", "hold", "no_signal"] as const).map((d) => (
+          <div className="stat-card" key={d}>
+            <span className="label">{(d === "no_signal" ? "No Signal" : d[0].toUpperCase() + d.slice(1))}</span>
+            <span className={`value`}>{counts[d] ?? 0}</span>
+          </div>
+        ))}
+      </div>
+
       <div className="panel">
         {rows.length === 0 ? (
           <EmptyState title="No signals match" hint="Adjust the symbol or signal filter." />
@@ -73,17 +87,25 @@ export function SignalsPage() {
               </tr>
             </thead>
             <tbody>
-              {rows.map((s) => (
-                <tr key={s.id}>
-                  <td className="mono">{fmtDateTime(s.generatedAt)}</td>
-                  <td style={{ fontWeight: 600 }}>{s.symbol.replace("NSE:", "")}</td>
-                  <td><Badge kind={s.direction}>{s.direction.replace("_", " ")}</Badge></td>
-                  <td className="mono">{fmtPct(s.confidence * 100, 0).replace("%", "")}%</td>
-                  <td className="mono">₹{fmtPrice(s.price)}</td>
-                  <td><Badge kind={s.bias}>{s.bias}</Badge></td>
-                  <td className="muted" style={{ maxWidth: 360 }}>{s.reason}</td>
-                </tr>
-              ))}
+              {rows.map((s) => {
+                const conf = Math.round(s.confidence * 100);
+                return (
+                  <tr key={s.id} className={`sig-row sig-${s.direction}`}>
+                    <td className="mono">{fmtDateTime(s.generatedAt)}</td>
+                    <td style={{ fontWeight: 600 }}>{s.symbol.replace("NSE:", "")}</td>
+                    <td><Badge kind={s.direction}>{s.direction.replace("_", " ")}</Badge></td>
+                    <td className="num" style={{ minWidth: 120 }}>
+                      <div className="conf-bar" style={{ marginTop: 2 }}>
+                        <span className={s.direction === "short" ? "neg" : s.direction === "long" ? "pos" : "muted"} style={{ width: `${conf}%` }} />
+                      </div>
+                      <span className="mono" style={{ fontSize: 11 }}>{conf}%</span>
+                    </td>
+                    <td className="mono">₹{fmtPrice(s.price)}</td>
+                    <td><Badge kind={s.bias}>{s.bias}</Badge></td>
+                    <td className="muted" style={{ maxWidth: 360 }}>{s.reason}</td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

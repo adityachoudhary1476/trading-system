@@ -3,6 +3,7 @@ import { useApp } from "@/store/AppContext";
 import { dataSource } from "@/data/MarketDataSource";
 import type { MarketStatus } from "@/types";
 import { Panel } from "@/components/ui";
+import { fmtTime } from "@/lib/format";
 
 function sessionNow(): MarketStatus {
   // Mock: market is OPEN during 09:15–15:30 IST on weekdays.
@@ -29,7 +30,11 @@ export function MarketStatusPanel() {
   const open = status.open;
   return (
     <Panel title="Market Status">
-      <div className="grid cols-2" style={{ gap: 12 }}>
+      <div className={`mkt-status-head ${open ? "open" : "closed"}`}>
+        <span className="mkt-dot" />
+        <span className="mkt-status-text">{open ? "MARKET OPEN" : "MARKET CLOSED"}</span>
+      </div>
+      <div className="grid cols-2" style={{ gap: 12, marginTop: 12 }}>
         <div className="stat">
           <span className="label">Market</span>
           <span className="value">{status.market}</span>
@@ -43,10 +48,8 @@ export function MarketStatusPanel() {
           <span className="value mono" style={{ fontSize: 13 }}>{status.hours}</span>
         </div>
         <div className="stat">
-          <span className="label">Status</span>
-          <span className={`value ${open ? "pos" : "muted"}`} style={{ fontSize: 14 }}>
-            {open ? "MARKET OPEN" : "MARKET CLOSED"}
-          </span>
+          <span className="label">As of</span>
+          <span className="value mono" style={{ fontSize: 13 }}>{fmtTime(Date.now())}</span>
         </div>
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 12, marginBottom: 0 }}>

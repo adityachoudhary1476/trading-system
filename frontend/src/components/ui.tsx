@@ -3,22 +3,27 @@ import type { ReactNode } from "react";
 export function Panel({
   title,
   actions,
+  toolbar,
   children,
   className,
+  subtle,
 }: {
   title?: string;
   actions?: ReactNode;
+  toolbar?: ReactNode;
   children: ReactNode;
   className?: string;
+  subtle?: boolean;
 }) {
   return (
-    <section className={`panel${className ? ` ${className}` : ""}`}>
+    <section className={`panel${subtle ? " panel-subtle" : ""}${className ? ` ${className}` : ""}`}>
       {title && (
         <div className="panel-head">
           <span className="panel-title">{title}</span>
           {actions}
         </div>
       )}
+      {toolbar && <div className="panel-toolbar">{toolbar}</div>}
       <div className="panel-body">{children}</div>
     </section>
   );
@@ -55,5 +60,27 @@ export function Loading({ label = "Loading…" }: { label?: string }) {
       <div className="spinner" />
       <div>{label}</div>
     </div>
+  );
+}
+
+const STATUS_COLOR: Record<string, string> = {
+  healthy: "var(--positive)",
+  connected: "var(--positive)",
+  ready: "var(--accent)",
+  stale: "var(--warning)",
+  disconnected: "var(--negative)",
+  auth_error: "var(--negative)",
+  invalid_data: "var(--negative)",
+};
+
+/** Status dot + (optional) text. Used in System pipeline + Data Health. */
+export function HealthDot({ status, pulse }: { status: string; pulse?: boolean }) {
+  const color = STATUS_COLOR[status] ?? "var(--neutral)";
+  return (
+    <span
+      className={`health-dot${pulse && status === "healthy" ? " pulse" : ""}`}
+      style={{ background: color, boxShadow: `0 0 0 3px ${color}22` }}
+      aria-hidden="true"
+    />
   );
 }

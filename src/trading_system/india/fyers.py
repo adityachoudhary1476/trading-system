@@ -51,6 +51,35 @@ _RESOLUTION = {
 _DATA_BASE = "https://api-t1.fyers.in/data"
 _WS_URL = "wss://api.fyers.in/socket/v2/data/"
 
+# FYERS error codes we specifically need to distinguish (from Day 3 research /
+# documented FYERS v3 error responses). Code -16 is the canonical "could not
+# authenticate" response and MUST NOT be silently turned into empty data.
+_FYERS_AUTH_ERROR_CODES = {-16, 401, 403}
+
+
+class FYERSError(Exception):
+    """Base class for all FYERS provider errors.
+
+    Distinguishing auth / api / network failures matters for the backfill
+    command: an auth failure must look different from "no market data".
+    """
+
+
+class FYERSAuthError(FYERSError):
+    """Authentication failed (bad/expired token, missing credentials)."""
+
+
+class FYERSAPIError(FYERSError):
+    """FYERS returned an explicit API-level error (non-auth business error)."""
+
+
+class FYERSRateLimitError(FYERSError):
+    """FYERS signaled HTTP 429 (rate limited)."""
+
+
+class FYERSNetworkError(FYERSError):
+    """Transport-level failure (DNS, timeout, connection reset, exhausted retries)."""
+
 
 class FYERSMarketDataProvider(MarketDataProvider):
     name = "fyers"
@@ -118,14 +147,29 @@ class FYERSMarketDataProvider(MarketDataProvider):
         start: Optional[pd.Timestamp] = None,
         end: Optional[pd.Timestamp] = None,
     ) -> pd.DataFrame:
+        """Fetch a single (bounded) historical window for one symbol.
+
+        Used by the chunked backfill engine as the per-chunk fetch primitive.
+        The provider is the ONLY place that knows the FYERS date math, so the
+        start/end normalization lives here; the backfill command only controls
+        the overall range and chunk size via ``plan_chunks``.
+
+        Raises typed FYERS*Error on auth/api/network failures (never silently
+        returns an empty frame for a failed request). Returns an empty frame
+        ONLY when FYERS genuinely returns zero candles.
+        """
         if timeframe not in _RESOLUTION:
             raise ValueError(f"Unsupported timeframe for FYERS: {timeframe}")
         fy_sym = self._fyers_symbol(symbol)
 
         # Determine date range. FYERS caps: minute=100d/req, day+=366d/req.
-        end_ts = (end or pd.Timestamp.now(tz="UTC")).floor("D")
+        # Note: we keep the raw request window (un-floored end) so intraday
+        # backfills can retrieve the latest not-yet-floored candle if FYERS has
+        # it; the caller is responsible for not fabricating incomplete candles.
+        end_ts = end if end is not None else pd.Timestamp.now(tz="UTC")
+        end_ts = pd.Timestamp(end_ts).tz_convert("UTC") if getattr(end_ts, "tzinfo", None) else pd.Timestamp(end_ts, tz="UTC")
         if start is not None:
-            start_ts = pd.Timestamp(start).tz_convert("UTC") if start.tzinfo else pd.Timestamp(start, tz="UTC")
+            start_ts = pd.Timestamp(start).tz_convert("UTC") if getattr(start, "tzinfo", None) else pd.Timestamp(start, tz="UTC")
         elif limit is not None:
             # Approximate window from limit; clamps to official caps below.
             days = min(limit, 366) if timeframe in ("1d", "1w", "1M") else min(limit, 100)
@@ -145,6 +189,7 @@ class FYERSMarketDataProvider(MarketDataProvider):
         raw = self._get("/history", params)
         candles = raw.get("candles", []) if isinstance(raw, dict) else []
         if not candles:
+            # Genuinely no data for this (sub)window — empty frame is correct.
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
 
         df = pd.DataFrame(
@@ -169,12 +214,14 @@ class FYERSMarketDataProvider(MarketDataProvider):
     # --- REST helper --------------------------------------------------------
     def _get(self, path: str, params: dict) -> dict:
         url = f"{_DATA_BASE}{path}"
+        # Credentials are sent ONLY over the wire, never stored in exceptions,
+        # logs, or error messages (see task: never expose FYERS credentials).
         headers = {
             "Authorization": f"{self.client_id}:{self.access_token}",
         }
-    
+
         last_err: Optional[Exception] = None
-    
+
         for attempt in range(self.max_retries):
             try:
                 resp = requests.get(
@@ -183,19 +230,69 @@ class FYERSMarketDataProvider(MarketDataProvider):
                     headers=headers,
                     timeout=self.timeout,
                 )
-    
+
                 if resp.status_code == 429:
-                    time.sleep(2 ** attempt)
+                    time.sleep(min(2 ** attempt, 30))
                     continue
-    
-                resp.raise_for_status()
-                return resp.json()
-    
+
+                # FYERS sometimes returns 200 with an error payload:
+                #   {"s":"error","code":-16,"message":"Could not authenticate..."}
+                # We must NOT treat that as valid JSON data, and never swallow it
+                # as "empty" — surface it as a typed error.
+                if resp.status_code >= 400:
+                    payload = self._safe_parse(resp)
+                    code = payload.get("code") if isinstance(payload, dict) else None
+                    msg = payload.get("message") if isinstance(payload, dict) else resp.text
+                    if resp.status_code == 429:
+                        raise FYERSRateLimitError(
+                            f"FYERS rate limited (HTTP 429): {msg}"
+                        )
+                    if code in _FYERS_AUTH_ERROR_CODES or resp.status_code in (401, 403):
+                        raise FYERSAuthError(
+                            f"FYERS authentication failed (code={code}): {msg}"
+                        )
+                    raise FYERSAPIError(
+                        f"FYERS API error (HTTP {resp.status_code}, code={code}): {msg}"
+                    )
+
+                payload = self._safe_parse(resp)
+                if isinstance(payload, dict) and payload.get("s") == "error":
+                    code = payload.get("code")
+                    msg = payload.get("message", "unknown error")
+                    if code in _FYERS_AUTH_ERROR_CODES:
+                        raise FYERSAuthError(
+                            f"FYERS authentication failed (code={code}): {msg}"
+                        )
+                    raise FYERSAPIError(
+                        f"FYERS API error (code={code}): {msg}"
+                    )
+                return payload if isinstance(payload, dict) else {"raw": payload}
+
+            except FYERSError:
+                # Typed provider errors are authoritative — do not retry.
+                raise
             except (requests.RequestException, ValueError) as e:
                 last_err = e
-                time.sleep(1.5 * (attempt + 1))
-    
-        raise RuntimeError(f"FYERS request failed after retries: {last_err}")
+                time.sleep(min(1.5 * (attempt + 1), 30))
+
+        # Exhausted retries on network/parse errors.
+        raise FYERSNetworkError(
+            f"FYERS request failed after {self.max_retries} retries: {last_err}"
+        )
+
+    @staticmethod
+    def _safe_parse(resp) -> object:
+        """Parse a response body as JSON, returning a best-effort value.
+
+        Never raises (network/parse failures are reported by the caller).
+        """
+        try:
+            return resp.json()
+        except (ValueError, AttributeError):
+            try:
+                return resp.text
+            except Exception:  # pragma: no cover - defensive
+                return None
 
     # --- WebSocket (live) ---------------------------------------------------
     def connect_live(

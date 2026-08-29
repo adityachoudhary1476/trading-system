@@ -1,0 +1,38 @@
+{
+  "DEFAULT_BASKET": {
+    "symbols": ["NSE:RELIANCE", "NSE:TCS", "NSE:INFY", "NSE:HDFCBANK", "NSE:ICICIBANK", "NSE:SBIN"],
+    "segment": "equity",
+    "description": "Equity instruments already present in the InstrumentRegistry defaults. Safe to backfill.",
+    "requires_constituents": false
+  },
+  "INDICES": {
+    "symbols": ["NSE:NIFTY50", "NSE:NIFTYBANK", "NSE:FINNIFTY"],
+    "segment": "index",
+    "description": "Index instruments in the registry defaults.",
+    "requires_constituents": false
+  },
+  "NIFTY50": {
+    "symbols": [],
+    "segment": "fno",
+    "description": "NIFTY 50 constituents. POPULATE FROM OFFICIAL NSE LIST before use. Do not fabricate.",
+    "requires_constituents": true
+  },
+  "NIFTY100": {
+    "symbols": [],
+    "segment": "fno",
+    "description": "NIFTY 100 constituents. POPULATE FROM OFFICIAL NSE LIST before use.",
+    "requires_constituents": true
+  },
+  "LIQUID_FNO": {
+    "symbols": [],
+    "segment": "fno",
+    "description": "Liquid F&O underlyings. POPULATE FROM OFFICIAL NSE F&O LIST before use.",
+    "requires_constituents": true
+  },
+  "MCX_RESEARCH": {
+    "symbols": [],
+    "segment": "mcx",
+    "description": "MCX liquid commodities. POPULATE FROM OFFICIAL MCX LIST before use.",
+    "requires_constituents": true
+  }
+}

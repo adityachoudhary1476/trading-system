@@ -5,10 +5,9 @@ queries (get/ search/ equities/ indices/ derivatives). Provider-specific symbol
 masters (e.g. FYERS CSV) are parsed into the normalized model by the importer, so
 the rest of the system never depends on a broker's raw master format.
 
-Design note: the system must eventually *discover* instruments dynamically from a
-provider master rather than rely on a hand-coded list. `import_master_rows` accepts
-already-parsed rows (or fixture data) and merges them in. Live master download is
-out of scope for Day 4 (requires auth); the integration is a thin step later.
+Day 6 extension: derivative discovery (futures / options / expiries) behind a
+provider-independent interface. The FYERS implementation uses the live
+``optionchain`` endpoint (read-only, no orders); see ``FyersInstrumentDiscovery``.
 """
 from __future__ import annotations
 
@@ -23,6 +22,7 @@ from .instruments import (
     InstrumentRegistry,
     InstrumentType,
     InternalSymbol,
+    OptionType,
 )
 from .symbol_map import from_fyers_symbol, to_fyers_symbol
 
@@ -42,6 +42,9 @@ class InstrumentRepository:
 
     def __init__(self, registry: Optional[InstrumentRegistry] = None) -> None:
         self.registry = registry or InstrumentRegistry()
+        # Cache of discovered derivative contracts, keyed by contract_id, so we can
+        # answer list_futures/list_options/get_expiries without re-hitting the API.
+        self._derivatives: dict[str, Instrument] = {}
 
     # --- normalized queries ----------------------------------------------
     def get_instrument(self, symbol: str) -> Optional[Instrument]:
@@ -49,6 +52,10 @@ class InstrumentRepository:
 
     def register(self, instrument: Instrument) -> None:
         self.registry.register(instrument)
+        if instrument.instrument_type in (
+            InstrumentType.FUTURE, InstrumentType.OPTION_CE, InstrumentType.OPTION_PE
+        ):
+            self._derivatives[instrument.contract_id] = instrument
 
     def search_instruments(self, query: str) -> list[Instrument]:
         q = query.upper()
@@ -82,6 +89,77 @@ class InstrumentRepository:
             out = [i for i in out if i.internal.exchange == exchange.upper()]
         return out
 
+    # --- derivative discovery (provider-independent interface) ------------
+    def list_futures(
+        self, underlying: str, exchange: str | None = None
+    ) -> list[Instrument]:
+        """All known futures for an underlying (e.g. 'NIFTY')."""
+        u = underlying.upper()
+        out = [
+            i for i in self._derivatives.values()
+            if i.instrument_type == InstrumentType.FUTURE and (i.underlying or "").upper() == u
+        ]
+        if exchange:
+            out = [i for i in out if i.internal.exchange == exchange.upper()]
+        return sorted(out, key=lambda i: i.expiry or "")
+
+    def list_options(
+        self,
+        underlying: str,
+        expiry: Optional[str] = None,
+        option_type: Optional[str] = None,
+        exchange: str | None = None,
+    ) -> list[Instrument]:
+        """All known options for an underlying, optionally filtered by expiry/CE/PE."""
+        u = underlying.upper()
+        out = [
+            i for i in self._derivatives.values()
+            if i.instrument_type in (InstrumentType.OPTION_CE, InstrumentType.OPTION_PE)
+            and (i.underlying or "").upper() == u
+        ]
+        if expiry:
+            out = [i for i in out if i.expiry == date.fromisoformat(expiry).isoformat()]
+        if option_type:
+            ot = option_type.upper()
+            out = [
+                i for i in out
+                if (i.option_type or ("CE" if i.instrument_type == InstrumentType.OPTION_CE else "PE")) == ot
+            ]
+        if exchange:
+            out = [i for i in out if i.internal.exchange == exchange.upper()]
+        return sorted(out, key=lambda i: (i.expiry or "", i.strike or 0))
+
+    def get_expiries(self, underlying: str) -> list[str]:
+        """Distinct expiry dates known for an underlying (sorted)."""
+        u = underlying.upper()
+        exps = {
+            i.expiry for i in self._derivatives.values()
+            if (i.underlying or "").upper() == u and i.expiry
+        }
+        return sorted(exps)
+
+    def find_contract(
+        self,
+        underlying: str,
+        expiry: str,
+        option_type: Optional[str] = None,
+        strike: Optional[float] = None,
+    ) -> Optional[Instrument]:
+        """Find a single contract by identity (future or specific option)."""
+        u = underlying.upper()
+        iso_exp = date.fromisoformat(expiry).isoformat()
+        for i in self._derivatives.values():
+            if (i.underlying or "").upper() != u or i.expiry != iso_exp:
+                continue
+            if option_type is None:
+                if i.instrument_type == InstrumentType.FUTURE:
+                    return i
+            else:
+                ot = option_type.upper()
+                if (i.option_type == ot) and (strike is None or i.strike == float(strike)):
+                    return i
+        return None
+
     # --- importing parsed rows (provider-agnostic) ------------------------
     def import_master_rows(self, rows: Iterable[dict]) -> int:
         """Merge parsed master rows into the registry. Returns count added."""
@@ -91,7 +169,7 @@ class InstrumentRepository:
             if instr is not None:
                 existing = self.registry.get(instr.internal)
                 if existing is None or not existing.provider_symbol:
-                    self.registry.register(instr)
+                    self.register(instr)
                     added += 1
         return added
 

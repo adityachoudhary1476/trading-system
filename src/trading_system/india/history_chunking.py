@@ -31,13 +31,13 @@ FYERS_MAX_DAYS_PER_REQUEST = {
 }
 
 # Internal timeframe -> FYERS resolution token (mirrors fyers._RESOLUTION).
-_INTERNAL_TO_FYERS = {v: k for k, v in _RESOLUTION.items()} if False else None
-_INTERNAL_TF = {v: k for k, v in _RESOLUTION.items()}
+# `_RESOLUTION` maps internal name -> FYERS token, e.g. "1d" -> "D", "5m" -> "5".
+_FYERS_TOKEN_OF = dict(_RESOLUTION)
 
 
 def _fy_cap_days(timeframe: str) -> int:
     """Max days/request for an internal timeframe under FYERS caps."""
-    token = _INTERNAL_TF.get(timeframe)
+    token = _FYERS_TOKEN_OF.get(timeframe)
     if token is None:
         # Unknown resolution: be conservative (small window) rather than assume.
         return 30
@@ -61,11 +61,21 @@ def plan_chunks(
 ) -> list[DateChunk]:
     """Split [start, end] into non-overlapping daily-bounded chunks.
 
-    Each chunk's span never exceeds the provider's per-request cap. Chunks are
-    adjacent and cover the full range exactly. Pure function (no I/O).
+    Chunks are stored as **inclusive-looking** DateChunks whose `end` is the last
+    datetime *included* in that chunk; consecutive chunks are **exclusive** at the
+    boundary (chunk N+1 starts at chunk N's end + 1 day), so there is never a day
+    of overlap that would double-count candles. Time-of-day from `start`/`end` is
+    preserved (not floored to midnight) so intraday backfills reach the true end.
+
+    Each chunk's span never exceeds the provider's per-request cap. Pure
+    function (no I/O).
     """
-    start = pd.Timestamp(start).normalize()
-    end = pd.Timestamp(end).normalize()
+    start = pd.Timestamp(start)
+    end = pd.Timestamp(end)
+    if start.tzinfo is None:
+        start = start.tz_localize("UTC")
+    if end.tzinfo is None:
+        end = end.tz_localize("UTC")
     if start > end:
         raise ValueError("start must be <= end")
     cap = max_days_per_request if max_days_per_request is not None else _fy_cap_days(timeframe)
@@ -74,9 +84,9 @@ def plan_chunks(
     chunks: list[DateChunk] = []
     cur = start
     while cur <= end:
-        nxt = min(cur + timedelta(days=cap - 1), end)
+        nxt = min(cur + timedelta(days=cap), end)
         chunks.append(DateChunk(start=cur, end=nxt))
-        cur = nxt + timedelta(days=1)
+        cur = nxt + timedelta(days=1)  # exclusive boundary -> no overlap
     return chunks
 
 

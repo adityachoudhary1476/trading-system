@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { dataSource } from "@/data/MarketDataSource";
 import type { MarketQuote } from "@/types";
-import { fmtPrice, fmtSigned, fmtPct, fmtVolume } from "@/lib/format";
+import { fmtPrice, fmtSigned, fmtPct, fmtVolume, fmtTime } from "@/lib/format";
 import { Stat } from "@/components/ui";
 
 export function QuoteHeader({ symbol }: { symbol: string }) {
@@ -14,28 +14,53 @@ export function QuoteHeader({ symbol }: { symbol: string }) {
   if (!q) return null;
   const up = q.change >= 0;
   return (
-    <div className="page-head">
-      <div>
+    <div className="page-head instrument-head">
+      <div className="instrument-id">
         <h1 className="page-title">
           {q.symbol.replace("NSE:", "")} <span className="sym">{q.name}</span>
         </h1>
         <div className="subtitle">
-          {q.exchange} · {q.providerSymbol} · {q.instrumentType.toUpperCase()}
+          {q.exchange} · {q.instrumentType.toUpperCase()} · <span className="mono">{q.providerSymbol}</span>
         </div>
       </div>
-      <div style={{ display: "flex", alignItems: "baseline", gap: 16 }}>
-        <div style={{ fontSize: 28, fontWeight: 700, fontVariantNumeric: "tabular-nums" }}>
-          ₹{fmtPrice(q.price)}
-        </div>
-        <div style={{ textAlign: "right" }}>
-          <div className={up ? "pos" : "neg"} style={{ fontWeight: 600, fontVariantNumeric: "tabular-nums" }}>
-            {fmtSigned(q.change)} ({fmtPct(q.changePct)})
-          </div>
-          <div className="faint" style={{ fontSize: 11 }}>
-            prev close ₹{fmtPrice(q.previousClose)}
-          </div>
+      <div className="instrument-quote">
+        <div className="iq-price mono">{up ? "" : "-"}₹{fmtPrice(Math.abs(q.price))}</div>
+        <span className={`chg-pill ${up ? "pos" : "neg"}`}>
+          {up ? "▲" : "▼"} {fmtSigned(q.change)} ({fmtPct(q.changePct)})
+        </span>
+        <div className="iq-meta faint">
+          Prev Close <span className="mono">₹{fmtPrice(q.previousClose)}</span> · {fmtTime(q.lastUpdate)}
         </div>
       </div>
+    </div>
+  );
+}
+
+/** Compact terminal-style strip of key session metrics (open/high/low/vol/prev/VWAP). */
+export function MetricsStrip({ symbol }: { symbol: string }) {
+  const [q, setQ] = useState<MarketQuote | null>(null);
+  useEffect(() => {
+    let alive = true;
+    dataSource.getQuote(symbol).then((r) => alive && setQ(r));
+    return () => { alive = false; };
+  }, [symbol]);
+  if (!q) return null;
+  const cells: { k: string; v: string; tone?: "pos" | "neg" }[] = [
+    { k: "Open", v: `₹${fmtPrice(q.dayOpen)}` },
+    { k: "High", v: `₹${fmtPrice(q.dayHigh)}`, tone: "pos" },
+    { k: "Low", v: `₹${fmtPrice(q.dayLow)}`, tone: "neg" },
+    { k: "Volume", v: fmtVolume(q.volume) },
+    { k: "Prev Close", v: `₹${fmtPrice(q.previousClose)}` },
+    { k: "VWAP", v: `₹${fmtPrice(q.vwap)}` },
+  ];
+  return (
+    <div className="metric-strip" role="list">
+      {cells.map((c) => (
+        <div className="ms-cell" role="listitem" key={c.k}>
+          <span className="ms-k">{c.k}</span>
+          <span className={`ms-v mono${c.tone ? " " + c.tone : ""}`}>{c.v}</span>
+        </div>
+      ))}
     </div>
   );
 }

@@ -2,8 +2,8 @@ import { useEffect, useState } from "react";
 import { dataSource } from "@/data/MarketDataSource";
 import { useApp } from "@/store/AppContext";
 import type { PipelineStage } from "@/types";
-import { Badge, Panel } from "@/components/ui";
-import { fmtHM } from "@/lib/format";
+import { Badge, Panel, HealthDot } from "@/components/ui";
+import { fmtAgo } from "@/lib/format";
 
 export function SystemPage() {
   const { env } = useApp();
@@ -21,6 +21,7 @@ export function SystemPage() {
           <h1 className="page-title">System</h1>
           <div className="subtitle">Pipeline health & runtime environment.</div>
         </div>
+        <span className="mock-badge"><span className="dot" /> {env.mode === "mock" ? "Demo Data" : "Live"}</span>
       </div>
 
       <div className="grid cols-3" style={{ gap: 16 }}>
@@ -31,15 +32,21 @@ export function SystemPage() {
 
       <div className="panel" style={{ marginTop: 16 }}>
         <div className="panel-head"><span className="panel-title">Pipeline</span></div>
-        <div className="pipe">
+        <div className="pipeline-flow">
           {stages.map((s, i) => (
-            <div key={s.id}>
-              <div className="pipe-stage">
-                <span style={{ fontWeight: 600 }}>{s.label}</span>
-                <span className="pipe-metric">{s.metric}</span>
+            <div className="pf-node" key={s.id}>
+              <div className="pf-left">
+                <HealthDot status={s.status} pulse />
+              </div>
+              <div className="pf-body">
+                <div className="pf-label">{s.label}</div>
+                <div className="pf-metric">{s.metric}</div>
+                <div className="pf-time">last activity {fmtAgo(s.lastActivity)}</div>
+              </div>
+              <div className="pf-right">
                 <Badge kind={s.status}>{s.status.replace("_", " ")}</Badge>
               </div>
-              {i < stages.length - 1 && <div className="pipe-arrow">↓</div>}
+              {i < stages.length - 1 && <div className="pf-connector" aria-hidden="true" />}
             </div>
           ))}
         </div>
@@ -61,5 +68,3 @@ function EnvRow({ k, v, tone }: { k: string; v: string; tone?: "pos" | "neg" }) 
     </div>
   );
 }
-
-void fmtHM;

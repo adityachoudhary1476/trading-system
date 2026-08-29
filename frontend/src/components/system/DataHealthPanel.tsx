@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { dataSource } from "@/data/MarketDataSource";
 import type { FeedHealth } from "@/types";
-import { Panel, Badge, Loading, EmptyState } from "@/components/ui";
-import { fmtTime, fmtHM } from "@/lib/format";
+import { Panel, Badge, Loading, HealthDot } from "@/components/ui";
+import { fmtAgo } from "@/lib/format";
 
 export function DataHealthPanel() {
   const [h, setH] = useState<FeedHealth | null>(null);
@@ -17,7 +17,12 @@ export function DataHealthPanel() {
   return (
     <Panel
       title="Data Health"
-      actions={<Badge kind={h.status}>{h.status.replace("_", " ")}</Badge>}
+      actions={
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          <HealthDot status={h.status} pulse />
+          <Badge kind={h.status}>{h.status.replace("_", " ")}</Badge>
+        </span>
+      }
     >
       <div className="grid cols-2" style={{ gap: 12 }}>
         <div className="stat">
@@ -26,7 +31,7 @@ export function DataHealthPanel() {
         </div>
         <div className="stat">
           <span className="label">Last Tick</span>
-          <span className="value mono" style={{ fontSize: 13 }}>{fmtTime(h.lastTick)}</span>
+          <span className="value mono" style={{ fontSize: 13 }}>{fmtAgo(h.lastTick)}</span>
         </div>
         <div className="stat">
           <span className="label">Events Received</span>
@@ -42,7 +47,7 @@ export function DataHealthPanel() {
         </div>
         <div className="stat">
           <span className="label">Last Closed Candle</span>
-          <span className="value mono" style={{ fontSize: 13 }}>{fmtHM(h.lastClosedCandle)}</span>
+          <span className="value mono" style={{ fontSize: 13 }}>{fmtAgo(h.lastClosedCandle)}</span>
         </div>
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 12, marginBottom: 0 }}>
@@ -51,5 +56,3 @@ export function DataHealthPanel() {
     </Panel>
   );
 }
-
-void EmptyState;
