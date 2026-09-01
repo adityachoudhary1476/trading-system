@@ -40,12 +40,23 @@ const CONNECTION_META: Record<
 export function SystemPage() {
   const { env } = useApp();
   const [stages, setStages] = useState<PipelineStage[]>([]);
+  const [stagesError, setStagesError] = useState<string | null>(null);
   const [connState, setConnState] = useState<ConnectionState>({ kind: "loading" });
 
   useEffect(() => {
     let alive = true;
-    dataSource.getPipeline().then((r) => alive && setStages(r));
-    return () => { alive = false; };
+    setStagesError(null);
+    dataSource
+      .getPipeline()
+      .then((r) => {
+        if (alive) setStages(r);
+      })
+      .catch((err: unknown) => {
+        if (alive) setStagesError(err instanceof Error ? err.message : "Failed to load pipeline");
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -102,24 +113,32 @@ export function SystemPage() {
 
       <div className="panel" style={{ marginTop: 16 }}>
         <div className="panel-head"><span className="panel-title">Pipeline</span></div>
-        <div className="pipeline-flow">
-          {stages.map((s, i) => (
-            <div className="pf-node" key={s.id}>
-              <div className="pf-left">
-                <HealthDot status={s.status} pulse />
+        {stagesError ? (
+          <div className="empty">
+            <div className="empty-icon" aria-hidden="true">⚠</div>
+            <div style={{ fontWeight: 600, color: "var(--text-dim)" }}>Unable to load pipeline</div>
+            <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{stagesError}</div>
+          </div>
+        ) : (
+          <div className="pipeline-flow">
+            {stages.map((s, i) => (
+              <div className="pf-node" key={s.id}>
+                <div className="pf-left">
+                  <HealthDot status={s.status} pulse />
+                </div>
+                <div className="pf-body">
+                  <div className="pf-label">{s.label}</div>
+                  <div className="pf-metric">{s.metric}</div>
+                  <div className="pf-time">last activity {fmtAgo(s.lastActivity)}</div>
+                </div>
+                <div className="pf-right">
+                  <Badge kind={s.status}>{s.status.replace("_", " ")}</Badge>
+                </div>
+                {i < stages.length - 1 && <div className="pf-connector" aria-hidden="true" />}
               </div>
-              <div className="pf-body">
-                <div className="pf-label">{s.label}</div>
-                <div className="pf-metric">{s.metric}</div>
-                <div className="pf-time">last activity {fmtAgo(s.lastActivity)}</div>
-              </div>
-              <div className="pf-right">
-                <Badge kind={s.status}>{s.status.replace("_", " ")}</Badge>
-              </div>
-              {i < stages.length - 1 && <div className="pf-connector" aria-hidden="true" />}
-            </div>
-          ))}
-        </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>

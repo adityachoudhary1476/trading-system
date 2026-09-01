@@ -104,7 +104,14 @@ function WatchRow({ sym, active, onSelect }: { sym: string; active: boolean; onS
   const [series, setSeries] = useState<number[]>([]);
   useEffect(() => {
     let alive = true;
-    dataSource.getOHLCV(sym, "1D", 40).then((bars) => alive && setSeries(bars.map((b) => b.close)));
+    dataSource
+      .getOHLCV(sym, "1D", 40)
+      .then((bars) => {
+        if (alive) setSeries(bars.map((b) => b.close));
+      })
+      .catch(() => {
+        if (alive) setSeries([]);
+      });
     return () => {
       alive = false;
     };

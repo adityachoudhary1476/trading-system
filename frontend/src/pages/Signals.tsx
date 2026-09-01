@@ -8,13 +8,24 @@ const SIGNAL_FILTERS: ("all" | SignalDirection)[] = ["all", "long", "short", "ho
 
 export function SignalsPage() {
   const [signals, setSignals] = useState<Signal[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [sym, setSym] = useState("");
   const [dir, setDir] = useState<"all" | SignalDirection>("all");
 
   useEffect(() => {
     let alive = true;
-    dataSource.getSignals(18).then((r) => alive && setSignals(r));
-    return () => { alive = false; };
+    setError(null);
+    dataSource
+      .getSignals(18)
+      .then((r) => {
+        if (alive) setSignals(r);
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(err instanceof Error ? err.message : "Failed to load signals");
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
 
   const symbols = useMemo(
@@ -34,6 +45,21 @@ export function SignalsPage() {
     signals?.forEach((s) => { c[s.direction] = (c[s.direction] ?? 0) + 1; });
     return c;
   }, [signals]);
+
+  if (error) {
+    return (
+      <>
+        <div className="page-head"><h1 className="page-title">Signals</h1></div>
+        <div className="panel">
+          <div className="empty">
+            <div className="empty-icon" aria-hidden="true">⚠</div>
+            <div style={{ fontWeight: 600, color: "var(--text-dim)" }}>Unable to load signals</div>
+            <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{error}</div>
+          </div>
+        </div>
+      </>
+    );
+  }
 
   if (!signals) {
     return (
