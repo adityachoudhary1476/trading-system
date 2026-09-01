@@ -11,6 +11,7 @@ const MAIN_NAV = [
   { to: "/markets", label: "Markets" },
   { to: "/signals", label: "Signals" },
   { to: "/system", label: "System" },
+  { to: "/broker", label: "Broker" },
 ];
 
 const PAPER_NAV = [

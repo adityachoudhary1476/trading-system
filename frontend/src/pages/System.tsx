@@ -4,15 +4,63 @@ import { useApp } from "@/store/AppContext";
 import type { PipelineStage } from "@/types";
 import { Badge, Panel, HealthDot } from "@/components/ui";
 import { fmtAgo } from "@/lib/format";
+import { fetchConnectionStatus } from "@/lib/upstox";
+import type { ConnectionStatus } from "@/lib/upstox";
+
+type ConnectionState =
+  | { kind: "loading" }
+  | { kind: "mock" }
+  | { kind: "connected"; obtainedAt?: string }
+  | { kind: "not_connected" }
+  | { kind: "network_error" };
+
+function deriveConnectionState(
+  status: ConnectionStatus | null,
+  mode: "mock" | "live",
+): ConnectionState {
+  if (mode === "mock") return { kind: "mock" };
+  if (status === null) return { kind: "loading" };
+  if (status.connected) {
+    return { kind: "connected", obtainedAt: status.obtained_at };
+  }
+  return { kind: "not_connected" };
+}
+
+const CONNECTION_META: Record<
+  ConnectionState["kind"],
+  { label: string; tone: "pos" | "neg" | "warn" | "muted" }
+> = {
+  loading: { label: "Checking…", tone: "muted" },
+  mock: { label: "Mock", tone: "warn" },
+  connected: { label: "Connected", tone: "pos" },
+  not_connected: { label: "Not Connected", tone: "neg" },
+  network_error: { label: "Network Error", tone: "neg" },
+};
 
 export function SystemPage() {
   const { env } = useApp();
   const [stages, setStages] = useState<PipelineStage[]>([]);
+  const [connState, setConnState] = useState<ConnectionState>({ kind: "loading" });
+
   useEffect(() => {
     let alive = true;
     dataSource.getPipeline().then((r) => alive && setStages(r));
     return () => { alive = false; };
   }, []);
+
+  useEffect(() => {
+    if (env.mode !== "live") {
+      setConnState({ kind: "mock" });
+      return;
+    }
+    let alive = true;
+    fetchConnectionStatus()
+      .then((s) => alive && setConnState(deriveConnectionState(s, "live")))
+      .catch(() => alive && setConnState({ kind: "network_error" }));
+    return () => { alive = false; };
+  }, [env.mode]);
+
+  const connMeta = CONNECTION_META[connState.kind];
 
   return (
     <>
@@ -28,6 +76,28 @@ export function SystemPage() {
         <Panel title="Environment"><EnvRow k="Environment" v={env.environment} /></Panel>
         <Panel title="Data Source"><EnvRow k="Data Source" v={env.dataSource} /></Panel>
         <Panel title="Execution"><EnvRow k="Execution" v={env.execution} tone={env.execution === "DISABLED" ? "pos" : "neg"} /></Panel>
+      </div>
+
+      <div className="panel" style={{ marginTop: 16 }}>
+        <div className="panel-head">
+          <span className="panel-title">Upstox Connection</span>
+        </div>
+        <div className="stat">
+          <span className="label">Status</span>
+          <span className={`value ${connMeta.tone}`} style={{ fontSize: 15 }}>
+            {connMeta.label}
+          </span>
+        </div>
+        {connState.kind === "connected" && connState.obtainedAt && (
+          <div className="faint" style={{ fontSize: 12, marginTop: 8 }}>
+            Connected {new Date(connState.obtainedAt).toLocaleString()}
+          </div>
+        )}
+        {connState.kind === "network_error" && (
+          <div className="faint" style={{ fontSize: 12, marginTop: 8 }}>
+            Unable to reach the server. Check your network connection.
+          </div>
+        )}
       </div>
 
       <div className="panel" style={{ marginTop: 16 }}>
@@ -53,8 +123,8 @@ export function SystemPage() {
       </div>
 
       <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>
-        Mock pipeline status. Each stage maps to a real backend component (Upstox → events → bus → candle
-        pipeline → data health → snapshot → AI → signal). Connection state is OFFLINE / MOCK — not connected to Upstox.
+        Pipeline status reflects the {env.mode === "mock" ? "mock" : "live"} data source.
+        Connection state is derived from the server-side Upstox token verification.
       </p>
     </>
   );

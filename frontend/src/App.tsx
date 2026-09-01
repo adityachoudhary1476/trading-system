@@ -5,6 +5,7 @@ import { DashboardPage } from "@/pages/Dashboard";
 import { MarketsPage } from "@/pages/Markets";
 import { SignalsPage } from "@/pages/Signals";
 import { SystemPage } from "@/pages/System";
+import { BrokerConnectionsPage } from "@/pages/BrokerConnections";
 import { PaperTradingPage } from "@/pages/paper/PaperTrading";
 import { PaperOverview } from "@/pages/paper/PaperOverview";
 import { PaperDeployments } from "@/pages/paper/PaperDeployments";
@@ -52,6 +53,7 @@ export function App() {
           <Route path="/markets" element={<MarketsPage />} />
           <Route path="/signals" element={<SignalsPage />} />
           <Route path="/system" element={<SystemPage />} />
+          <Route path="/broker" element={<BrokerConnectionsPage />} />
           <Route path="/paper" element={<PaperTradingPage />}>
             <Route index element={<PaperOverview />} />
             <Route path="overview" element={<PaperOverview />} />
