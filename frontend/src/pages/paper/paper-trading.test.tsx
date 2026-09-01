@@ -675,14 +675,146 @@ describe("Paper Trading Frontend", () => {
   });
 
   describe("PaperPositions", () => {
-    it("renders flat position state", async () => {
-      vi.mocked(paperApi.getPositions).mockResolvedValue({ ok: true, data: { positions: { open_position: null, is_flat: true }, schema_version: 1 } } as any);
+    const positionsMock = {
+      positions: {
+        open_position: null,
+        is_flat: true,
+      },
+      schema_version: 1,
+    };
+
+    const openPositionMock = {
+      positions: {
+        open_position: {
+          symbol: "NSE:SBIN",
+          quantity: 100,
+          side: "long",
+          entry_price: 450.5,
+          current_price: 455.75,
+          unrealized_pnl: 525,
+          position_value: 45575,
+        },
+        is_flat: false,
+      },
+      schema_version: 1,
+    };
+
+    beforeEach(() => {
+      vi.mocked(paperApi.getDeployment).mockResolvedValue({ ok: true, data: { deployment: mockDeployments.deployments[0], schema_version: 1 } } as any);
+      vi.mocked(paperApi.getPositions).mockResolvedValue({ ok: true, data: positionsMock } as any);
+    });
+
+    it("renders flat position state with deployment context", async () => {
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText(/No open position/)).toBeDefined();
+      });
+      expect(screen.getByText("strat-1")).toBeDefined();
+      expect(screen.getAllByText(/NSE:SBIN/).length).toBeGreaterThan(0);
+      expect(screen.getAllByText("PAPER").length).toBeGreaterThan(0);
+    });
+
+    it("renders open position with metrics", async () => {
+      vi.mocked(paperApi.getPositions).mockResolvedValue({ ok: true, data: openPositionMock } as any);
 
       renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
 
       await waitFor(() => {
-        expect(screen.getByText(/No open positions/)).toBeDefined();
+        expect(screen.getByText("Position Detail")).toBeDefined();
       });
+      expect(screen.getAllByText(/NSE:SBIN/).length).toBeGreaterThan(0);
+      expect(screen.getAllByText("LONG").length).toBeGreaterThan(0);
+      expect(screen.getAllByText(/45,?575/).length).toBeGreaterThan(0);
+    });
+
+    it("shows positive P&L in positive tone", async () => {
+      vi.mocked(paperApi.getPositions).mockResolvedValue({ ok: true, data: openPositionMock } as any);
+
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Position Detail")).toBeDefined();
+      });
+      expect(screen.getAllByText(/525/).length).toBeGreaterThan(0);
+    });
+
+    it("shows negative P&L in negative tone", async () => {
+      const lossMock = {
+        ...openPositionMock,
+        positions: {
+          ...openPositionMock.positions,
+          open_position: {
+            ...openPositionMock.positions.open_position,
+            unrealized_pnl: -300,
+          },
+          is_flat: false,
+        },
+      };
+      vi.mocked(paperApi.getPositions).mockResolvedValue({ ok: true, data: lossMock } as any);
+
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Position Detail")).toBeDefined();
+      });
+      expect(screen.getAllByText(/300/).length).toBeGreaterThan(0);
+    });
+
+    it("renders navigation links", async () => {
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Deployment Detail")).toBeDefined();
+      });
+      expect(screen.getByText("Session")).toBeDefined();
+      expect(screen.getByText("Events")).toBeDefined();
+      expect(screen.getByText("Risk & Health")).toBeDefined();
+    });
+
+    it("shows error state with retry", async () => {
+      vi.mocked(paperApi.getPositions).mockResolvedValue({ ok: false, error: { code: "network_error", message: "Failed" }, status: 0 } as any);
+
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Unable to load positions")).toBeDefined();
+      });
+      expect(screen.getByText("Failed")).toBeDefined();
+    });
+
+    it("shows loading skeleton", async () => {
+      vi.mocked(paperApi.getPositions).mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve({ ok: true, data: positionsMock } as any), 200))
+      );
+
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      expect(screen.getByLabelText("Loading positions")).toBeDefined();
+    });
+
+    it("does not contain buy/sell/order controls", async () => {
+      vi.mocked(paperApi.getPositions).mockResolvedValue({ ok: true, data: openPositionMock } as any);
+
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Position Detail")).toBeDefined();
+      });
+      expect(screen.queryByText("Buy")).toBeNull();
+      expect(screen.queryByText("Sell")).toBeNull();
+      expect(screen.queryByText("Close")).toBeNull();
+    });
+
+    it("does not contain broker or credential UI", async () => {
+      renderWithParams(<PaperPositions />, "/paper/positions/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText(/No open position/)).toBeDefined();
+      });
+      expect(screen.queryByText(/API Key/i)).toBeNull();
+      expect(screen.queryByText(/Secret/i)).toBeNull();
+      expect(screen.queryByText(/Broker/i)).toBeNull();
     });
   });
 

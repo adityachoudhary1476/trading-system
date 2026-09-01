@@ -1974,6 +1974,57 @@ table.data tbody tr.active {
   margin-top: 4px;
 }
 
+/* ---------- Position banner ---------- */
+.pos-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px 16px;
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius);
+  margin-bottom: 16px;
+}
+.pos-banner.pos-flat { border-left: 3px solid var(--neutral); }
+.pos-banner.pos-open { border-left: 3px solid var(--positive); }
+.pos-banner-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pos-banner-status {
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.pos-banner.pos-flat .pos-banner-status { color: var(--text-dim); }
+.pos-banner.pos-open .pos-banner-status { color: var(--positive); }
+.pos-banner-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--panel-border-soft);
+}
+.pos-banner-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.pos-banner-metric .m-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-faint);
+}
+.pos-banner-metric .m-value {
+  font-size: 14px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
 /* ---------- Controls group ---------- */
 .controls-group {
   display: flex;
