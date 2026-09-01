@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { randomBytes } from "node:crypto";
-import { getServerSupabase } from "../lib/supabase";
+import { getServerSupabase } from "../lib/supabase.js";
 
 const UPSTOX_AUTH_URL = "https://api.upstox.com/v2/login/authorization/dialog";
 const STATE_TTL_MS = 10 * 60 * 1000;

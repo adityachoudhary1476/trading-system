@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getServerSupabase } from "../lib/supabase";
-import { encryptToken } from "../lib/crypto";
-import { validateOAuthState } from "../../src/lib/oauth-state-machine";
+import { getServerSupabase } from "../lib/supabase.js";
+import { encryptToken } from "../lib/crypto.js";
+import { validateOAuthState } from "../../src/lib/oauth-state-machine.js";
 
 const UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token";
 

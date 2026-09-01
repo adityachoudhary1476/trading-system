@@ -1,5 +1,5 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getServerSupabase } from "../lib/supabase";
+import { getServerSupabase } from "../lib/supabase.js";
 
 function getBearer(req: VercelRequest): string | null {
   const h = req.headers.authorization;

@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { getServerSupabase } from "../lib/supabase";
-import { decryptToken } from "../lib/crypto";
-import { toUpstoxSymbol } from "../lib/symbol-map";
+import { getServerSupabase } from "../lib/supabase.js";
+import { decryptToken } from "../lib/crypto.js";
+import { toUpstoxSymbol } from "../lib/symbol-map.js";
 
 const UPSTOX_BASE = "https://api.upstox.com/v2";
 
