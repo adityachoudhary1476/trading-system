@@ -1,191 +1,212 @@
-"""Tests for FYERS auth-recovery helpers (Day 10.5 recovery). No network, no real creds.
+"""Tests for Upstox auth-recovery helpers (OAuth 2.0 migration). No network, no real creds.
 
-Verifies: login URL is generated correctly and contains no leaked secret in the wrong
-place (the secret_key is REQUIRED by FYERS in the URL itself, but the token manager never
-logs it); auth-code exchange success; exchange failure handling; tokens never written to
-files; no order/execution code invoked.
+Verifies: login URL is generated correctly and contains ONLY the OAuth params
+(response_type, client_id, redirect_uri, state) — the client secret is NEVER
+placed in the URL (it is used only at token exchange, server-to-server);
+auth-code exchange success; exchange failure handling; tokens never written
+to files during exchange; no order/execution code invoked.
 """
 from __future__ import annotations
 
-import os
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from trading_system.india.token_manager import TokenManager, TokenError, _checksum
+from trading_system.india.token_manager import (
+    UpstoxTokenManager,
+    TokenManager,
+    TokenError,
+    UPSTOX_AUTH_URL,
+    UPSTOX_TOKEN_URL,
+)
 
 
-CLIENT = "CLIENT1-100"
-SECRET = "SUPER_SECRET_VALUE_0123456789"
-AUTH_CODE = "AUTHCODE_0123456789"
+CLIENT = "upstox_client_123"
+SECRET = "UPSTOX_SECRET_VALUE_9999999999"
+REDIRECT = "https://127.0.0.1:8080/callback"
+AUTH_CODE = "AUTHCODE_0123456789abcdef"
 
 
 def _fake_post_ok(url, data):
     class R:
         status_code = 200
         def json(self):
-            return {"s": "ok", "access_token": "NEW_ACCESS", "refresh_token": "NEW_REFRESH"}
+            return {"access_token": "NEW_ACCESS_TOKEN"}
     return R()
 
 
+# --- authorization URL -------------------------------------------------------
+
 def test_generate_auth_url_contains_expected_params():
-    tm = TokenManager(client_id=CLIENT, secret=SECRET)
-    url = tm.generate_auth_url(redirect_uri="https://example.com/cb", state="xyz")
-    assert url.startswith("https://api-t1.fyers.in/api/v3/generate-authcode?")
-    assert "client_id=CLIENT1-100" in url
-    assert "response_type=code" in url
-    assert "state=xyz" in url
-    assert "secret_key=" in url  # FYERS requires secret_key in the URL by design
-    assert "redirect_uri=" in url
+    tm = UpstoxTokenManager(client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT)
+    url = tm.build_authorization_url()
+    from urllib.parse import urlparse, parse_qs
+    assert url.startswith(UPSTOX_AUTH_URL + "?")
+    qs = parse_qs(urlparse(url).query)
+    assert qs["response_type"] == ["code"]
+    assert qs["client_id"] == [CLIENT]
+    assert qs["redirect_uri"] == [REDIRECT]
+    assert "state" in qs
+    assert "client_secret" not in url.lower()
 
 
 def test_generate_auth_url_requires_credentials():
-    tm = TokenManager(client_id="", secret="")
+    tm = UpstoxTokenManager(client_id="", secret="", redirect_uri=REDIRECT)
     with pytest.raises(TokenError):
-        tm.generate_auth_url()
+        tm.build_authorization_url()
 
 
 def test_generate_auth_url_state_is_per_request_random():
-    tm = TokenManager(client_id=CLIENT, secret=SECRET)
-    url1 = tm.generate_auth_url()
-    url2 = tm.generate_auth_url()
-    # The URLs must differ (different random state each call).
+    tm = UpstoxTokenManager(client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT)
+    url1 = tm.build_authorization_url()
+    url2 = tm.build_authorization_url()
     assert url1 != url2
-    s1 = _state_from_url(url1)
-    s2 = _state_from_url(url2)
+    from urllib.parse import urlparse, parse_qs
+    s1 = parse_qs(urlparse(url1).query)["state"][0]
+    s2 = parse_qs(urlparse(url2).query)["state"][0]
     assert s1 != s2
 
 
 def test_generate_auth_url_state_is_url_safe():
-    tm = TokenManager(client_id=CLIENT, secret=SECRET)
-    url = tm.generate_auth_url()
-    s = _state_from_url(url)
-    # URL-safe alphabet only (no '+' '/' '=').
+    tm = UpstoxTokenManager(client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT)
+    url = tm.build_authorization_url()
+    from urllib.parse import urlparse, parse_qs
+    s = parse_qs(urlparse(url).query)["state"][0]
     import string
     allowed = string.ascii_letters + string.digits + "-._~"
-    assert s, "state must be non-empty"
+    assert s
     assert all(c in allowed for c in s)
-    # secrets.token_urlsafe output contains only [A-Za-z0-9_-].
-    assert set(s) <= set(string.ascii_letters + string.digits + "-_")
 
 
 def test_generate_auth_url_state_present_and_params_intact():
-    tm = TokenManager(client_id=CLIENT, secret=SECRET)
-    url = tm.generate_auth_url()
-    assert "state=" in url
-    assert url.startswith("https://api-t1.fyers.in/api/v3/generate-authcode?")
-    assert "client_id=CLIENT1-100" in url
-    assert "response_type=code" in url
-    assert "secret_key=" in url  # FYERS requires secret_key in the URL (expected)
-    assert "redirect_uri=" in url
+    tm = UpstoxTokenManager(client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT)
+    url = tm.build_authorization_url()
+    from urllib.parse import urlparse, parse_qs
+    qs = parse_qs(urlparse(url).query)
+    assert "state" in qs
+    assert qs["response_type"] == ["code"]
+    assert qs["client_id"] == [CLIENT]
+    assert qs["redirect_uri"] == [REDIRECT]
+    assert "client_secret" not in url.lower()
 
 
-def _state_from_url(url: str) -> str:
-    from urllib.parse import parse_qs, urlparse
-    return parse_qs(urlparse(url).query)["state"][0]
+def test_generate_auth_url_has_only_allowed_params():
+    """Regression: the login URL must carry ONLY the three OAuth params
+    (response_type, client_id, redirect_uri) plus state — no secret."""
+    tm = UpstoxTokenManager(client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT)
+    url = tm.build_authorization_url(state="xyz")
+    from urllib.parse import urlparse, parse_qs
+    qs = urlparse(url).query
+    params = parse_qs(qs, keep_blank_values=True)
+    assert set(params.keys()) == {
+        "client_id", "redirect_uri", "response_type", "state"
+    }, f"unexpected params: {set(params.keys())}"
+    assert params["client_id"] == [CLIENT]
+    assert params["redirect_uri"] == [REDIRECT]
+    assert params["response_type"] == ["code"]
+    assert params["state"] == ["xyz"]
+    assert "secret" not in qs.lower()
 
+
+# --- auth-code exchange ------------------------------------------------------
 
 def test_exchange_auth_code_success():
     captured = {}
 
-    def fake_post(url, data, json_body=False):
+    def fake_post(url, data):
         captured["url"] = url
         captured["data"] = data
-        captured["json_body"] = json_body
+        return _fake_post_ok(url, data)
 
-        class R:
-            status_code = 200
-
-            def json(self):
-                return {"s": "ok", "access_token": "NEW_ACCESS", "refresh_token": "NEW_REFRESH"}
-
-        return R()
-
-    tm = TokenManager(client_id=CLIENT, secret=SECRET, http_post=fake_post)
-    access, refresh = tm.exchange_auth_code(AUTH_CODE)
-    assert access == "NEW_ACCESS"
-    assert refresh == "NEW_REFRESH"
-    # Stored on the manager in-memory.
-    assert tm.access_token == "NEW_ACCESS"
-    assert tm.refresh_token == "NEW_REFRESH"
-    # Contract: correct v3 endpoint, JSON body, appIdHash present, legacy fields absent.
-    assert captured["url"] == "https://api-t1.fyers.in/api/v3/validate-authcode"
-    assert captured["json_body"] is True
+    tm = UpstoxTokenManager(
+        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=fake_post,
+    )
+    access = tm.exchange_auth_code(AUTH_CODE)
+    assert access == "NEW_ACCESS_TOKEN"
+    assert tm.access_token == "NEW_ACCESS_TOKEN"
+    # Upstox token exchange: form-encoded POST to the token endpoint.
+    assert captured["url"] == UPSTOX_TOKEN_URL
     assert captured["data"]["grant_type"] == "authorization_code"
     assert captured["data"]["code"] == AUTH_CODE
-    assert captured["data"]["appIdHash"] == _checksum(CLIENT, SECRET)
-    # FYERS v3 exchange must NOT leak secret/old param names.
-    assert "secret_key" not in captured["data"]
-    assert "auth_code" not in captured["data"]
-    assert "redirect_uri" not in captured["data"]
-    assert "client_id" not in captured["data"]
+    assert captured["data"]["client_id"] == CLIENT
+    assert captured["data"]["client_secret"] == SECRET
+    assert captured["data"]["redirect_uri"] == REDIRECT
+    # Secret is in the POST body (server-to-server), NOT in a URL or logged.
+    assert "REDIRECT_URI" not in str(captured["url"])
+    assert "secret" not in str(captured["url"]).lower()
 
 
-def test_exchange_appidhash_is_sha256_of_clientid_secret():
-    import hashlib
-
-    captured = {}
-
-    def fake_post(url, data, json_body=False):
-        captured["data"] = data
-
+def test_exchange_auth_code_rejected_http_error():
+    def fake_post(url, data):
         class R:
-            status_code = 200
-
+            status_code = 400
             def json(self):
-                return {"s": "ok", "access_token": "X", "refresh_token": "Y"}
-
+                return {"status": "error", "errors": [{"code": "invalid_grant", "message": "bad code"}]}
         return R()
 
-    tm = TokenManager(client_id=CLIENT, secret=SECRET, http_post=fake_post)
-    tm.exchange_auth_code(AUTH_CODE)
-    expected = hashlib.sha256(f"{CLIENT}:{SECRET}".encode("utf-8")).hexdigest()
-    assert captured["data"]["appIdHash"] == expected
-
-
-def test_exchange_auth_code_rejected():
-    def fake_post(url, data, json_body=False):
-        class R:
-            status_code = 200
-
-            def json(self):
-                return {"s": "error", "code": -16, "message": "bad auth code"}
-
-        return R()
-
-    tm = TokenManager(client_id=CLIENT, secret=SECRET, http_post=fake_post)
+    tm = UpstoxTokenManager(
+        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=fake_post,
+    )
     with pytest.raises(TokenError):
         tm.exchange_auth_code(AUTH_CODE)
 
 
 def test_exchange_auth_code_no_code():
-    tm = TokenManager(client_id=CLIENT, secret=SECRET, http_post=MagicMock())
+    tm = UpstoxTokenManager(
+        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=MagicMock(),
+    )
     with pytest.raises(TokenError):
         tm.exchange_auth_code("")
 
 
 def test_exchange_auth_code_missing_secret():
-    tm = TokenManager(client_id=CLIENT, secret="", http_post=MagicMock())
+    tm = UpstoxTokenManager(
+        client_id=CLIENT, secret="", redirect_uri=REDIRECT, http_post=MagicMock(),
+    )
     with pytest.raises(TokenError):
         tm.exchange_auth_code(AUTH_CODE)
 
 
-def test_exchange_does_not_write_files(tmp_path):
-    # Ensure no .env is touched during exchange.
+def test_exchange_does_not_write_files(tmp_path, monkeypatch):
+    from trading_system.config import settings
+    monkeypatch.setattr(settings, "project_root", tmp_path)
     env_file = tmp_path / ".env"
-    env_file.write_text("FYERS_ACCESS_TOKEN=old\n")
+    env_file.write_text("UPSTOX_ACCESS_TOKEN=old\n")
 
-    def fake_post(url, data, json_body=False):
-        class R:
-            status_code = 200
+    def fake_post(url, data):
+        return _fake_post_ok(url, data)
 
-            def json(self):
-                return {"s": "ok", "access_token": "NEW_ACCESS", "refresh_token": "NEW_REFRESH"}
-
-        return R()
-
-    tm = TokenManager(client_id=CLIENT, secret=SECRET, http_post=fake_post)
+    tm = UpstoxTokenManager(
+        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=fake_post,
+    )
     tm.exchange_auth_code(AUTH_CODE)
     # File must be unchanged (we never write creds).
     assert "old" in env_file.read_text()
-    assert "NEW_ACCESS" not in env_file.read_text()
+    assert "NEW_ACCESS_TOKEN" not in env_file.read_text()
+
+
+def test_exchange_auth_code_invalid_credentials():
+    def fake_post(url, data):
+        class R:
+            status_code = 401
+            def json(self):
+                return {"status": "error", "errors": [{"code": "invalid_client", "message": "bad secret"}]}
+        return R()
+
+    tm = UpstoxTokenManager(
+        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=fake_post,
+    )
+    with pytest.raises(TokenError):
+        tm.exchange_auth_code(AUTH_CODE)
+
+
+def test_exchange_auth_code_network_failure():
+    def fake_post(url, data):
+        import requests
+        raise requests.RequestException("conn reset")
+
+    tm = UpstoxTokenManager(
+        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=fake_post,
+    )
+    with pytest.raises(TokenError):
+        tm.exchange_auth_code(AUTH_CODE)

@@ -82,3 +82,96 @@ def _internal(ex: str, sym: str):
     from .instruments import InternalSymbol
 
     return InternalSymbol(exchange=ex.upper(), symbol=sym)
+
+
+def to_upstox_symbol(instrument: Instrument) -> str:
+    """Map a normalized Instrument to its Upstox symbol string.
+
+    Upstox instrument keys use the form EXCHANGE_SEGMENT|SYMBOL, e.g.:
+      * Equity  : NSE_EQ|SBIN
+      * Index   : NSE_INDEX|NIFTY50
+      * Futures : NSE_FUT|SBIN25DECFUT
+      * Options : NSE_OPT|SBIN25DEC400CE
+    """
+    ex = instrument.internal.exchange.upper()
+    t = instrument.instrument_type
+    base = instrument.internal.symbol
+
+    if t == InstrumentType.INDEX:
+        segment = "INDEX"
+        return f"{ex}_{segment}|{base}"
+    if t == InstrumentType.EQUITY:
+        segment = "EQ"
+        return f"{ex}_{segment}|{base}"
+    if t in (InstrumentType.OPTION_CE, InstrumentType.OPTION_PE):
+        segment = "OPT"
+        if not (instrument.underlying and instrument.expiry and instrument.strike):
+            raise ValueError("Options need underlying/expiry/strike for Upstox symbol")
+        import datetime as dt
+        exp = dt.date.fromisoformat(instrument.expiry)
+        yy = f"{exp.year % 100:02d}"
+        mm = exp.strftime("%b").upper()
+        ot = "CE" if t == InstrumentType.OPTION_CE else "PE"
+        strike = int(instrument.strike)
+        token = f"{instrument.underlying}{yy}{mm}{strike}{ot}"
+        return f"{ex}_{segment}|{token}"
+    if t == InstrumentType.FUTURE:
+        segment = "FUT"
+        return f"{ex}_{segment}|{base}"
+    return f"{ex}_EQ|{base}"
+
+
+def from_upstox_symbol(upstox_symbol: str) -> Instrument:
+    """Best-effort parse of an Upstox symbol back to an Instrument."""
+    if "|" not in upstox_symbol:
+        raise ValueError(f"Not an Upstox symbol: {upstox_symbol!r}")
+    prefix, body = upstox_symbol.split("|", 1)
+    ex = prefix.split("_")[0] if "_" in prefix else prefix
+    segment = prefix.split("_")[1] if "_" in prefix else "EQ"
+    if segment == "INDEX":
+        return Instrument(
+            instrument_type=InstrumentType.INDEX,
+            internal=_internal(ex, body),
+            provider_symbol=upstox_symbol,
+        )
+    if segment == "EQ":
+        return Instrument(
+            instrument_type=InstrumentType.EQUITY,
+            internal=_internal(ex, body),
+            provider_symbol=upstox_symbol,
+        )
+    if segment == "OPT":
+        instr = Instrument(
+            instrument_type=InstrumentType.EQUITY,
+            internal=_internal(ex, body),
+            provider_symbol=upstox_symbol,
+        )
+        try:
+            import re
+            m = re.match(r"^([A-Z]+?)(\d{2})([A-Z]{3})(\d+)(CE|PE)$", body)
+            if m:
+                root, yy, mmm, strike_str, ot = m.groups()
+                year = 2000 + int(yy)
+                month = {
+                    "JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                    "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12,
+                }[mmm]
+                expiry = f"{year:04d}-{month:02d}-28"
+                instr = Instrument.option(
+                    ex, root, expiry, float(strike_str), ot, provider_symbol=upstox_symbol
+                )
+                instr.internal = _internal(ex, body)
+        except Exception:
+            pass
+        return instr
+    if segment == "FUT":
+        return Instrument(
+            instrument_type=InstrumentType.FUTURE,
+            internal=_internal(ex, body),
+            provider_symbol=upstox_symbol,
+        )
+    return Instrument(
+        instrument_type=InstrumentType.EQUITY,
+        internal=_internal(ex, body),
+        provider_symbol=upstox_symbol,
+    )

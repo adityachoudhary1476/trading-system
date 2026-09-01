@@ -13,7 +13,6 @@ import {
   type HistogramData,
   type LineData,
   type IPriceLine,
-  type MouseEventParams,
 } from "lightweight-charts";
 
 export type DrawTool = "none" | "trend" | "fib" | "forecast";
@@ -44,14 +43,12 @@ export function PriceChart({
   indicators = DEFAULT_INDICATORS,
   levels = [],
   drawTool = "none",
-  onDrawingsChange,
   height = 460,
 }: {
   data: OHLCVBar[];
   indicators?: IndicatorConfig;
   levels?: number[];
   drawTool?: DrawTool;
-  onDrawingsChange?: (n: number) => void;
   height?: number;
 }) {
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -63,7 +60,6 @@ export function PriceChart({
   const priceLineRefs = useRef<IPriceLine[]>([]);
 
   const [legend, setLegend] = useState<{ o: number; h: number; l: number; c: number; chg: number } | null>(null);
-  const [drawings, setDrawings] = useState<Drawing[]>([]);
   const [pending, setPending] = useState<Anchor | null>(null);
   const [tick, setTick] = useState(0); // forces SVG overlay recompute on pan/zoom
   const [size, setSize] = useState({ w: 800, h: height });
@@ -74,7 +70,7 @@ export function PriceChart({
     if (!el) return;
     const chart = createChart(el, {
       autoSize: true,
-      layout: { background: { color: "transparent" }, textColor: "#9aa7b8", fontFamily: "Inter, system-ui, sans-serif", fontSize: 11 },
+      layout: { background: { color: "white" }, textColor: "#9aa7b8", fontFamily: "Inter, system-ui, sans-serif", fontSize: 11 },
       grid: { vertLines: { color: "rgba(31,38,51,0.45)" }, horzLines: { color: "rgba(31,38,51,0.45)" } },
       rightPriceScale: { borderColor: "#1f2633" },
       timeScale: { borderColor: "#1f2633", timeVisible: true, secondsVisible: false },
@@ -93,23 +89,26 @@ export function PriceChart({
       setTick((t) => (t + 1) % 1_000_000);
     });
     chart.timeScale().subscribeVisibleTimeRangeChange(() => setTick((t) => (t + 1) % 1_000_000));
-    chart.subscribeClick((p: MouseEventParams) => {
-      if (drawTool === "none" || !p.point || p.time == null) return;
-      const price = candle.coordinateToPrice(p.point.y);
-      if (price == null) return;
-      const anchor: Anchor = { t: p.time as number, p: price as number };
-      setPending((prev) => {
-        if (!prev) return anchor;
-        const done: Drawing = { id: `d${Date.now()}${Math.random().toString(36).slice(2, 6)}`, type: drawTool, a: prev, b: anchor };
-        setDrawings((ds) => { const next = [...ds, done]; onDrawingsChange?.(next.length); return next; });
-        return null;
-      });
-    });
-
     chartRef.current = chart; candleRef.current = candle; volRef.current = vol;
     const ro = new ResizeObserver(() => { const r = el.getBoundingClientRect(); setSize({ w: r.width, h: r.height }); });
     ro.observe(el);
-    return () => { ro.disconnect(); chart.remove(); chartRef.current = null; };
+    return () => {
+      // Strict cleanup: remove overlays/RSI/price-lines before tearing down the
+      // whole chart. lightweight-charts v5 throws "Value is undefined" if you call
+      // removeSeries on an already-removed series (StrictMode double-invoke / effect
+      // re-run), so guard every removal here.
+      try {
+        overlayRefs.current.forEach((s) => { try { chart.removeSeries(s); } catch {} });
+        overlayRefs.current = [];
+        if (rsiRef.current) { try { chart.removeSeries(rsiRef.current); } catch {} rsiRef.current = null; }
+        priceLineRefs.current.forEach((pl) => { try { candle.removePriceLine(pl); } catch {} });
+        priceLineRefs.current = [];
+      } finally {
+        ro.disconnect();
+        chart.remove();
+        chartRef.current = null;
+      }
+    };
   }, []); // eslint-disable-line
 
   // Rebuild overlays + RSI when indicators or data change
@@ -170,12 +169,14 @@ export function PriceChart({
     return { x, y };
   };
 
+const DRAWINGS: Drawing[] = [];
+
   const svg = (() => {
     const chart = chartRef.current; if (!chart) return null;
     const w = size.w, h = size.h;
     return (
       <svg key={tick} width={w} height={h} style={{ position: "absolute", inset: 0, pointerEvents: "none" }} aria-hidden="true">
-        {drawings.map((d) => {
+        {DRAWINGS.map((d) => {
           const A = toXY(d.a), B = toXY(d.b);
           if (!A || !B) return null;
           if (d.type === "trend") {

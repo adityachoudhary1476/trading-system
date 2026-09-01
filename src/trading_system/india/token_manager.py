@@ -1,115 +1,167 @@
-"""FYERS token lifecycle manager (Day 10.5) — DATA ONLY, no execution.
+"""Upstox OAuth 2.0 authorization-code token lifecycle manager.
 
-Owns the access-token / refresh-token lifecycle for FYERS v3. It NEVER prints, logs,
-or embeds secrets (access token, refresh token, client secret, PIN) in exceptions, logs,
-or status strings. All observable output is a status code.
+Handles the Upstox authorization-code grant:
 
-FYERS v3 token facts (verified from official FYERS docs / community at Day 10.5):
-  * access token validity  ~ 24 hours
-  * refresh token validity ~ 15 days
-  * refresh grant: POST {TOKEN_URL} with
-        grant_type=refresh_token
-        refresh_token=<refresh_token>
-        client_id=<client_id>
-        checksum=SHA-256("<client_id>:<secret>")
-    Response: {"s":"ok","access_token":"..."}  or  {"s":"error","code":<n>,"message":...}
-  * FYERS auth error code -16 ("could not authenticate") must never be swallowed.
+  1. ``build_authorization_url()``  — user opens in browser; Upstox redirects
+     with an authorization ``code``.
+  2. ``exchange_auth_code()``      — form-encoded POST to the token endpoint,
+     receives an access token.
+  3. ``verify_authentication()``   — probe ``/v2/user/profile`` to confirm the
+     token is actually accepted by Upstox (distinct from mere presence).
+  4. Token validity tracking       — Upstox access tokens expire at **3:30 AM
+     IST the following day**; the manager computes this boundary and reports
+     expiry without guessing.
 
-  * generate_auth_url() uses a PER-REQUEST random `state` (secrets.token_urlsafe) so each
-    login URL is unique; a static state caused FYERS to replay a prior authorization
-    (same auth_code) for an already-authorized session. Random state also gives CSRF protection.
-
-This module does NOT automate browser login or PIN entry (forbidden this phase). If the
-refresh token is expired, it fails clearly with REFRESH_TOKEN_EXPIRED — the human must
-re-authorize. The access-token HTTP callable is injectable so tests use mocks (no network,
-no real credentials).
+Design constraints
+  * All credentials are read from environment variables (never hardcoded).
+  * The client secret is **never** sent in the authorization URL (only at the
+    token-exchange POST, server-to-server).
+  * Access tokens, auth codes, and secrets are never printed or logged.
+  * No refresh-token flow is invented — Upstox's current token model does not
+    expose one for this application.  When a token is expired/invalid the
+    manager requires re-authorization rather than pretending the token is valid.
+  * The HTTP transport (``http_post`` / ``http_get``) is injectable so tests
+    exercise the full parsing logic without network calls.
+  * This module is **DATA-ONLY** — no order/execution code.
 """
 from __future__ import annotations
 
-import hashlib
+import datetime as dt
 import os
 import secrets
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlencode
 
 import requests
 
 from ..config import log
 
 
-FYERS_TOKEN_URL = "https://api-t1.fyers.in/api/v3/token"
-# FYERS v3 authorization-code exchange endpoint (SessionModel.generate_token -> /validate-authcode).
-# Per the official fyers_apiv3 SDK (3.1.16), the auth-code exchange POSTs JSON with
-# {grant_type, appIdHash, code} to this endpoint; appIdHash = SHA-256(client_id:secret).
-FYERS_TOKEN_EXCHANGE_URL = "https://api-t1.fyers.in/api/v3/validate-authcode"
+# --- Upstox OAuth 2.0 endpoints (official) ------------------------------------
+# Authorization:  user opens in browser → Upstox redirects with ``code=``
+UPSTOX_AUTH_URL = "https://api.upstox.com/v2/login/authorization/dialog"
+# Token exchange:  POST form-encoded → { "access_token": "..." }
+UPSTOX_TOKEN_URL = "https://api.upstox.com/v2/login/authorization/token"
+# Connectivity probe:  GET with Bearer token → 200 if the token is live.
+UPSTOX_PROFILE_URL = "https://api.upstox.com/v2/user/profile"
 
-# FYERS auth error codes that mean "authentication failed" (never treat as empty data).
-_FYERS_AUTH_CODES = {-16, -17, 401, 403}
+# Upstox access tokens expire at 3:30 AM IST the following day.
+_EXPIRY_HOUR = 3
+_EXPIRY_MINUTE = 30
+
+_IST = dt.timezone(dt.timedelta(hours=5, minutes=30))
+_UTC = dt.timezone.utc
+
+
+def _next_expiry(obtained_at: dt.datetime) -> dt.datetime:
+    """Return the next 3:30 AM IST boundary at/after *obtained_at* (UTC datetime).
+
+    Examples (IST):
+      obtained 2026-09-01 02:00  → expires 2026-09-01 03:30 IST
+      obtained 2026-09-01 10:00  → expires 2026-09-02 03:30 IST
+    """
+    obtained_ist = obtained_at.astimezone(_IST)
+    today_330 = obtained_ist.replace(
+        hour=_EXPIRY_HOUR, minute=_EXPIRY_MINUTE, second=0, microsecond=0
+    )
+    if obtained_ist < today_330:
+        return today_330.astimezone(_UTC)
+    return (today_330 + dt.timedelta(days=1)).astimezone(_UTC)
+
+
+def _redact(value: Optional[str]) -> str:
+    """Length-safe mask for any log message (never the raw secret)."""
+    if not value:
+        return "<none>"
+    return f"<{len(value)} chars>"
 
 
 class AuthStatus(str, Enum):
-    """Observable FYERS authentication state. Never includes secret material."""
-
+    """Observable Upstox authentication state. Never includes secret material."""
     AUTH_OK = "auth_ok"
-    ACCESS_TOKEN_EXPIRED = "access_token_expired"   # token absent/expired; refresh may help
-    REFRESH_TOKEN_EXPIRED = "refresh_token_expired"  # refresh rejected; human must re-auth
-    AUTH_FAILED = "auth_failed"                       # other auth/business failure
-    NETWORK_ERROR = "network_error"                  # transport failure
+    ACCESS_TOKEN_EXPIRED = "access_token_expired"
+    AUTH_FAILED = "auth_failed"
+    NETWORK_ERROR = "network_error"
 
 
 class TokenError(Exception):
     """Raised on unrecoverable token problems. Messages contain NO secrets."""
 
 
-# Injectable HTTP post for testability: (url, data) -> requests.Response-like.
-HttpPost = Callable[[str, dict], "object"]
-
-
-def _checksum(client_id: str, secret: str) -> str:
-    return hashlib.sha256(f"{client_id}:{secret}".encode("utf-8")).hexdigest()
-
-
-def _redact(value: Optional[str]) -> str:
-    """Return a length-safe mask for logs (never the raw secret)."""
-    if not value:
-        return "<none>"
-    return f"<{len(value)} chars>"
-
-
 @dataclass
 class TokenState:
+    """Snapshot of authentication state (safe to log/print)."""
     status: AuthStatus
     access_token_present: bool
-    refresh_token_present: bool
+    refresh_token_present: bool  # Always False for Upstox (no refresh flow).
     message: str = ""
 
 
-class TokenManager:
-    """Manages FYERS access/refresh token lifecycle. Secrets come from env/config."""
+# Injectable HTTP callables for testability (no network in unit tests).
+HttpPost = Callable[[str, dict], object]
+HttpGet = Callable[[str, dict], object]
+
+
+class UpstoxTokenManager:
+    """Upstox OAuth 2.0 access-token lifecycle.
+
+    Credentials (read from env via ``settings`` / ``load_dotenv``):
+      ``UPSTOX_CLIENT_ID``     — API key
+      ``UPSTOX_CLIENT_SECRET``  — API secret (server-to-server exchange only)
+      ``UPSTOX_REDIRECT_URI``   — exact URI registered in the Upstox console
+      ``UPSTOX_ACCESS_TOKEN``   — access token (pre-obtained, if any)
+
+    Does **not** automate browser login or TOTP. The user opens the
+    authorization URL, logs in manually, and supplies the resulting
+    ``code`` to ``exchange_auth_code()``.
+    """
 
     def __init__(
         self,
         client_id: Optional[str] = None,
         access_token: Optional[str] = None,
-        refresh_token: Optional[str] = None,
         secret: Optional[str] = None,
-        token_url: str = FYERS_TOKEN_URL,
-        token_exchange_url: str = FYERS_TOKEN_EXCHANGE_URL,
+        client_secret: Optional[str] = None,
+        redirect_uri: Optional[str] = None,
+        token_url: str = UPSTOX_TOKEN_URL,
+        profile_url: str = UPSTOX_PROFILE_URL,
+        auth_url: str = UPSTOX_AUTH_URL,
         http_post: Optional[HttpPost] = None,
+        http_get: Optional[HttpGet] = None,
+        auth_status_callback: Optional[Callable[[str], None]] = None,
         timeout: int = 20,
     ) -> None:
-        # All secrets read from env by default (never stored in source).
-        self.client_id = client_id if client_id is not None else os.getenv("FYERS_CLIENT_ID", "")
-        self._access_token = access_token if access_token is not None else os.getenv("FYERS_ACCESS_TOKEN", "")
-        self.refresh_token = refresh_token if refresh_token is not None else os.getenv("FYERS_REFRESH_TOKEN", "")
-        self.secret = secret if secret is not None else os.getenv("FYERS_SECRET", "")
+        # Accept both ``secret`` and ``client_secret`` for backward compat.
+        resolved_secret = client_secret if client_secret is not None else secret
+        self.client_id: str = (
+            client_id if client_id is not None else os.getenv("UPSTOX_CLIENT_ID", "")
+        )
+        self.secret: str = (
+            resolved_secret if resolved_secret is not None
+            else os.getenv("UPSTOX_CLIENT_SECRET", "")
+        )
+        self._access_token: str = (
+            access_token if access_token is not None
+            else os.getenv("UPSTOX_ACCESS_TOKEN", "")
+        )
+        self.redirect_uri: str = (
+            redirect_uri if redirect_uri is not None
+            else os.getenv("UPSTOX_REDIRECT_URI", "")
+        )
         self.token_url = token_url
-        self.token_exchange_url = token_exchange_url
+        self.profile_url = profile_url
+        self.auth_url = auth_url
         self._http_post = http_post or self._default_post
-        self.timeout = timeout
+        self._http_get = http_get or self._default_get
+        self._auth_status_callback = auth_status_callback
+        self._timeout = timeout
+        # When the token was obtained (UTC).  None until exchange or explicit load.
+        self._obtained_at: Optional[dt.datetime] = None
 
-    # --- accessors (never expose raw secret) --------------------------------
+    # ------------------------------------------------------------------ tokens
     @property
     def access_token(self) -> str:
         return self._access_token
@@ -118,188 +170,344 @@ class TokenManager:
     def access_token(self, value: str) -> None:
         self._access_token = value
 
+    @property
+    def refresh_token(self) -> str:
+        """Upstox has no refresh token in this architecture."""
+        return ""
+
+    @refresh_token.setter
+    def refresh_token(self, value: str) -> None:
+        # Accepted for backward-compat with existing constructor calls; silently
+        # ignored — Upstox does not provide a refresh-token flow here.
+        pass
+
     def has_access_token(self) -> bool:
         return bool(self._access_token)
 
     def has_refresh_token(self) -> bool:
-        return bool(self.refresh_token)
+        return False
 
-    # --- status / lifecycle -------------------------------------------------
-    def token_status(self) -> TokenState:
-        """Best-known state without a network probe."""
-        if self.has_access_token() and self.has_refresh_token():
-            return TokenState(AuthStatus.AUTH_OK, True, True, "access+refresh token present")
-        if self.has_access_token() and not self.has_refresh_token():
-            return TokenState(AuthStatus.ACCESS_TOKEN_EXPIRED, True, False,
-                              "access token present but no refresh token; refresh unavailable")
-        if not self.has_access_token() and self.has_refresh_token():
-            return TokenState(AuthStatus.ACCESS_TOKEN_EXPIRED, False, True,
-                              "no access token; refresh available")
-        return TokenState(AuthStatus.ACCESS_TOKEN_EXPIRED, False, False,
-                          "no access or refresh token configured")
-
-    def get_valid_access_token(self) -> str:
-        """Return the current access token if present, else raise (no silent fabrication)."""
+    def get_access_token(self) -> Optional[str]:
+        """Return the access token if present and within its validity window."""
         if not self._access_token:
-            raise TokenError("No FYERS access token present; refresh or re-authorize.")
+            return None
+        if self._is_expired():
+            return None
         return self._access_token
 
-    def refresh_access_token(self) -> str:
-        """Mint a new access token from the refresh token via the FYERS token endpoint.
+    def get_valid_access_token(self) -> str:
+        """Return the access token if usable, else raise (no silent fabrication)."""
+        token = self.get_access_token()
+        if not token:
+            raise TokenError(
+                "No valid Upstox access token (absent or expired); "
+                "re-authorize via `auth-login` then `auth-exchange`."
+            )
+        return token
 
-        Raises TokenError with AUTH/REFRESH/NETWORK status (never embeds secrets).
-        On success, stores and returns the new access token.
+    def is_authenticated(self) -> bool:
+        return bool(self.get_access_token())
+
+    # ------------------------------------------------------- authorization url
+    def build_authorization_url(
+        self,
+        redirect_uri: Optional[str] = None,
+        state: Optional[str] = None,
+    ) -> str:
+        """Construct the Upstox authorize URL the user opens in a browser.
+
+        The URL carries ONLY: ``response_type``, ``client_id``,
+        ``redirect_uri``, and ``state``.  The client secret is never placed
+        in the authorization URL (OAuth2 spec; Upstox rejects it).
+
+        ``state`` defaults to a fresh ``secrets.token_urlsafe(16)`` so every
+        URL is unique (CSRF protection + prevents replay).
         """
-        if not self.client_id or not self.secret:
-            raise TokenError("Missing FYERS_CLIENT_ID or FYERS_SECRET; cannot refresh.")
-        if not self.refresh_token:
-            raise TokenError("No FYERS refresh token; human re-authorization required.")
-
-        payload = {
-            "grant_type": "refresh_token",
-            "refresh_token": self.refresh_token,
-            "client_id": self.client_id,
-            "checksum": _checksum(self.client_id, self.secret),
-        }
-        try:
-            resp = self._http_post(self.token_url, payload)
-        except requests.RequestException as e:
-            log.warning("FYERS token refresh network error")
-            raise TokenError("FYERS token refresh network error") from e
-
-        code, body = self._parse(resp)
-        if code == -16 or code == -17 or code in _FYERS_AUTH_CODES:
-            # Refresh token rejected -> must re-authorize.
-            log.warning("FYERS refresh token rejected (code=%s)", code)
-            raise TokenError("FYERS refresh token expired or invalid; human re-authorization required.")
-        if code != 200 and body.get("s") != "ok":
-            log.warning("FYERS token refresh failed (code=%s)", code)
-            raise TokenError(f"FYERS token refresh failed (code={code}).")
-        new_token = body.get("access_token")
-        if not new_token:
-            raise TokenError("FYERS token response missing access_token.")
-        self._access_token = new_token
-        log.info("FYERS access token refreshed (length %d)", len(new_token))
-        return new_token
-
-    # --- auth-code login flow (Day 10.5 recovery; isolated, no automation) ----
-    def generate_auth_url(self, redirect_uri: Optional[str] = None,
-                          state: Optional[str] = None) -> str:
-        """Build the FYERS v3 generate-authcode URL the user opens in a browser.
-
-        This ONLY constructs a URL string from client_id + app secret + redirect URI.
-        It performs NO network call and NEVER prints secrets. The caller prints the URL
-        and the user completes login manually; the redirect returns `auth_code=...`.
-        No browser/TOTP automation is performed here (per scope).
-
-        `state` is intentionally PER-REQUEST and RANDOM (secrets.token_urlsafe) so that
-        each login URL is unique. A static state made every generated URL byte-identical,
-        which let FYERS replay a prior authorization (same auth_code) for an already
-        authorized session. Randomizing state also provides CSRF protection. Pass an
-        explicit `state` only for tests; production calls should let it default.
-        """
-        if not self.client_id or not self.secret:
-            raise TokenError("Missing FYERS_CLIENT_ID or FYERS_SECRET; cannot build login URL.")
-        # Per-request random state (URL-safe). Defaults to a new random value each call.
+        if not self.client_id:
+            raise TokenError(
+                "Missing UPSTOX_CLIENT_ID; cannot build authorization URL."
+            )
+        redirect = redirect_uri or self.redirect_uri
+        if not redirect:
+            raise TokenError(
+                "Missing UPSTOX_REDIRECT_URI; register one in the Upstox console "
+                "and configure it via env or parameter."
+            )
         if state is None:
             state = secrets.token_urlsafe(16)
-        redirect = redirect_uri or os.getenv(
-            "FYERS_REDIRECT_URI",
-            "https://trade.fyers.in/api-login/redirect-uri/index.html",
-        )
-        from urllib.parse import urlencode
         params = {
+            "response_type": "code",
             "client_id": self.client_id,
             "redirect_uri": redirect,
-            "response_type": "code",
             "state": state,
-            "secret_key": self.secret,
         }
-        return "https://api-t1.fyers.in/api/v3/generate-authcode?" + urlencode(params)
+        return self.auth_url + "?" + urlencode(params)
 
-    def exchange_auth_code(self, auth_code: str, redirect_uri: Optional[str] = None) -> tuple[str, str]:
-        """Exchange an auth_code for a fresh access token + refresh token.
+    # Backward-compatible alias (kept so existing CLI/tests compile).
+    def generate_auth_url(
+        self,
+        redirect_uri: Optional[str] = None,
+        state: Optional[str] = None,
+    ) -> str:
+        return self.build_authorization_url(redirect_uri=redirect_uri, state=state)
 
-        Implements the current FYERS v3 authorization-code grant (matches the official
-        fyers_apiv3 SessionModel.generate_token contract):
+    # ----------------------------------------------------- auth-code exchange
+    def exchange_auth_code(
+        self,
+        auth_code: str,
+        redirect_uri: Optional[str] = None,
+    ) -> str:
+        """Exchange an authorization code for an access token via Upstox OAuth2.
 
-          POST {FYERS_TOKEN_EXCHANGE_URL}  (JSON body)
-            grant_type = "authorization_code"
-            appIdHash  = SHA-256("{client_id}:{secret}")  (hex)
-            code       = <auth_code from the login redirect>
+        Sends a form-encoded POST to ``UPSTOX_TOKEN_URL`` with:
+          ``code``, ``client_id``, ``client_secret``, ``redirect_uri``,
+          ``grant_type=authorization_code``
 
-        The redirect URI is NOT sent in the exchange body (FYERS binds the auth_code to
-        the redirect_uri from the generate-authcode step server-side). We still resolve
-        FYERS_REDIRECT_URI here so the value used to build the login URL is consistent
-        and the override/fallback behavior is preserved.
+        The ``redirect_uri`` must exactly match the one registered with Upstox
+        and used in ``build_authorization_url``.
 
-        On success stores and returns (access_token, refresh_token). Raises TokenError
-        on any failure (never embeds secrets). Does NOT write files; the caller persists
-        via the existing secure config (.env). No network call is made by this method's
-        caller beyond the one POST below.
+        Returns the access token.  Stores it internally with an
+        ``obtained_at`` timestamp.  Does NOT write to disk — call
+        ``save_access_token()`` to persist.
+
+        Raises :class:`TokenError` on any failure (message never contains the
+        secret, token, or auth code).
         """
         if not self.client_id or not self.secret:
-            raise TokenError("Missing FYERS_CLIENT_ID or FYERS_SECRET; cannot exchange auth code.")
+            raise TokenError(
+                "Missing UPSTOX_CLIENT_ID or UPSTOX_CLIENT_SECRET; "
+                "cannot exchange authorization code."
+            )
         if not auth_code:
-            raise TokenError("No auth_code supplied; complete the manual login first.")
-        # Resolved for parity with generate_auth_url (override/fallback preserved);
-        # not included in the exchange payload per FYERS v3 contract.
-        _ = redirect_uri or os.getenv(
-            "FYERS_REDIRECT_URI",
-            "https://trade.fyers.in/api-login/redirect-uri/index.html",
-        )
-        payload = {
-            "grant_type": "authorization_code",
-            "appIdHash": _checksum(self.client_id, self.secret),
+            raise TokenError(
+                "No authorization code supplied; complete the login first."
+            )
+        redirect = redirect_uri or self.redirect_uri
+
+        form = {
             "code": auth_code,
+            "client_id": self.client_id,
+            "client_secret": self.secret,
+            "redirect_uri": redirect,
+            "grant_type": "authorization_code",
         }
         try:
-            resp = self._http_post(self.token_exchange_url, payload, json_body=True)
-        except requests.RequestException as e:
-            log.warning("FYERS auth-code exchange network error")
-            raise TokenError("FYERS auth-code exchange network error") from e
+            resp = self._http_post(self.token_url, form)
+        except requests.RequestException:
+            log.warning("Upstox token exchange network error")
+            raise TokenError("Upstox token exchange network error.")
 
-        code, body = self._parse(resp)
-        if code == -16 or code == -17 or code in _FYERS_AUTH_CODES:
-            log.warning("FYERS auth-code exchange rejected (code=%s)", code)
-            raise TokenError("FYERS rejected the auth code (code=%s); re-run login." % code)
-        if code != 200 and body.get("s") != "ok":
-            fy_message = body.get("message") or body.get("msg") or ""
-            log.warning("FYERS auth-code exchange failed (code=%s): %s", code, fy_message)
-            detail = f" — {fy_message}" if fy_message else ""
-            raise TokenError(f"FYERS auth-code exchange failed (code={code}){detail}.")
-        new_access = body.get("access_token")
-        new_refresh = body.get("refresh_token")
-        if not new_access:
-            raise TokenError("FYERS token response missing access_token.")
-        self._access_token = new_access
-        self.refresh_token = new_refresh or self.refresh_token
-        log.info("FYERS access token issued (length %d); refresh token %s",
-                 len(new_access), "present" if new_refresh else "absent")
-        return new_access, new_refresh or ""
+        access = self._parse_token_response(resp)
+        self._access_token = access
+        self._obtained_at = dt.datetime.now(_UTC)
+        log.info("Upstox access token received (length %d)", len(access))
+        return access
+
+    # -------------------------------------------------- persistence / storage
+    def save_access_token(self, access_token: str) -> Path:
+        """Persist ``access_token`` to the project ``.env`` file.
+
+        Updates (or appends) the ``UPSTOX_ACCESS_TOKEN`` line.  Does not touch
+        any other key.  Returns the path written.
+        """
+        env_path = _find_env_file()
+        token_line = f"UPSTOX_ACCESS_TOKEN={access_token}"
+        lines: list[str] = (
+            env_path.read_text(encoding="utf-8").splitlines()
+            if env_path.exists()
+            else []
+        )
+        seen = False
+        for i, line in enumerate(lines):
+            if line.strip().startswith("UPSTOX_ACCESS_TOKEN="):
+                lines[i] = token_line
+                seen = True
+                break
+        if not seen:
+            lines.append(token_line)
+        env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return env_path
+
+    def load_access_token(self) -> Optional[str]:
+        """Read ``UPSTOX_ACCESS_TOKEN`` from the environment at call time."""
+        return os.getenv("UPSTOX_ACCESS_TOKEN", "")
+
+    # ----------------------------------------------------- status / lifecycle
+    def token_status(self) -> TokenState:
+        """Best-known state from presence + computed expiry (no network)."""
+        if not self._access_token:
+            return TokenState(
+                AuthStatus.ACCESS_TOKEN_EXPIRED, False, False,
+                "no Upstox access token configured",
+            )
+        if self._is_expired():
+            return TokenState(
+                AuthStatus.ACCESS_TOKEN_EXPIRED, True, False,
+                "Upstox access token expired (past 3:30 AM IST boundary); "
+                "re-authorize",
+            )
+        return TokenState(
+            AuthStatus.AUTH_OK, True, False,
+            "Upstox access token present and within validity window",
+        )
 
     def verify_authentication(self) -> TokenState:
-        """Best-effort liveness check. Uses token_status unless a probe is wired.
+        """Prove the stored token is actually accepted by Upstox.
 
-        The default provider can be injected with a `probe` callable that returns an
-        AuthStatus (e.g. a lightweight FYERS /profile call). Without one, this is the
-        static best-known state (no network). Tests inject a probe.
+        Issues a GET to ``UPSTOX_PROFILE_URL`` with
+        ``Authorization: Bearer <token>``.
+
+        Three distinct outcomes:
+          1. token absent → presence-only state, **no** network probe
+          2. token expired (3:30 AM boundary) → ACCESS_TOKEN_EXPIRED, no probe
+          3. token present + not expired → live probe:
+             200 → AUTH_OK,  401/403 → ACCESS_TOKEN_EXPIRED,  else → AUTH_FAILED
         """
-        return self.token_status()
+        # --- no token or locally-expired → skip the network call
+        if not self._access_token:
+            state = TokenState(
+                AuthStatus.ACCESS_TOKEN_EXPIRED, False, False,
+                "no Upstox access token configured; re-authorize via auth-login",
+            )
+            return state
+        if self._is_expired():
+            state = TokenState(
+                AuthStatus.ACCESS_TOKEN_EXPIRED, True, False,
+                "Upstox access token expired (past 3:30 AM IST boundary); "
+                "re-authorize",
+            )
+            self._notify(state.status)
+            return state
 
-    # --- internals ----------------------------------------------------------
-    def _default_post(self, url: str, data: dict, json_body: bool = False) -> "object":
-        if json_body:
-            return requests.post(url, json=data, timeout=self.timeout)
-        return requests.post(url, data=data, timeout=self.timeout)
+        # --- live probe
+        try:
+            resp = self._http_get(
+                self.profile_url,
+                {"Authorization": f"Bearer {self._access_token}"},
+            )
+        except requests.RequestException:
+            log.warning("Upstox connectivity probe network error")
+            result = TokenState(
+                AuthStatus.NETWORK_ERROR, True, False,
+                "network error during Upstox connectivity probe",
+            )
+            self._notify(result.status)
+            return result
 
+        status, body = self._parse(resp)
+        if status == 200:
+            result = TokenState(
+                AuthStatus.AUTH_OK, True, False,
+                "access token accepted by Upstox (profile call succeeded)",
+            )
+            self._notify(result.status)
+            return result
+        if status in (401, 403):
+            result = TokenState(
+                AuthStatus.ACCESS_TOKEN_EXPIRED, True, False,
+                "access token rejected by Upstox; re-authorize required",
+            )
+            self._notify(result.status)
+            return result
+        # Non-auth error (rate-limit, server error, etc.).
+        msg = _safe_err(body)
+        log.warning("Upstox connectivity probe error (status=%s): %s", status, msg)
+        result = TokenState(
+            AuthStatus.AUTH_FAILED, True, False,
+            f"Upstox error during connectivity probe (status={status})",
+        )
+        self._notify(result.status)
+        return result
+
+    # ---------------------------------------------------------------- internals
+    def _default_post(self, url: str, data: dict) -> object:
+        return requests.post(url, data=data, timeout=self._timeout)
+
+    def _default_get(self, url: str, headers: dict) -> object:
+        return requests.get(url, headers=headers, timeout=self._timeout)
+
+    def _is_expired(self) -> bool:
+        """True if obtained_at is known and past the 3:30 AM IST expiry."""
+        if self._obtained_at is None:
+            return False
+        return dt.datetime.now(_UTC) >= _next_expiry(self._obtained_at)
+
+    def _notify(self, status: AuthStatus) -> None:
+        if self._auth_status_callback is not None:
+            try:
+                self._auth_status_callback(status.value)
+            except Exception:  # pragma: no cover - callback must never break caller
+                log.debug("auth_status_callback raised; ignored")
+
+    # -- response parsing ------------------------------------------------------
     @staticmethod
     def _parse(resp) -> tuple[int, dict]:
+        """Return (http_status_code, body_dict).  The HTTP status is the source of truth;
+        Upstox error bodies are parsed only for messages, not for status overrides."""
         status = getattr(resp, "status_code", 200)
         try:
             body = resp.json()
         except Exception:
             body = {}
-        if isinstance(body, dict) and body.get("s") == "error":
-            status = body.get("code", status)
         return status, (body if isinstance(body, dict) else {})
+
+    def _parse_token_response(self, resp) -> str:
+        """Parse the Upstox token-exchange HTTP response.
+
+        Raises :class:`TokenError` (without leaking the secret/auth-code) on
+        any problem: HTTP error, malformed JSON, missing ``access_token``,
+        invalid/expired code, redirect-URI mismatch, or invalid credentials.
+        """
+        status = getattr(resp, "status_code", 200)
+        body = _safe_parse_json(resp)
+
+        if status != 200:
+            msg = _safe_err(body) if body else "unknown error"
+            raise TokenError(
+                f"Upstox authorization code rejected (HTTP {status}): {msg}"
+            )
+
+        if not isinstance(body, dict):
+            raise TokenError("Upstox token response was not a JSON object.")
+
+        token = body.get("access_token")
+        if not token:
+            msg = _safe_err(body)
+            if msg:
+                raise TokenError(
+                    f"Upstox token exchange failed: {msg}"
+                )
+            raise TokenError(
+                "Upstox token exchange returned no access_token."
+            )
+        return token
+
+
+# Backward-compatible alias for code/tests that import ``TokenManager``.
+TokenManager = UpstoxTokenManager
+
+
+# --------------------------------------------------------------------- helpers
+def _find_env_file() -> Path:
+    from ..config import settings
+    return settings.project_root / ".env"
+
+
+def _safe_parse_json(resp) -> dict:
+    try:
+        body = resp.json()
+    except (ValueError, AttributeError):
+        return {}
+    return body if isinstance(body, dict) else {}
+
+
+def _safe_err(body: dict) -> str:
+    """Extract a human-readable (non-secret) error message from an Upstox response."""
+    if not isinstance(body, dict):
+        return "unknown error"
+    errs = body.get("errors")
+    if isinstance(errs, list) and errs:
+        first = errs[0]
+        if isinstance(first, dict):
+            return first.get("message", "unknown error")
+    return body.get("message", "unknown error")

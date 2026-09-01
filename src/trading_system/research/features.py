@@ -24,6 +24,8 @@ from ..analysis.quant import (
     rolling_volatility,
     annualized_volatility,
 )
+# Reuse the project's existing pure indicator calculations (no duplication).
+from ..indicators.indicators import momentum as _momentum_indicator
 
 # Features the engine can actually compute from stored OHLCV.
 AVAILABLE_FEATURES = [
@@ -90,7 +92,7 @@ def add_features(
     out[prefix + "atr"] = tr.rolling(window=atr_window, min_periods=atr_window).mean()
 
     # --- momentum (causal: close[T] / close[T-window] - 1) ---
-    out[prefix + "momentum"] = close / close.shift(momentum_window) - 1.0
+    out[prefix + "momentum"] = _momentum_indicator(close, momentum_window)
 
     # --- high/low range relative to close (causal, uses only T) ---
     out[prefix + "hl_range"] = (out["high"] - out["low"]) / close

@@ -24,6 +24,13 @@ def ema(series: pd.Series, span: int) -> pd.Series:
     return series.ewm(span=span, adjust=False, min_periods=1).mean()
 
 
+def momentum(series: pd.Series, window: int) -> pd.Series:
+    """Rate-of-change momentum: series[T] / series[T-window] - 1 (causal)."""
+    if window <= 0:
+        raise ValueError("window must be positive")
+    return series / series.shift(window) - 1.0
+
+
 def rolling_std(series: pd.Series, window: int) -> pd.Series:
     """Rolling standard deviation (population)."""
     if window <= 0:

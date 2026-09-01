@@ -1,4 +1,4 @@
-"""Indian market data layer (FYERS adapter, instruments, sessions, aggregation)."""
+"""Indian market data layer (FYERS/Upstox adapters, instruments, sessions, aggregation)."""
 from .instruments import (
     Exchange,
     InstrumentType,
@@ -8,7 +8,12 @@ from .instruments import (
     InstrumentRegistry,
     DEFAULT_INSTRUMENTS,
 )
-from .symbol_map import to_fyers_symbol, from_fyers_symbol
+from .symbol_map import (
+    to_fyers_symbol,
+    from_fyers_symbol,
+    to_upstox_symbol,
+    from_upstox_symbol,
+)
 from .market_calendar import (
     KOLKATA,
     TradingCalendar,
@@ -30,6 +35,15 @@ from .fyers import (
     FYERSAPIError,
     FYERSRateLimitError,
     FYERSNetworkError,
+)
+from .upstox import (
+    UpstoxMarketDataProvider,
+    UpstoxDataSocket,
+    UpstoxError,
+    UpstoxAuthError,
+    UpstoxAPIError,
+    UpstoxRateLimitError,
+    UpstoxNetworkError,
 )
 from .history_chunking import (
     ChunkedHistoricalFetcher,
@@ -59,6 +73,8 @@ __all__ = [
     "DEFAULT_INSTRUMENTS",
     "to_fyers_symbol",
     "from_fyers_symbol",
+    "to_upstox_symbol",
+    "from_upstox_symbol",
     "KOLKATA",
     "TradingCalendar",
     "SessionPhase",
@@ -80,6 +96,13 @@ __all__ = [
     "FYERSAPIError",
     "FYERSRateLimitError",
     "FYERSNetworkError",
+    "UpstoxMarketDataProvider",
+    "UpstoxDataSocket",
+    "UpstoxError",
+    "UpstoxAuthError",
+    "UpstoxAPIError",
+    "UpstoxRateLimitError",
+    "UpstoxNetworkError",
     "ChunkedHistoricalFetcher",
     "plan_chunks",
     "combine_frames",

@@ -7,7 +7,7 @@ factory change and nothing downstream needs to know.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 
@@ -49,3 +49,23 @@ class MarketDataProvider(ABC):
     @property
     def has_historical(self) -> bool:
         return True
+
+    @property
+    def is_authenticated(self) -> bool:
+        """Whether the provider has valid credentials (client_id + access_token)."""
+        return False
+
+    def connect_live(
+        self,
+        symbols: list[str],
+        on_event: Callable,
+        timeframe: str = "1m",
+        **kwargs,
+    ):
+        """Open a live data socket and start feeding normalized events to on_event.
+
+        Returns a controller object with at least a ``close()`` method.
+        Default implementation raises NotImplementedError; only real-time
+        providers need to override this.
+        """
+        raise NotImplementedError

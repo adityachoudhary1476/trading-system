@@ -53,7 +53,7 @@ export function MarketStatusPanel() {
         </div>
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 12, marginBottom: 0 }}>
-        Mock session state. Not connected to FYERS — real backend determines state during NSE hours.
+        Mock session state. Not connected to Upstox — real backend determines state during NSE hours.
       </p>
     </Panel>
   );

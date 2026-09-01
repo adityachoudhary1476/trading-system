@@ -24,7 +24,7 @@ from .analysis.pipeline import analyze
 from .storage.database import MarketStore, OHLCVRecord
 from .models.snapshot import build_snapshot_from_df
 from .models import analyze_snapshot, get_model_provider
-
+from .india.data_health import DataHealthMonitor, FeedStatus
 
 def _store() -> MarketStore:
     return MarketStore(settings.storage.db_url)
@@ -143,7 +143,7 @@ def _cmd_providers(args: argparse.Namespace) -> int:
     from .data.provider_exports import get_provider
 
     rows = []
-    for name in ("binance", "stooq", "fyers"):
+    for name in ("binance", "stooq", "upstox"):
         try:
             p = get_provider(name)
             rows.append([name, p.name, p.has_historical, p.is_real_time])
@@ -220,7 +220,7 @@ def _cmd_instruments(args: argparse.Namespace) -> int:
             fy,
         ])
     print(tabulate(table, headers=[
-        "internal", "type", "underlying", "expiry", "strike", "opt", "fyers_symbol"
+        "internal", "type", "underlying", "expiry", "strike", "opt", "provider_symbol"
     ], tablefmt="github"))
     return 0
 
@@ -381,53 +381,114 @@ def _cmd_research(args: argparse.Namespace) -> int:
     return 1
 
 
-def _cmd_auth_status(args: argparse.Namespace) -> int:
-    """Show FYERS token/auth status. Never prints secrets."""
-    from .india.token_manager import TokenManager, AuthStatus
+def _cmd_paper_status(args: argparse.Namespace) -> int:
+    """Report paper-trading engine status. Simulation-only; never places orders."""
+    from .execution import PaperBroker, SlippageConfig
 
-    tm = TokenManager()
-    state = tm.token_status()
-    print("FYERS AUTH STATUS")
-    print("------------------")
-    print(f"  status                : {state.status.value}")
-    print(f"  access_token_present  : {state.access_token_present}")
-    print(f"  refresh_token_present : {state.refresh_token_present}")
-    print(f"  client_id_present     : {bool(tm.client_id)}")
-    print(f"  message               : {state.message}")
+    # Build a fresh, in-memory broker to report its static configuration.
+    # No prices, no orders, no live calls.
+    broker = PaperBroker(initial_cash=100_000.0, slippage=SlippageConfig())
+    acc = broker.account()
+    print("PAPER TRADING")
+    print("-------------")
+    print("status:        READY")
+    print("mode:          PAPER")
+    print("live_orders:   DISABLED")
+    print("broker_class:  PaperBroker")
+    print(f"slippage_bps:  {broker.slippage.slippage_bps}")
+    print(f"initial_cash:  {acc.initial_cash:,.2f}")
     print()
-    if state.status in (AuthStatus.ACCESS_TOKEN_EXPIRED, AuthStatus.REFRESH_TOKEN_EXPIRED):
-        print("  AUTH BLOCKED — re-authorize via FYERS and update FYERS_ACCESS_TOKEN")
-        print("  (and FYERS_REFRESH_TOKEN / FYERS_SECRET if refresh is desired).")
-        return 2
-    print("  auth tokens appear configured; use a live probe to confirm validity.")
+    print("This engine simulates execution in memory. It cannot and does not")
+    print("place real broker orders, call Upstox, or modify live configuration.")
     return 0
 
 
+def _cmd_auth_status(args: argparse.Namespace) -> int:
+    """Show Upstox token/auth status, then PROVE connectivity with a live probe.
+
+    Never prints secrets. Reports three distinct things:
+      * whether credentials/token are present,
+      * whether the token was exchanged (presence-only state),
+      * whether Upstox actually accepts the token (live probe).
+    A token string existing is NOT reported as CONNECTED.
+    """
+    from .india.token_manager import UpstoxTokenManager, AuthStatus
+
+    monitor = DataHealthMonitor()
+    tm = UpstoxTokenManager(auth_status_callback=monitor.on_auth_status)
+    presence = tm.token_status()
+    print("UPSTOX AUTH STATUS")
+    print("------------------")
+    print(f"  status                : {presence.status.value}")
+    print(f"  access_token_present  : {presence.access_token_present}")
+    print(f"  client_id_present     : {bool(tm.client_id)}")
+    print(f"  redirect_uri_present  : {bool(tm.redirect_uri)}")
+    print(f"  message               : {presence.message}")
+    print()
+
+    if not presence.access_token_present:
+        print("  CREDENTIALS MISSING — set UPSTOX_CLIENT_ID, UPSTOX_CLIENT_SECRET, "
+              "UPSTOX_REDIRECT_URI, and UPSTOX_ACCESS_TOKEN in .env.")
+        print("  (No token to validate; Upstox connectivity was NOT checked.)")
+        return 2
+
+    print("  Validating token against Upstox (live probe)...")
+    result = tm.verify_authentication()
+    print(f"  UPSTOX CONNECTIVITY    : {_connectivity_label(result.status)}")
+    print(f"  probe detail          : {result.message}")
+    print()
+    if result.status == AuthStatus.AUTH_OK:
+        print("  CONNECTED — access token accepted by Upstox.")
+        return 0
+    if result.status == AuthStatus.NETWORK_ERROR:
+        print("  NETWORK ERROR — could not reach Upstox; check connectivity.")
+        return 2
+    if result.status == AuthStatus.ACCESS_TOKEN_EXPIRED:
+        print("  AUTH FAILED / TOKEN EXPIRED — re-run: auth-login then auth-exchange.")
+        return 2
+    print("  OTHER UPSTOX ERROR — see probe detail.")
+    return 2
+
+
+def _connectivity_label(status) -> str:
+    from .india.token_manager import AuthStatus
+
+    return {
+        AuthStatus.AUTH_OK: "CONNECTED",
+        AuthStatus.NETWORK_ERROR: "NETWORK ERROR",
+        AuthStatus.ACCESS_TOKEN_EXPIRED: "NOT CONNECTED (token rejected/expired)",
+        AuthStatus.AUTH_FAILED: "NOT CONNECTED (other Upstox error)",
+    }.get(status, "UNKNOWN")
+
 def _cmd_gen_auth_url(args: argparse.Namespace) -> int:
-    """Write the complete FYERS login URL (WITH secret_key) to a local temp file, and
-    best-effort copy to clipboard. The secret is NEVER printed to the terminal or logs.
+    """Write the complete Upstox login URL to a local temp file, and
+    best-effort copy to clipboard. The URL contains ONLY the OAuth params
+    (client_id, redirect_uri, response_type, state); the app secret is NOT in the URL.
+    The secret is never printed to the terminal or logs.
 
     Only the CLI output changes here; authentication logic, .env, and order/execution
-    code are untouched. The full URL is returned by TokenManager.generate_auth_url()
+    code are untouched. The full URL is returned by UpstoxTokenManager.build_authorization_url()
     and written to disk/clipboard only.
+
+    Each run generates a FRESH random `state`, so every URL is unique (CSRF + prevents
+    replay of a prior authorization). This is the `auth-login` sign-in step too.
     """
     import os
     import tempfile
-    from .india.token_manager import TokenManager, TokenError
+    from .india.token_manager import UpstoxTokenManager, TokenError
 
-    tm = TokenManager()
+    tm = UpstoxTokenManager()
     if not tm.client_id or not tm.secret:
-        print("Cannot build login URL: FYERS_CLIENT_ID and FYERS_SECRET are not set.")
-        print("Set them in .env (FYERS_CLIENT_ID=...  FYERS_SECRET=...) and retry.")
+        print("Cannot build login URL: UPSTOX_CLIENT_ID and UPSTOX_CLIENT_SECRET are not set.")
+        print("Set them in .env (UPSTOX_CLIENT_ID=...  UPSTOX_CLIENT_SECRET=...  UPSTOX_REDIRECT_URI=...) and retry.")
         return 2
     try:
-        url = tm.generate_auth_url()  # contains the real secret_key (kept in memory only)
+        url = tm.build_authorization_url()
     except TokenError as e:
         print(f"ERROR: {e}")
         return 2
 
-    # Write the FULL url (with secret) to a local temp file. Secret never printed.
-    tmp = os.path.join(tempfile.gettempdir(), "fyers_auth_url.txt")
+    tmp = os.path.join(tempfile.gettempdir(), "upstox_auth_url.txt")
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             fh.write(url)
@@ -435,7 +496,6 @@ def _cmd_gen_auth_url(args: argparse.Namespace) -> int:
         print(f"ERROR: could not write auth URL to temp file: {e}")
         return 2
 
-    # Best-effort clipboard copy (optional; no failure if pyperclip absent).
     copied = False
     try:
         import pyperclip  # type: ignore
@@ -444,107 +504,101 @@ def _cmd_gen_auth_url(args: argparse.Namespace) -> int:
     except Exception:
         copied = False
 
-    print("FYERS login URL written to a LOCAL file (secret NOT printed to terminal):")
+    print("Upstox login URL written to a LOCAL file (secret NOT printed to terminal):")
     print(f"  {tmp}")
     if copied:
         print("  (also copied to clipboard)")
     print()
     print("Open that file and paste the URL into your browser, then log in.")
     print("After login, the browser redirects to your redirect URI with a URL like:")
-    print("  https://trade.fyers.in/api-login/redirect-uri/index.html?auth_code=XXXX&state=sample")
+    print("  https://api.upstox.com/v2/login/authorization/dialog?...&code=XXXX&state=YYYY")
     print()
     print("Copy the auth_code value, then run:")
     print("  python -m trading_system auth-exchange   # it will prompt for the auth_code")
-    print("  (or export FYERS_AUTH_CODE=XXXX and run the same command)")
+    print("  (or export UPSTOX_AUTH_CODE=XXXX and run the same command)")
     print()
     print("This tool NEVER prints your client secret, PIN, or tokens.")
-    print("Reminder: the temp file contains your secret_key — delete it after use.")
+    print("Reminder: the temp file holds the login URL — delete it after use.")
     return 0
 
 
 def _extract_auth_code(raw: str) -> str:
-    """Robustly extract the bare FYERS auth_code from user input.
+    """Robustly extract the bare auth_code from user input.
 
     Accepts any of:
       * the bare token (e.g. "eyJ...abc")
-      * "auth_code=XXXX" or "auth_code=XXXX&state=sample"
-      * a full redirect URL "https://...?auth_code=XXXX&state=sample"
+      * "code=XXXX" or "code=XXXX&state=sample"
+      * a full redirect URL "https://...?code=XXXX&state=sample"
     Strips surrounding whitespace and matching single/double quotes. Never logs the value.
     Returns the trimmed code, or "" if nothing usable.
     """
     if not raw:
         return ""
     s = raw.strip()
-    # Strip a single layer of matching quotes.
     if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
         s = s[1:-1].strip()
-    # If it looks like a URL or query string, pull the auth_code param.
-    if "auth_code=" in s:
+    if "code=" in s:
         from urllib.parse import parse_qs, urlparse
-        # Works for both "?auth_code=.." and a full URL (urlparse handles the query).
         query = s.split("?", 1)[1] if "?" in s else s
         parsed = parse_qs(query)
-        vals = parsed.get("auth_code")
+        vals = parsed.get("code")
         if vals:
             s = vals[0].strip()
-    # Drop any trailing "&state=..." or similar that may have leaked through.
     if "&" in s:
         s = s.split("&", 1)[0].strip()
     return s
 
 
 def _cmd_auth_exchange(args: argparse.Namespace) -> int:
-    """Exchange a manual auth_code for tokens. Reads the code from prompt/env only.
+    """Exchange a manual auth_code for an access token. Reads the code from prompt/env only.
 
-    Never writes .env automatically. Prints the resulting tokens so you can paste them
-    into .env yourself. No orders, no execution.
+    The access token is written to your local .env via save_access_token()
+    so subsequent commands pick it up automatically. No orders, no execution.
     """
     import getpass
-    from .india.token_manager import TokenManager, TokenError
+    from .india.token_manager import UpstoxTokenManager, TokenError, AuthStatus
 
-    tm = TokenManager()
+    monitor = DataHealthMonitor()
+    tm = UpstoxTokenManager(auth_status_callback=monitor.on_auth_status)
     if not tm.client_id or not tm.secret:
-        print("ERROR: FYERS_CLIENT_ID and FYERS_SECRET must be set in .env first.")
+        print("ERROR: UPSTOX_CLIENT_ID and UPSTOX_CLIENT_SECRET must be set in .env first.")
         return 2
-    # Resolve the auth_code with correct precedence:
-    #   1) explicit --auth-code CLI arg (if supplied)
-    #   2) interactive hidden prompt (PRIMARY manual source)
-    #   3) FYERS_AUTH_CODE env var (FALLBACK only, never overrides manual input)
-    env_code = os.getenv("FYERS_AUTH_CODE", "")
+    env_code = os.getenv("UPSTOX_AUTH_CODE", "")
     if env_code:
-        # Generic warning only; the env value is never printed.
-        print("WARNING: FYERS_AUTH_CODE environment variable is set; manual input takes precedence.")
+        print("WARNING: UPSTOX_AUTH_CODE environment variable is set; manual input takes precedence.")
     code = args.auth_code or ""
     if not code:
         try:
-            code = getpass.getpass("Paste the FYERS auth_code (input hidden): ").strip()
+            code = getpass.getpass("Paste the Upstox auth_code (input hidden): ").strip()
         except Exception:
-            code = input("Paste the FYERS auth_code: ").strip()
+            code = input("Paste the Upstox auth_code: ").strip()
     if not code:
-        # Only now fall back to the environment value.
         code = env_code
     if not code:
         print("No auth_code provided. Aborting.")
         return 2
-    # Normalize: accept bare token, "auth_code=XXXX", or a full redirect URL.
     code = _extract_auth_code(code)
     if not code:
         print("No usable auth_code extracted. Aborting.")
         return 2
     try:
-        access, refresh = tm.exchange_auth_code(code)
+        access = tm.exchange_auth_code(code)
     except TokenError as e:
-        print(f"TOKEN EXCHANGE: FAIL")
+        print("TOKEN EXCHANGE: FAIL")
         print(f"  {e}")
         return 2
-    print("TOKEN EXCHANGE: PASS")
+    print("TOKEN EXCHANGE: SUCCESS")
+    result = tm.verify_authentication()
+    print(f"UPSTOX CONNECTIVITY: {_connectivity_label(result.status)}")
+    if result.status != AuthStatus.AUTH_OK:
+        print(f"REASON: {result.message}")
     print()
-    print("Add these to your .env (this tool did NOT modify any files):")
-    print(f"  FYERS_ACCESS_TOKEN={access}")
-    if refresh:
-        print(f"  FYERS_REFRESH_TOKEN={refresh}")
-    else:
-        print("  FYERS_REFRESH_TOKEN=  (not returned this exchange; set blank)")
+    try:
+        env_path = tm.save_access_token(access)
+        print(f"Access token saved to {env_path} (UPSTOX_ACCESS_TOKEN).")
+    except OSError as e:
+        print(f"WARNING: could not save token to .env: {e}")
+        print("Add UPSTOX_ACCESS_TOKEN to your .env manually (this tool did NOT modify any files).")
     print()
     print("Then verify with:  python -m trading_system auth-status")
     return 0
@@ -644,7 +698,7 @@ def _cmd_backfill_universe(args: argparse.Namespace) -> int:
         return 1
 
     store = MarketStore(settings.storage.db_url)
-    provider = FYERSMarketDataProvider()
+    provider = UpstoxMarketDataProvider()
     engine = BackfillEngine(
         provider=provider, store=store, registry=InstrumentRegistry(),
         max_retries=2, retry_backoff=0.5,
@@ -855,11 +909,11 @@ def _cmd_backfill_history(args: argparse.Namespace) -> int:
     start = pd.Timestamp(args.start) if args.start else None
     end = pd.Timestamp(args.end) if args.end else None
 
-    print("FYERS HISTORICAL BACKFILL  (DATA ONLY — no orders placed)")
+    print("UPSTOX HISTORICAL BACKFILL  (DATA ONLY — no orders placed)")
     if not provider.is_authenticated:
         print(
-            "ERROR: FYERS credentials not found in environment (.env). "
-            "Set FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN, then retry."
+            "ERROR: Upstox credentials not found in environment (.env). "
+            "Set UPSTOX_CLIENT_ID and UPSTOX_ACCESS_TOKEN, then retry."
         )
         return 2
     print(f"Provider: {provider.name}")
@@ -884,7 +938,7 @@ def _cmd_backfill_history(args: argparse.Namespace) -> int:
 
         print("=" * 64)
         print(f"Symbol:      {res.symbol}")
-        print(f"FYERS sym:   {res.fyers_symbol}")
+        print(f"Provider symbol: {res.fyers_symbol}")
         print(f"Timeframe:   {res.timeframe}")
         if res.requested_start and res.requested_end:
             print(f"Requested:   {res.requested_start.date()} -> {res.requested_end.date()}")
@@ -941,16 +995,16 @@ def _cmd_ingest_india(args: argparse.Namespace) -> int:
     limit = args.limit
 
     print(f"Ingesting Indian market data via '{provider.name}' "
-          f"(provider credentials required for live FYERS)...")
+          f"(provider credentials required for live Upstox)...")
     results = []
     for sym in symbols:
         instr = reg.resolve(sym)
-        fy_sym = None
+        provider_symbol = None
         try:
-            fy_sym = provider._fyers_symbol(sym) if hasattr(provider, "_fyers_symbol") else sym
+            provider_symbol = provider._upstox_symbol(sym) if hasattr(provider, "_upstox_symbol") else sym
         except Exception:
-            fy_sym = sym
-        # Historical fetch requires auth for FYERS; Binance works without.
+            provider_symbol = sym
+        # Historical fetch requires auth for Upstox; Binance works without.
         try:
             df = provider.get_historical(sym, tf, limit)
             received = len(df)
@@ -971,12 +1025,12 @@ def _cmd_ingest_india(args: argparse.Namespace) -> int:
             ]
             inserted = _store().upsert_many(rows)
             results.append({
-                "symbol": sym, "fyers": fy_sym, "received": received,
+                "symbol": sym, "provider_symbol": provider_symbol, "received": received,
                 "inserted": inserted, "error": None,
             })
         except Exception as e:
             results.append({
-                "symbol": sym, "fyers": fy_sym, "received": 0,
+                "symbol": sym, "provider_symbol": provider_symbol, "received": 0,
                 "inserted": 0, "error": f"{type(e).__name__}: {e}",
             })
     print("\n" + tabulate(results, headers="keys", tablefmt="github") + "\n")
@@ -990,21 +1044,21 @@ def _cmd_ingest_india(args: argparse.Namespace) -> int:
 
 
 def _cmd_live(args: argparse.Namespace) -> int:
-    """Connect to FYERS live data, normalize + log events, then shut down.
+    """Connect to Upstox live data, normalize + log events, then shut down.
 
-    Does NOT place orders. Requires FYERS_CLIENT_ID + FYERS_ACCESS_TOKEN in env.
+    Does NOT place orders. Requires UPSTOX_CLIENT_ID + UPSTOX_ACCESS_TOKEN in env.
     If credentials are absent, exits with a clear, controlled message.
     """
     import time as _time
     from .data.provider_exports import get_provider
 
-    provider = get_provider(args.provider or "fyers")
+    provider = get_provider(args.provider or "upstox")
     if not getattr(provider, "is_authenticated", False):
-        print("FYERS runtime verification blocked because credentials were not "
-              "available (set FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN).")
+        print("Upstox runtime verification blocked because credentials were not "
+              "available (set UPSTOX_CLIENT_ID and UPSTOX_ACCESS_TOKEN).")
         return 1
 
-    print(f"Connecting to FYERS live for: {args.symbols} (max {args.duration}s)...")
+    print(f"Connecting to Upstox live for: {args.symbols} (max {args.duration}s)...")
     received = {"n": 0}
 
     def on_event(ev):
@@ -1089,24 +1143,24 @@ def _cmd_data_health(args: argparse.Namespace) -> int:
 
 
 def _cmd_live_verify(args: argparse.Namespace) -> int:
-    """REAL FYERS market-data verification only. Does NOT place orders.
+    """REAL Upstox market-data verification only. Does NOT place orders.
 
     Connects using .env credentials, subscribes to one liquid NSE symbol (NSE:SBIN
     by default), prints normalized events + feed health for a bounded period, then
     exits. This is data-only verification; no order API is called.
     """
-    from .india.fyers import FYERSMarketDataProvider
+    from .india.upstox import UpstoxMarketDataProvider
     from .india.live_pipeline import LiveMarketPipeline
 
     print("=" * 70)
-    print("FYERS LIVE-VERIFY  —  REAL MARKET-DATA VERIFICATION ONLY")
+    print("UPSTOX LIVE-VERIFY  —  REAL MARKET-DATA VERIFICATION ONLY")
     print("This command does NOT place orders or call any brokerage execution API.")
     print("=" * 70)
 
-    prov = FYERSMarketDataProvider()
+    prov = UpstoxMarketDataProvider()
     if not prov.is_authenticated:
-        print("ERROR: FYERS credentials not found in environment (.env).")
-        print("Set FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN, then retry.")
+        print("ERROR: Upstox credentials not found in environment (.env).")
+        print("Set UPSTOX_CLIENT_ID and UPSTOX_ACCESS_TOKEN, then retry.")
         return 2
 
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -1133,7 +1187,7 @@ def _cmd_live_verify(args: argparse.Namespace) -> int:
     try:
         socket = prov.connect_live(symbols, on_event=on_event, timeframe=timeframe)
     except Exception as e:
-        print(f"FYERS connect failed: {e}")
+        print(f"Upstox connect failed: {e}")
         return 1
     pipe.attach_socket(socket)
 
@@ -1184,7 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status", help="Show config (no secrets) and stored counts")
 
     sub.add_parser("providers", help="List available market-data providers")
-    p_in = sub.add_parser("instruments", help="List known Indian instruments + FYERS symbols")
+    p_in = sub.add_parser("instruments", help="List known Indian instruments + provider symbols")
     p_in.add_argument("--underlying", default=None, help="Filter/resolve by underlying (e.g. NIFTY, SBIN, SILVERMIC)")
     p_in.add_argument("--type", dest="instr_type", default=None,
                       choices=["equity", "index", "future", "option", "options", "futures"],
@@ -1193,17 +1247,17 @@ def main(argv: list[str] | None = None) -> int:
     p_in.add_argument("--strike", type=float, default=None, help="Option strike")
     p_in.add_argument("--option-type", default=None, choices=["CE", "PE"], help="CE/PE for options")
     p_in.add_argument("--discover", action="store_true",
-                      help="Use the live FYERS option-chain to discover contracts (DATA ONLY; requires creds)")
+                      help="Use the live option-chain to discover contracts (DATA ONLY; requires creds)")
 
     p_ing_in = sub.add_parser("ingest-india", help="Ingest Indian-market historical data")
     p_ing_in.add_argument("--symbols", required=True, help="Comma-separated INTERNAL symbols, e.g. NSE:RELIANCE,NSE:NIFTY50")
     p_ing_in.add_argument("--timeframe", default="1d")
     p_ing_in.add_argument("--limit", type=int, default=365)
-    p_ing_in.add_argument("--provider", default="fyers")
+    p_ing_in.add_argument("--provider", default="upstox")
 
     p_bf = sub.add_parser(
         "backfill-history",
-        help="Bulk historical backfill (FYERS) — DATA ONLY, no orders. Idempotent.",
+        help="Bulk historical backfill (Upstox) — DATA ONLY, no orders. Idempotent.",
     )
     p_bf.add_argument(
         "--symbols", required=True,
@@ -1288,17 +1342,17 @@ def main(argv: list[str] | None = None) -> int:
     p_rfa.add_argument("--factor", required=True, help="Factor name to analyze vs forward return")
     p_rfa.add_argument("--lag", type=int, default=1)
 
-    p_auth = sub.add_parser("auth-status", help="Show FYERS token/auth status (no secrets)")
-    p_gen = sub.add_parser("gen-auth-url", help="Print the FYERS login URL to open in a browser (no secrets)")
+    p_auth = sub.add_parser("auth-status", help="Show Upstox token/auth status (no secrets)")
+    p_gen = sub.add_parser("gen-auth-url", help="Print the Upstox login URL to open in a browser (no secrets)")
     p_login = sub.add_parser(
         "auth-login",
-        help="Sign-in step: generate a FRESH FYERS login URL (new state) and write it to a temp file/clipboard",
+        help="Sign-in step: generate a FRESH Upstox login URL (new state) and write it to a temp file/clipboard",
     )
     p_ex = sub.add_parser(
         "auth-exchange",
-        help="Exchange a manual FYERS auth_code for tokens (reads code from prompt/env; never writes files)",
+        help="Exchange a manual Upstox auth_code for tokens (reads code from prompt/env; never writes files)",
     )
-    p_ex.add_argument("--auth-code", default=None, help="FYERS auth_code (prefer env FYERS_AUTH_CODE to avoid shell history)")
+    p_ex.add_argument("--auth-code", default=None, help="Upstox auth_code (prefer env UPSTOX_AUTH_CODE to avoid shell history)")
     p_bu = sub.add_parser(
         "backfill-universe",
         help="Bulk historical backfill for a research universe (DATA ONLY, no orders).",
@@ -1313,21 +1367,25 @@ def main(argv: list[str] | None = None) -> int:
     p_bu.add_argument("--request-delay", type=float, default=0.5, help="Seconds between symbols")
 
 
-    p_lv = sub.add_parser("live", help="Connect FYERS live data (no orders placed)")
+    p_lv = sub.add_parser("live", help="Connect Upstox live data (no orders placed)")
     p_lv.add_argument("--symbols", required=True, help="Comma-separated INTERNAL symbols")
     p_lv.add_argument("--timeframe", default="1m")
     p_lv.add_argument("--duration", type=int, default=15, help="seconds to run")
     p_lv.add_argument("--lite", action="store_true", help="Lite (LTP-only) mode")
-    p_lv.add_argument("--provider", default="fyers")
+    p_lv.add_argument("--provider", default="upstox")
 
     p_is = sub.add_parser("instrument-search", help="Search known Indian instruments")
     p_is.add_argument("query", help="Substring, e.g. BANK, NIFTY, RELIANCE")
     sub.add_parser("market-status", help="Feed health + stored-data quality")
     sub.add_parser("data-health", help="Alias of market-status")
+    sub.add_parser(
+        "paper-status",
+        help="Show paper-trading engine status (simulation only, live orders DISABLED)",
+    )
 
     p_lv2 = sub.add_parser(
         "live-verify",
-        help="REAL FYERS market-data verification only (no orders placed)",
+        help="REAL Upstox market-data verification only (no orders placed)",
     )
     p_lv2.add_argument("--symbols", default="NSE:SBIN", help="Comma-separated INTERNAL symbols")
     p_lv2.add_argument("--timeframe", default="1m")
@@ -1377,6 +1435,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_instrument_search(args)
     if args.command in ("market-status", "data-health"):
         return _cmd_data_health(args)
+    if args.command == "paper-status":
+        return _cmd_paper_status(args)
     if args.command == "live-verify":
         return _cmd_live_verify(args)
     parser.print_help()

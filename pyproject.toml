@@ -13,6 +13,11 @@ dependencies = [
     "numpy==2.4.6",
     "SQLAlchemy==2.0.52",
     "python-dotenv==1.2.3",
+    # fyers-apiv3 is imported directly by src/trading_system/india/fyers.py (live WS) and
+    # src/trading_system/__main__.py (instrument discovery). 3.1.16 is the latest published
+    # release and is the version the auth contract was verified against; its hard-pinned
+    # requests==2.31.0 matches the pin below.
+    "fyers-apiv3==3.1.16",
     "requests==2.31.0",  # pinned to fyers-apiv3 3.1.16's required version (hard pin in its METADATA)
     "tabulate==0.10.0",
     "pydantic==2.13.4",

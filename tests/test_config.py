@@ -7,10 +7,10 @@ import pytest
 from trading_system.config import settings, Settings, MarketConfig
 
 
-def test_default_provider_is_fyers_india_primary():
-    # Day 3+: Indian markets are the primary target; FYERS is the default provider,
+def test_default_provider_is_upstox_india_primary():
+    # Day 3+: Indian markets are the primary target; Upstox is the default provider,
     # but Binance remains available as a development/test provider.
-    assert settings.market.provider in ("fyers", "binance")
+    assert settings.market.provider in ("upstox", "binance")
 
 
 def test_binance_still_selectable_as_dev_provider(monkeypatch):

@@ -86,7 +86,7 @@ export interface Signal {
 
 /** Feed health (maps backend DataHealthMonitor.snapshot). */
 export interface FeedHealth {
-  feed: string; // e.g. "FYERS"
+  feed: string; // e.g. "Upstox"
   status: FeedStatus;
   lastTick: number | null; // epoch ms
   eventsReceived: number;

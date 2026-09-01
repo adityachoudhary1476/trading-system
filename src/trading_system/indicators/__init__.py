@@ -6,6 +6,7 @@ from .indicators import (
     macd,
     bollinger_bands,
     atr,
+    momentum,
     rolling_std,
     add_all_indicators,
 )
@@ -17,6 +18,7 @@ __all__ = [
     "macd",
     "bollinger_bands",
     "atr",
+    "momentum",
     "rolling_std",
     "add_all_indicators",
 ]

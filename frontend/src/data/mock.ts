@@ -221,7 +221,7 @@ export function mockSignals(count = 18): Signal[] {
 
 // --- feed health -----------------------------------------------------------
 
-export function mockFeedHealth(feed = "FYERS"): FeedHealth {
+export function mockFeedHealth(feed = "Upstox"): FeedHealth {
   const now = Date.now();
   return {
     feed,
@@ -240,7 +240,7 @@ export function mockFeedHealth(feed = "FYERS"): FeedHealth {
 export function mockPipeline(): PipelineStage[] {
   const now = Date.now();
   return [
-    { id: "fyers", label: "FYERS", status: "connected", lastActivity: now - 1200, metric: "streaming" },
+    { id: "upstox", label: "Upstox", status: "connected", lastActivity: now - 1200, metric: "streaming" },
     { id: "events", label: "Market Events", status: "healthy", lastActivity: now - 900, metric: "18,432 events" },
     { id: "bus", label: "Event Bus", status: "healthy", lastActivity: now - 900, metric: "fan-out OK" },
     { id: "candles", label: "Candle Pipeline", status: "healthy", lastActivity: now - 5 * 60_000, metric: "412 candles" },

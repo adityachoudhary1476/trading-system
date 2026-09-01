@@ -43,9 +43,9 @@ Timeframe = Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w", "1M"]
 
 @dataclass
 class MarketConfig:
-    # Target market: "crypto" (Binance dev/test) or "india" (FYERS primary).
+    # Target market: "crypto" (Binance dev/test) or "india" (Upstox primary).
     market: str = field(default_factory=lambda: os.getenv("MARKET", "india"))
-    provider: str = field(default_factory=lambda: os.getenv("MARKET_DATA_PROVIDER", "fyers"))
+    provider: str = field(default_factory=lambda: os.getenv("MARKET_DATA_PROVIDER", "upstox"))
     default_exchange: str = field(default_factory=lambda: os.getenv("DEFAULT_EXCHANGE", "NSE"))
     timezone: str = field(default_factory=lambda: os.getenv("TIMEZONE", "Asia/Kolkata"))
     symbols: list[str] = field(

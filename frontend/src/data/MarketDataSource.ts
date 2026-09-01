@@ -40,8 +40,8 @@ export class MockMarketDataSource implements MarketDataSource {
   async getSignals(limit = 18) {
     return mock.mockSignals(limit);
   }
-  async getFeedHealth() {
-    return mock.mockFeedHealth("FYERS");
+    async getFeedHealth() {
+    return mock.mockFeedHealth("Upstox");
   }
   async getPipeline() {
     return mock.mockPipeline();

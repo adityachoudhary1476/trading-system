@@ -30,7 +30,7 @@ data source.
                  └───────────────────────┬─────────────────────┘
                                          ▼
    ┌─────────────────────────────────────────────┐
-   INDIAN MARKET  │  india.FYERSMarketDataProvider (primary)   │
+    INDIAN MARKET  │  india.UpstoxMarketDataProvider (primary)   │
    DATA           │  + instruments / symbol_map / calendar     │
    (primary)      │  + CandleAggregator / events               │
                   └───────────────────────┬─────────────────────┘
@@ -92,9 +92,9 @@ data source.
 | Package | Responsibility | Day 1 state |
 |---|---|---|
 | `config/` | Settings, env-driven config, logging | done |
-| `india/` | Indian layer: FYERS adapter (SDK-backed binary WS), instruments, symbol normalization, **derivative symbol resolver + option-chain discovery (Day 6)**, market calendar, candle aggregator, events, history chunking, instrument repo, event bus, closed-candle pipeline, data health, live pipeline, **`token_manager.py` (Day 10.5): explicit FYERS access/refresh token lifecycle, no secret leakage, observable auth states, integrated with `DataHealthMonitor.on_auth_status()`; no browser/TOTP automation**. | Day 6, 10.5 |
+| `india/` | Indian layer: Upstox adapter (WebSocket-backed), instruments, symbol normalization, derivative symbol resolver + option-chain discovery, market calendar, candle aggregator, events, history chunking, instrument repo, event bus, closed-candle pipeline, data health, live pipeline, token manager: explicit Upstox access/refresh token lifecycle, no secret leakage, observable auth states, integrated with `DataHealthMonitor.on_auth_status()`; no browser/TOTP automation. | Day 6, 10.5 |
 | `research/` | **Day 7 + Day 8**: provider-independent feature engine, strategy interface + baselines, deterministic next-bar backtester, risk layer, performance analytics, walk-forward split, AI-analyst interface; **Day 8**: `intelligence.py` (MarketIntelligenceEngine, FeatureEngine, MarketRegime, SignalCandidate, AnalysisExplanation, AIAnalysis, MarketReasoningProvider — DATA/ANALYSIS ONLY); **Day 10**: `factors.py` (causal FactorEngine, 17 documented factors), `factor_analysis.py` (IC/IR, grouped decile backtest, breakeven), warmup-aware `backtester.py`, `evidence.py` (ExperimentManifest deterministic hash, Hypothesis/EvidenceRun, EvidenceStore on the SAME SQLite engine as MarketStore — no second DB, ResearchRegistry, quality/freshness); **Day 10.5**: `costs.py` (IndiaTransactionCostModel, EffectiveRate effective-dated table, GST on taxable components only, missing-rate explicit error), `universe.py` (ResearchUniverse/UniverseRegistry, no fabricated constituents), `backtester.py` accepts `cost_model` via `BacktestConfig` (backward compatible). RESEARCH ONLY — no execution, no broker, no LLM code-gen. | Day 7, 8, 10, 10.5 |
-| `data/` | Provider interface, Binance/Stooq/FYERS adapters, validation, ingestion pipeline | done |
+| `data/` | Provider interface, Binance/Stooq/Upstox adapters, validation, ingestion pipeline | done |
 | `storage/` | SQLAlchemy SQLite store, idempotent upsert | done |
 | `analysis/` | Quant metrics + analysis pipeline | done |
 | `indicators/` | Technical indicators | done |

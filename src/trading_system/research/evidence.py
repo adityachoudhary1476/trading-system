@@ -47,6 +47,28 @@ class HypothesisStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class StrategyStatus(str, Enum):
+    """Phase 16 strategy lifecycle (research state, NOT execution permission)."""
+
+    PROPOSED = "proposed"
+    VALIDATED = "validated"
+    RESEARCHED = "researched"
+    WALK_FORWARD_VALIDATED = "walk_forward_validated"
+    REJECTED = "rejected"
+    RETIRED = "retired"
+
+
+class EvidenceType(str, Enum):
+    """Phase 16 evidence classification (Phase 18 adds PAPER_TRADING)."""
+
+    BACKTEST = "backtest"
+    RESEARCH = "research"
+    WALK_FORWARD = "walk_forward"
+    AI_RESEARCH = "ai_research"
+    HOLDOUT = "holdout"
+    PAPER_TRADING = "paper_trading"
+
+
 # --------------------------------------------------------------------------- #
 # Experiment manifest (deterministic identity)
 # --------------------------------------------------------------------------- #
@@ -97,6 +119,40 @@ class ExperimentManifest:
 
 def _stable(obj):
     return json.loads(json.dumps(obj, sort_keys=True, default=str))
+
+
+# --------------------------------------------------------------------------- #
+# Phase 16 — deterministic strategy + dataset identity
+# --------------------------------------------------------------------------- #
+def strategy_identity(spec: "StrategySpec") -> str:
+    """Deterministic strategy identity from canonical StrategySpec JSON.
+
+    Same spec -> same identity. Independent of dict ordering, whitespace, or
+    runtime object identity.
+    """
+    from trading_system.research.strategy_lab.spec import StrategySpec
+    if not isinstance(spec, StrategySpec):
+        raise TypeError("spec must be a StrategySpec")
+    blob = json.dumps(spec.model_dump(mode="json"), sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:64]
+
+
+def dataset_identity(dataset: "HistoricalDataset") -> str:
+    """Deterministic dataset identity from metadata (not raw OHLCV hash)."""
+    from trading_system.research.dataset import HistoricalDataset
+    if not isinstance(dataset, HistoricalDataset):
+        raise TypeError("dataset must be a HistoricalDataset")
+    data = dataset.data if dataset.data is not None else pd.DataFrame()
+    payload = {
+        "symbol": dataset.symbol,
+        "timeframe": dataset.timeframe,
+        "contract_id": dataset.contract_id or "",
+        "rows": int(len(data)),
+        "date_start": str(data.index.min()) if len(data) else "",
+        "date_end": str(data.index.max()) if len(data) else "",
+    }
+    blob = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:64]
 
 
 # --------------------------------------------------------------------------- #
@@ -226,6 +282,144 @@ class EvidenceRecord(Base):
 
 
 # --------------------------------------------------------------------------- #
+# Strategy registry models (Phase 16)
+# --------------------------------------------------------------------------- #
+class Strategy(BaseModel):
+    """Persisted strategy identity derived from a validated StrategySpec."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_id: str
+    name: str
+    symbol: str
+    timeframe: str
+    spec_json: str
+    spec_hash: str
+    status: StrategyStatus = StrategyStatus.PROPOSED
+    generated_by: str = ""
+    description: str = ""
+    parent_strategy_id: str = ""
+    generation_metadata: dict = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+
+    def as_record(self) -> "StrategyRecord":
+        return StrategyRecord(
+            strategy_id=self.strategy_id,
+            name=self.name,
+            symbol=self.symbol,
+            timeframe=self.timeframe,
+            spec_json=self.spec_json,
+            spec_hash=self.spec_hash,
+            status=self.status.value,
+            generated_by=self.generated_by,
+            description=self.description,
+            parent_strategy_id=self.parent_strategy_id or None,
+            generation_metadata=json.dumps(self.generation_metadata),
+            created_at=_parse_dt(self.created_at or _now()),
+            updated_at=_parse_dt(self.updated_at or _now()),
+        )
+
+
+class StrategyRecord(Base):
+    __tablename__ = "strategies"
+    strategy_id = Column(String(64), primary_key=True)
+    name = Column(String(128), nullable=False)
+    symbol = Column(String(32), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False)
+    spec_json = Column(Text, nullable=False)
+    spec_hash = Column(String(64), nullable=False, index=True)
+    status = Column(String(24), nullable=False, default="proposed", index=True)
+    generated_by = Column(String(64), nullable=False, default="")
+    description = Column(Text, nullable=False, default="")
+    parent_strategy_id = Column(String(64), nullable=True, index=True)
+    generation_metadata = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class StrategyEvidence(BaseModel):
+    """Immutable research observation about a strategy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evidence_id: str
+    strategy_id: str
+    strategy_spec_hash: str
+    evidence_type: EvidenceType
+    dataset_id: str
+    configuration_json: dict = field(default_factory=dict)
+    metrics_json: dict = field(default_factory=dict)
+    report_json: dict = field(default_factory=dict)
+    provenance_json: dict = field(default_factory=dict)
+    fold_id: Optional[int] = None
+    train_start: Optional[str] = None
+    train_end: Optional[str] = None
+    validation_start: Optional[str] = None
+    validation_end: Optional[str] = None
+    created_at: str = ""
+
+    def as_record(self) -> "StrategyEvidenceRecord":
+        return StrategyEvidenceRecord(
+            evidence_id=self.evidence_id,
+            strategy_id=self.strategy_id,
+            strategy_spec_hash=self.strategy_spec_hash,
+            evidence_type=self.evidence_type.value,
+            dataset_id=self.dataset_id,
+            configuration_json=json.dumps(self.configuration_json),
+            metrics_json=json.dumps(self.metrics_json),
+            report_json=json.dumps(self.report_json),
+            provenance_json=json.dumps(self.provenance_json),
+            fold_id=self.fold_id,
+            train_start=self.train_start,
+            train_end=self.train_end,
+            validation_start=self.validation_start,
+            validation_end=self.validation_end,
+            created_at=_parse_dt(self.created_at or _now()),
+        )
+
+
+class StrategyEvidenceRecord(Base):
+    __tablename__ = "strategy_evidence"
+    evidence_id = Column(String(64), primary_key=True)
+    strategy_id = Column(String(64), ForeignKey("strategies.strategy_id"), index=True)
+    strategy_spec_hash = Column(String(64), nullable=False, index=True)
+    evidence_type = Column(String(24), nullable=False, index=True)
+    dataset_id = Column(String(64), nullable=False, index=True)
+    configuration_json = Column(Text, nullable=False, default="{}")
+    metrics_json = Column(Text, nullable=False, default="{}")
+    report_json = Column(Text, nullable=False, default="{}")
+    provenance_json = Column(Text, nullable=False, default="{}")
+    fold_id = Column(Integer, nullable=True, index=True)
+    train_start = Column(String(24), nullable=True)
+    train_end = Column(String(24), nullable=True)
+    validation_start = Column(String(24), nullable=True)
+    validation_end = Column(String(24), nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class SchemaVersionRecord(Base):
+    __tablename__ = "schema_version"
+    id = Column(Integer, primary_key=True)
+    version = Column(Integer, nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle event record (Phase 17 — append-only audit trail)
+# --------------------------------------------------------------------------- #
+class LifecycleEventRecord(Base):
+    __tablename__ = "strategy_lifecycle_events"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    strategy_id = Column(String(64), ForeignKey("strategies.strategy_id"), nullable=False, index=True)
+    event_type = Column(String(32), nullable=False, index=True)
+    from_status = Column(String(24), nullable=True)
+    to_status = Column(String(24), nullable=True)
+    reason = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+# --------------------------------------------------------------------------- #
 # Evidence quality + freshness (deterministic, documented thresholds)
 # --------------------------------------------------------------------------- #
 # Provisional, configurable research policy (Day 10 placeholders — flagged as such).
@@ -274,6 +468,12 @@ class EvidenceStore:
         Base.metadata.create_all(engine)  # idempotent; adds hypotheses/evidence_runs
         from sqlalchemy.orm import sessionmaker
         self._Session = sessionmaker(bind=engine, future=True)
+        # Ensure schema version is initialized.
+        with self._Session() as s:
+            rec = s.get(SchemaVersionRecord, 1)
+            if rec is None:
+                s.add(SchemaVersionRecord(id=1, version=1, updated_at=_parse_dt(_now())))
+                s.commit()
 
     # --- hypotheses ---
     def create_hypothesis(self, h: Hypothesis) -> Hypothesis:
@@ -357,6 +557,160 @@ class EvidenceStore:
             })
         return pd.DataFrame(rows)
 
+    # --- strategies ---
+    def register_strategy(self, s: Strategy) -> Strategy:
+        rec = s.as_record()
+        with self._Session() as session:
+            existing = session.get(StrategyRecord, s.strategy_id)
+            if existing:
+                if existing.spec_json != s.spec_json:
+                    raise ValueError(
+                        f"strategy {s.strategy_id} already exists with a different spec"
+                    )
+                return _rec_to_strategy(existing)
+            session.add(rec)
+            session.commit()
+        return s
+
+    def get_strategy(self, strategy_id: str) -> Optional[Strategy]:
+        with self._Session() as s:
+            rec = s.get(StrategyRecord, strategy_id)
+            return _rec_to_strategy(rec) if rec else None
+
+    def get_strategy_by_spec(self, spec: "StrategySpec") -> Optional[Strategy]:
+        sid = strategy_identity(spec)
+        with self._Session() as s:
+            rec = s.get(StrategyRecord, sid)
+            return _rec_to_strategy(rec) if rec else None
+
+    def list_strategies(self, symbol: Optional[str] = None,
+                        timeframe: Optional[str] = None,
+                        status: Optional[str] = None,
+                        generated_by: Optional[str] = None) -> list[Strategy]:
+        with self._Session() as s:
+            q = select(StrategyRecord)
+            if symbol:
+                q = q.where(StrategyRecord.symbol == symbol)
+            if timeframe:
+                q = q.where(StrategyRecord.timeframe == timeframe)
+            if status:
+                q = q.where(StrategyRecord.status == status)
+            if generated_by:
+                q = q.where(StrategyRecord.generated_by == generated_by)
+            recs = s.execute(q.order_by(StrategyRecord.created_at.desc())).scalars().all()
+        return [_rec_to_strategy(r) for r in recs]
+
+    def update_strategy_status(self, strategy_id: str, status: StrategyStatus) -> None:
+        with self._Session() as s:
+            rec = s.get(StrategyRecord, strategy_id)
+            if rec is None:
+                raise KeyError(strategy_id)
+            rec.status = status.value
+            rec.updated_at = _parse_dt(_now())
+            s.commit()
+
+    # --- strategy evidence ---
+    def record_strategy_evidence(self, e: StrategyEvidence) -> StrategyEvidence:
+        rec = e.as_record()
+        with self._Session() as s:
+            existing = s.get(StrategyEvidenceRecord, e.evidence_id)
+            if existing:
+                return _rec_to_strategy_evidence(existing)
+            s.add(rec)
+            s.commit()
+        return e
+
+    def get_strategy_evidence(self, evidence_id: str) -> Optional[StrategyEvidence]:
+        with self._Session() as s:
+            rec = s.get(StrategyEvidenceRecord, evidence_id)
+            return _rec_to_strategy_evidence(rec) if rec else None
+
+    def list_strategy_evidence(self, strategy_id: Optional[str] = None,
+                               evidence_type: Optional[str] = None,
+                               dataset_id: Optional[str] = None,
+                               fold_id: Optional[int] = None) -> list[StrategyEvidence]:
+        with self._Session() as s:
+            q = select(StrategyEvidenceRecord)
+            if strategy_id:
+                q = q.where(StrategyEvidenceRecord.strategy_id == strategy_id)
+            if evidence_type:
+                q = q.where(StrategyEvidenceRecord.evidence_type == evidence_type)
+            if dataset_id:
+                q = q.where(StrategyEvidenceRecord.dataset_id == dataset_id)
+            if fold_id is not None:
+                q = q.where(StrategyEvidenceRecord.fold_id == fold_id)
+            recs = s.execute(q.order_by(StrategyEvidenceRecord.created_at.desc())).scalars().all()
+        return [_rec_to_strategy_evidence(r) for r in recs]
+
+    def get_latest_strategy_evidence(self, strategy_id: str) -> Optional[StrategyEvidence]:
+        evs = self.list_strategy_evidence(strategy_id=strategy_id)
+        return evs[0] if evs else None
+
+    def get_strategy_history(self, strategy_id: str) -> list[StrategyEvidence]:
+        return self.list_strategy_evidence(strategy_id=strategy_id)
+
+    def _schema_version(self) -> Optional[int]:
+        with self._Session() as s:
+            rec = s.get(SchemaVersionRecord, 1)
+            return rec.version if rec else None
+
+    def _set_schema_version(self, version: int) -> None:
+        with self._Session() as s:
+            rec = s.get(SchemaVersionRecord, 1)
+            if rec is None:
+                rec = SchemaVersionRecord(id=1, version=version, updated_at=_parse_dt(_now()))
+                s.add(rec)
+            else:
+                rec.version = version
+                rec.updated_at = _parse_dt(_now())
+            s.commit()
+
+    # --- schema migration (Phase 17) ---
+    CURRENT_SCHEMA_VERSION = 2
+
+    def ensure_schema_current(self) -> int:
+        """Idempotent forward migration. Returns the resulting schema version.
+
+        Phase 17 added the append-only ``strategy_lifecycle_events`` table;
+        Phase 18 reuses the existing ``strategies`` / ``strategy_evidence``
+        tables (PAPER_TRADING is just a new ``EvidenceType`` value, the
+        underlying column is a free-text String). All migrations are additive
+        only: existing tables/columns are untouched, so Phase 16/17 records
+        remain readable. Safe to call on every startup.
+        """
+        current = self._schema_version()
+        if current is not None and current >= self.CURRENT_SCHEMA_VERSION:
+            return current
+        Base.metadata.create_all(self.engine)
+        self._set_schema_version(self.CURRENT_SCHEMA_VERSION)
+        return self.CURRENT_SCHEMA_VERSION
+
+    # --- lifecycle events ---
+    def record_lifecycle_event(self, e: LifecycleEvent) -> LifecycleEvent:
+        rec = e.as_record()
+        with self._Session() as s:
+            s.add(rec)
+            s.commit()
+        # Reconstruct from the known input (avoids reading detached-instance
+        # attributes after the session closes; the DB-generated id is not
+        # required for the audit trail).
+        return LifecycleEvent(
+            event_type=e.event_type,
+            strategy_id=e.strategy_id,
+            from_status=e.from_status,
+            to_status=e.to_status,
+            reason=e.reason,
+            created_at=e.created_at,
+        )
+
+    def list_lifecycle_events(self, strategy_id: Optional[str] = None) -> list[LifecycleEvent]:
+        with self._Session() as s:
+            q = select(LifecycleEventRecord)
+            if strategy_id:
+                q = q.where(LifecycleEventRecord.strategy_id == strategy_id)
+            recs = s.execute(q.order_by(LifecycleEventRecord.created_at.asc())).scalars().all()
+        return [_rec_to_lifecycle_event(r) for r in recs]
+
 
 # --------------------------------------------------------------------------- #
 # Research registry (clean API for future Hermes tools — not SQLite internals)
@@ -390,6 +744,67 @@ class ResearchRegistry:
 
     def is_evidence_stale(self, e: EvidenceRun, stale_days: int = STALE_DAYS) -> bool:
         return is_evidence_stale(e.created_at, stale_days)
+
+    # --- strategies ---
+    def register_strategy(self, spec: "StrategySpec") -> Strategy:
+        sid = strategy_identity(spec)
+        s = Strategy(
+            strategy_id=sid,
+            name=spec.name,
+            symbol=spec.symbol,
+            timeframe=spec.timeframe,
+            spec_json=spec.to_json(),
+            spec_hash=sid,
+            status=StrategyStatus.PROPOSED,
+            generated_by=spec.generated_by,
+            description=spec.description,
+        )
+        return self.store.register_strategy(s)
+
+    def get_strategy(self, strategy_id: str) -> Optional[Strategy]:
+        return self.store.get_strategy(strategy_id)
+
+    def get_strategy_by_spec(self, spec: "StrategySpec") -> Optional[Strategy]:
+        return self.store.get_strategy_by_spec(spec)
+
+    def list_strategies(self, symbol: Optional[str] = None,
+                        timeframe: Optional[str] = None,
+                        status: Optional[str] = None,
+                        generated_by: Optional[str] = None) -> list[Strategy]:
+        return self.store.list_strategies(
+            symbol=symbol, timeframe=timeframe, status=status, generated_by=generated_by
+        )
+
+    def update_strategy_status(self, strategy_id: str, status: StrategyStatus) -> None:
+        self.store.update_strategy_status(strategy_id, status)
+
+    def record_strategy_evidence(self, e: StrategyEvidence) -> StrategyEvidence:
+        return self.store.record_strategy_evidence(e)
+
+    def get_strategy_evidence(self, evidence_id: str) -> Optional[StrategyEvidence]:
+        return self.store.get_strategy_evidence(evidence_id)
+
+    def list_strategy_evidence(self, strategy_id: Optional[str] = None,
+                               evidence_type: Optional[str] = None,
+                               dataset_id: Optional[str] = None,
+                               fold_id: Optional[int] = None) -> list[StrategyEvidence]:
+        return self.store.list_strategy_evidence(
+            strategy_id=strategy_id, evidence_type=evidence_type,
+            dataset_id=dataset_id, fold_id=fold_id,
+        )
+
+    def get_latest_strategy_evidence(self, strategy_id: str) -> Optional[StrategyEvidence]:
+        return self.store.get_latest_strategy_evidence(strategy_id)
+
+    def get_strategy_history(self, strategy_id: str) -> list[StrategyEvidence]:
+        return self.store.get_strategy_history(strategy_id)
+
+    # --- lifecycle events (Phase 17) ---
+    def record_lifecycle_event(self, e: LifecycleEvent) -> LifecycleEvent:
+        return self.store.record_lifecycle_event(e)
+
+    def list_lifecycle_events(self, strategy_id: Optional[str] = None) -> list[LifecycleEvent]:
+        return self.store.list_lifecycle_events(strategy_id=strategy_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -434,5 +849,85 @@ def _rec_to_evidence(rec: EvidenceRecord) -> EvidenceRun:
         max_drawdown=rec.max_drawdown, profit_factor=rec.profit_factor, ic=rec.ic, icir=rec.icir,
         cost_assumptions_bps=rec.cost_assumptions_bps, slippage_assumptions_bps=rec.slippage_assumptions_bps,
         regime=rec.regime, sample_size=rec.sample_size, quality=rec.quality,
+        created_at=rec.created_at.isoformat() if rec.created_at else "",
+    )
+
+
+def _rec_to_strategy(rec: StrategyRecord) -> Strategy:
+    return Strategy(
+        strategy_id=rec.strategy_id,
+        name=rec.name,
+        symbol=rec.symbol,
+        timeframe=rec.timeframe,
+        spec_json=rec.spec_json,
+        spec_hash=rec.spec_hash,
+        status=StrategyStatus(rec.status),
+        generated_by=rec.generated_by,
+        description=rec.description,
+        parent_strategy_id=rec.parent_strategy_id or "",
+        generation_metadata=json.loads(rec.generation_metadata or "{}"),
+        created_at=rec.created_at.isoformat() if rec.created_at else "",
+        updated_at=rec.updated_at.isoformat() if rec.updated_at else "",
+    )
+
+
+def _rec_to_strategy_evidence(rec: StrategyEvidenceRecord) -> StrategyEvidence:
+    return StrategyEvidence(
+        evidence_id=rec.evidence_id,
+        strategy_id=rec.strategy_id,
+        strategy_spec_hash=rec.strategy_spec_hash,
+        evidence_type=EvidenceType(rec.evidence_type),
+        dataset_id=rec.dataset_id,
+        configuration_json=json.loads(rec.configuration_json or "{}"),
+        metrics_json=json.loads(rec.metrics_json or "{}"),
+        report_json=json.loads(rec.report_json or "{}"),
+        provenance_json=json.loads(rec.provenance_json or "{}"),
+        fold_id=rec.fold_id,
+        train_start=rec.train_start,
+        train_end=rec.train_end,
+        validation_start=rec.validation_start,
+        validation_end=rec.validation_end,
+        created_at=rec.created_at.isoformat() if rec.created_at else "",
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Lifecycle event model (Phase 17)
+# --------------------------------------------------------------------------- #
+class LifecycleEvent(BaseModel):
+    """Append-only strategy lifecycle/audit event.
+
+    ``from_status`` / ``to_status`` are research lifecycle states (see
+    ``StrategyStatus``), never execution permissions. Reasons are free-form but
+    required for terminal transitions (retirement / rejection).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    event_type: str
+    strategy_id: str
+    from_status: Optional[StrategyStatus] = None
+    to_status: Optional[StrategyStatus] = None
+    reason: str = ""
+    created_at: str = ""
+
+    def as_record(self) -> "LifecycleEventRecord":
+        return LifecycleEventRecord(
+            strategy_id=self.strategy_id,
+            event_type=self.event_type,
+            from_status=self.from_status.value if self.from_status else None,
+            to_status=self.to_status.value if self.to_status else None,
+            reason=self.reason,
+            created_at=_parse_dt(self.created_at or _now()),
+        )
+
+
+def _rec_to_lifecycle_event(rec: LifecycleEventRecord) -> LifecycleEvent:
+    return LifecycleEvent(
+        event_type=rec.event_type,
+        strategy_id=rec.strategy_id,
+        from_status=StrategyStatus(rec.from_status) if rec.from_status else None,
+        to_status=StrategyStatus(rec.to_status) if rec.to_status else None,
+        reason=rec.reason or "",
         created_at=rec.created_at.isoformat() if rec.created_at else "",
     )

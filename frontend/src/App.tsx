@@ -5,12 +5,23 @@ import { DashboardPage } from "@/pages/Dashboard";
 import { MarketsPage } from "@/pages/Markets";
 import { SignalsPage } from "@/pages/Signals";
 import { SystemPage } from "@/pages/System";
+import { PaperTradingPage } from "@/pages/paper/PaperTrading";
+import { PaperOverview } from "@/pages/paper/PaperOverview";
+import { PaperDeployments } from "@/pages/paper/PaperDeployments";
+import { PaperDeploymentDetail } from "@/pages/paper/PaperDeploymentDetail";
+import { PaperStrategies } from "@/pages/paper/PaperStrategies";
+import { PaperSessions } from "@/pages/paper/PaperSessions";
+import { PaperPositions } from "@/pages/paper/PaperPositions";
+import { PaperEvents } from "@/pages/paper/PaperEvents";
+import { PaperRiskHealth } from "@/pages/paper/PaperRiskHealth";
+import { PaperReports } from "@/pages/paper/PaperReports";
 
 const KEYS: Record<string, string> = {
   "1": "/",
   "2": "/markets",
   "3": "/signals",
   "4": "/system",
+  "5": "/paper",
 };
 
 export function App() {
@@ -41,6 +52,23 @@ export function App() {
           <Route path="/markets" element={<MarketsPage />} />
           <Route path="/signals" element={<SignalsPage />} />
           <Route path="/system" element={<SystemPage />} />
+          <Route path="/paper" element={<PaperTradingPage />}>
+            <Route index element={<PaperOverview />} />
+            <Route path="overview" element={<PaperOverview />} />
+            <Route path="deployments" element={<PaperDeployments />} />
+            <Route path="deployments/:deploymentId" element={<PaperDeploymentDetail />} />
+            <Route path="strategies/:strategyId" element={<PaperStrategies />} />
+            <Route path="sessions" element={<PaperSessions />} />
+            <Route path="sessions/:deploymentId" element={<PaperSessions />} />
+            <Route path="positions" element={<PaperPositions />} />
+            <Route path="positions/:deploymentId" element={<PaperPositions />} />
+            <Route path="events" element={<PaperEvents />} />
+            <Route path="events/:deploymentId" element={<PaperEvents />} />
+            <Route path="risk" element={<PaperRiskHealth />} />
+            <Route path="risk/:deploymentId" element={<PaperRiskHealth />} />
+            <Route path="reports" element={<PaperReports />} />
+            <Route path="reports/:deploymentId" element={<PaperReports />} />
+          </Route>
           <Route path="*" element={<DashboardPage />} />
         </Routes>
       </main>

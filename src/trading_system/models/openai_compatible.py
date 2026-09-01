@@ -76,22 +76,20 @@ class OpenAICompatibleProvider(ModelProvider):
             return False
         return bool(os.getenv(self.api_key_env))
 
-    def analyze(self, snapshot: MarketSnapshot) -> MarketView:
-        if not self.is_available:
-            raise ModelProviderError(
-                "OpenAICompatibleProvider unavailable: set AI_API_KEY_ENV and the "
-                "corresponding environment variable (no key present in Day 2 env)."
-            )
-        # Defensive re-check.
+    def _post_chat(self, system_prompt: str, user_payload: str) -> str:
+        """POST one chat/completions request and return the message content.
+
+        Shared by ALL providers built on this client (MarketView analysis and
+        StrategySpec generation) so the HTTP/auth contract lives in one place.
+        Raises ModelProviderError on any transport or envelope failure.
+        """
         api_key = os.getenv(self.api_key_env, "")
         if not api_key:
             raise ModelProviderError("API key not found in environment")
-
-        user_payload = json.dumps(snapshot.to_context_dict(), indent=2, default=str)
         body = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload},
             ],
             "response_format": {"type": "json_object"},
@@ -109,9 +107,18 @@ class OpenAICompatibleProvider(ModelProvider):
                 timeout=self.timeout,
             )
             resp.raise_for_status()
-            content = resp.json()["choices"][0]["message"]["content"]
+            return resp.json()["choices"][0]["message"]["content"]
         except (requests.RequestException, KeyError, IndexError, ValueError) as e:
             raise ModelProviderError(f"OpenAI-compatible request failed: {e}")
+
+    def analyze(self, snapshot: MarketSnapshot) -> MarketView:
+        if not self.is_available:
+            raise ModelProviderError(
+                "OpenAICompatibleProvider unavailable: set AI_API_KEY_ENV and the "
+                "corresponding environment variable (no key present in Day 2 env)."
+            )
+        user_payload = json.dumps(snapshot.to_context_dict(), indent=2, default=str)
+        content = self._post_chat(_SYSTEM_PROMPT, user_payload)
 
         try:
             data = json.loads(content)

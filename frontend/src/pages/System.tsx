@@ -53,8 +53,8 @@ export function SystemPage() {
       </div>
 
       <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>
-        Mock pipeline status. Each stage maps to a real backend component (FYERS → events → bus → candle
-        pipeline → data health → snapshot → AI → signal). Connection state is OFFLINE / MOCK — not connected to FYERS.
+        Mock pipeline status. Each stage maps to a real backend component (Upstox → events → bus → candle
+        pipeline → data health → snapshot → AI → signal). Connection state is OFFLINE / MOCK — not connected to Upstox.
       </p>
     </>
   );
