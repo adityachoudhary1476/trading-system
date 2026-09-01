@@ -25,6 +25,7 @@ export function DashboardPage() {
   const [tf, setTf] = useState("5m");
   const [bars, setBars] = useState<OHLCVBar[] | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [indicators, setIndicators] = useState<IndicatorConfig>(DEFAULT_INDICATORS);
   const [levels, setLevels] = useState<number[]>([]);
   const [drawTool, setDrawTool] = useState<DrawTool>("none");
@@ -33,12 +34,22 @@ export function DashboardPage() {
     let alive = true;
     setBars(null);
     setLoading(true);
-    dataSource.getOHLCV(selectedSymbol, tf, 160).then((r) => {
-      if (!alive) return;
-      setBars(r);
-      setLoading(false);
-    });
-    return () => { alive = false; };
+    setError(null);
+    dataSource
+      .getOHLCV(selectedSymbol, tf, 160)
+      .then((r) => {
+        if (!alive) return;
+        setBars(r);
+        setLoading(false);
+      })
+      .catch((err: unknown) => {
+        if (!alive) return;
+        setError(err instanceof Error ? err.message : "Failed to load chart data");
+        setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
   }, [selectedSymbol, tf]);
 
   const lastClose = bars && bars.length ? bars[bars.length - 1].close : 0;
@@ -125,6 +136,12 @@ export function DashboardPage() {
                 levels={levels}
                 drawTool={drawTool}
               />
+            ) : error ? (
+              <div className="empty">
+                <div className="empty-icon" aria-hidden="true">⚠</div>
+                <div style={{ fontWeight: 600, color: "var(--text-dim)" }}>Unable to load chart</div>
+                <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{error}</div>
+              </div>
             ) : (
               <Loading label="Loading chart…" />
             )}

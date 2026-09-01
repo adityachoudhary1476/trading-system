@@ -6,11 +6,32 @@ import { Stat } from "@/components/ui";
 
 export function QuoteHeader({ symbol }: { symbol: string }) {
   const [q, setQ] = useState<MarketQuote | null>(null);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
-    dataSource.getQuote(symbol).then((r) => alive && setQ(r));
-    return () => { alive = false; };
+    setError(null);
+    dataSource
+      .getQuote(symbol)
+      .then((r) => {
+        if (alive) setQ(r);
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(err instanceof Error ? err.message : "Failed to load quote");
+      });
+    return () => {
+      alive = false;
+    };
   }, [symbol]);
+  if (!q && error) {
+    return (
+      <div className="page-head instrument-head">
+        <div className="instrument-id">
+          <h1 className="page-title">{symbol.replace("NSE:", "")}</h1>
+          <div className="subtitle">Data temporarily unavailable</div>
+        </div>
+      </div>
+    );
+  }
   if (!q) return null;
   const up = q.change >= 0;
   return (
@@ -41,8 +62,17 @@ export function MetricsStrip({ symbol }: { symbol: string }) {
   const [q, setQ] = useState<MarketQuote | null>(null);
   useEffect(() => {
     let alive = true;
-    dataSource.getQuote(symbol).then((r) => alive && setQ(r));
-    return () => { alive = false; };
+    dataSource
+      .getQuote(symbol)
+      .then((r) => {
+        if (alive) setQ(r);
+      })
+      .catch(() => {
+        if (alive) setQ(null);
+      });
+    return () => {
+      alive = false;
+    };
   }, [symbol]);
   if (!q) return null;
   const cells: { k: string; v: string; tone?: "pos" | "neg" }[] = [
@@ -69,8 +99,17 @@ export function MetricsPanel({ symbol }: { symbol: string }) {
   const [q, setQ] = useState<MarketQuote | null>(null);
   useEffect(() => {
     let alive = true;
-    dataSource.getQuote(symbol).then((r) => alive && setQ(r));
-    return () => { alive = false; };
+    dataSource
+      .getQuote(symbol)
+      .then((r) => {
+        if (alive) setQ(r);
+      })
+      .catch(() => {
+        if (alive) setQ(null);
+      });
+    return () => {
+      alive = false;
+    };
   }, [symbol]);
   if (!q) return null;
   const rows: [string, string][] = [

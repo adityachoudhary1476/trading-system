@@ -6,11 +6,34 @@ import { fmtAgo } from "@/lib/format";
 
 export function DataHealthPanel() {
   const [h, setH] = useState<FeedHealth | null>(null);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
-    dataSource.getFeedHealth().then((r) => alive && setH(r));
-    return () => { alive = false; };
+    setError(null);
+    dataSource
+      .getFeedHealth()
+      .then((r) => {
+        if (alive) setH(r);
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(err instanceof Error ? err.message : "Failed to load feed health");
+      });
+    return () => {
+      alive = false;
+    };
   }, []);
+
+  if (error) {
+    return (
+      <Panel title="Data Health">
+        <div className="empty">
+          <div className="empty-icon" aria-hidden="true">⚠</div>
+          <div style={{ fontWeight: 600, color: "var(--text-dim)" }}>Data health unavailable</div>
+          <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{error}</div>
+        </div>
+      </Panel>
+    );
+  }
 
   if (!h) return <Panel title="Data Health"><Loading /></Panel>;
   const healthy = h.status === "healthy";

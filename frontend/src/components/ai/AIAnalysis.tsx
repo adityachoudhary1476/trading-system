@@ -6,11 +6,34 @@ import { fmtPrice, fmtTime } from "@/lib/format";
 
 export function AIAnalysisPanel({ symbol }: { symbol: string }) {
   const [ai, setAi] = useState<AIAnalysis | null>(null);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
-    dataSource.getAIAnalysis(symbol).then((r) => alive && setAi(r));
-    return () => { alive = false; };
+    setError(null);
+    dataSource
+      .getAIAnalysis(symbol)
+      .then((r) => {
+        if (alive) setAi(r);
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(err instanceof Error ? err.message : "Failed to load analysis");
+      });
+    return () => {
+      alive = false;
+    };
   }, [symbol]);
+
+  if (error) {
+    return (
+      <Panel title="AI Market Intelligence">
+        <div className="empty">
+          <div className="empty-icon" aria-hidden="true">⚠</div>
+          <div style={{ fontWeight: 600, color: "var(--text-dim)" }}>Analysis unavailable</div>
+          <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{error}</div>
+        </div>
+      </Panel>
+    );
+  }
 
   if (!ai) return null;
   const confPct = Math.round(ai.confidence * 100);
@@ -77,16 +100,45 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
 export function SignalCard({ symbol }: { symbol: string }) {
   const [ai, setAi] = useState<AIAnalysis | null>(null);
   const [sig, setSig] = useState<{ price: number; generatedAt: number; reason: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     let alive = true;
-    dataSource.getAIAnalysis(symbol).then((r) => alive && setAi(r));
-    dataSource.getSignals(12).then((list) => {
-      if (!alive) return;
-      const s = list.find((x) => x.symbol === symbol) ?? list[0];
-      if (s) setSig({ price: s.price, generatedAt: s.generatedAt, reason: s.reason });
-    });
-    return () => { alive = false; };
+    setError(null);
+    dataSource
+      .getAIAnalysis(symbol)
+      .then((r) => {
+        if (alive) setAi(r);
+      })
+      .catch((err: unknown) => {
+        if (alive) setError(err instanceof Error ? err.message : "Failed to load signal");
+      });
+    dataSource
+      .getSignals(12)
+      .then((list) => {
+        if (!alive) return;
+        const s = list.find((x) => x.symbol === symbol) ?? list[0];
+        if (s) setSig({ price: s.price, generatedAt: s.generatedAt, reason: s.reason });
+      })
+      .catch(() => {
+        if (alive) setSig(null);
+      });
+    return () => {
+      alive = false;
+    };
   }, [symbol]);
+
+  if (error) {
+    return (
+      <Panel title="Signal">
+        <div className="empty">
+          <div className="empty-icon" aria-hidden="true">⚠</div>
+          <div style={{ fontWeight: 600, color: "var(--text-dim)" }}>Signal unavailable</div>
+          <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{error}</div>
+        </div>
+      </Panel>
+    );
+  }
+
   if (!ai) return null;
   const confPct = Math.round(ai.confidence * 100);
   return (
