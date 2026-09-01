@@ -11,6 +11,7 @@ import type {
   Signal,
 } from "@/types";
 import * as mock from "@/data/mock";
+import { getSupabaseClient } from "@/lib/supabase";
 
 export interface MarketDataSource {
   readonly mode: "mock" | "live";
@@ -69,12 +70,27 @@ export class ApiMarketDataSource implements MarketDataSource {
   readonly mode = "live" as const;
 
   private async fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+    const sb = getSupabaseClient();
+    const { data: sessionData } = await sb.auth.getSession();
+    const token = sessionData.session?.access_token;
+    const headers: Record<string, string> = {
+      "Content-Type": "application/json",
+    };
+    if (init?.headers) {
+      if (init.headers instanceof Headers) {
+        init.headers.forEach((value, key) => {
+          headers[key] = value;
+        });
+      } else {
+        Object.assign(headers, init.headers as Record<string, string>);
+      }
+    }
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
     const resp = await fetch(path, {
       ...init,
-      headers: {
-        "Content-Type": "application/json",
-        ...(init?.headers ?? {}),
-      },
+      headers,
       cache: "no-store",
     });
     if (!resp.ok) {

@@ -1,6 +1,18 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { ApiMarketDataSource } from "../MarketDataSource";
 
+vi.mock("../../lib/supabase", () => ({
+  getSupabaseClient: vi.fn(),
+}));
+
+import { getSupabaseClient } from "../../lib/supabase";
+
+const mockGetSession = vi.fn();
+
+vi.mocked(getSupabaseClient).mockReturnValue({
+  auth: { getSession: mockGetSession },
+} as unknown as ReturnType<typeof getSupabaseClient>);
+
 describe("ApiMarketDataSource", () => {
   let source: ApiMarketDataSource;
 
@@ -15,6 +27,10 @@ describe("ApiMarketDataSource", () => {
   });
 
   it("getQuote calls the correct endpoint", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
@@ -28,7 +44,41 @@ describe("ApiMarketDataSource", () => {
     expect(result.symbol).toBe("NSE:SBIN");
   });
 
+  it("sends Authorization header when session exists", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ symbol: "NSE:SBIN", price: 100 }),
+    });
+    await source.getQuote("NSE:SBIN");
+    const callArgs = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(callArgs[1].headers).toHaveProperty("Authorization", "Bearer test-token");
+  });
+
+  it("omits Authorization header when no session exists", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: null },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 200,
+      ok: true,
+      json: async () => ({ symbol: "NSE:SBIN", price: 100 }),
+    });
+    await source.getQuote("NSE:SBIN");
+    const callArgs = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(callArgs[1].headers).not.toHaveProperty("Authorization");
+  });
+
   it("getOHLCV calls the correct endpoint with params", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
@@ -44,6 +94,10 @@ describe("ApiMarketDataSource", () => {
   });
 
   it("getFeedHealth calls /api/upstox/status", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
@@ -58,6 +112,10 @@ describe("ApiMarketDataSource", () => {
   });
 
   it("throws on non-ok response", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 500,
       ok: false,
@@ -66,6 +124,10 @@ describe("ApiMarketDataSource", () => {
   });
 
   it("uses no-store cache", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
