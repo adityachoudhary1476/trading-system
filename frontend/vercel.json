@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "name": "finova-markets-frontend",
+  "rootDirectory": "frontend",
+  "builds": [
+    {
+      "src": "package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "distDir": "dist"
+      }
+    }
+  ]
+}
