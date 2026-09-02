@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState, useMemo, useCallback, useRef } from "react";
 import { Link } from "react-router-dom";
 import { paperApi } from "@/lib/paperApi";
 import type {
@@ -15,12 +15,14 @@ export function PaperOverview() {
   const [snapshot, setSnapshot] = useState<DashboardSnapshotResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const fetchSeqRef = useRef(0);
 
   const fetchData = useCallback(async (id: string) => {
-    if (!id) return;
+    const seq = ++fetchSeqRef.current;
     setLoading(true);
     setError(null);
     const res = await paperApi.getDashboard(id);
+    if (seq !== fetchSeqRef.current) return;
     if (res.ok) {
       setSnapshot(res.data);
     } else {
@@ -475,9 +477,9 @@ function SystemRow({
 
 function mapSessionTone(s: SessionStatus): string {
   if (s === "active" || s === "restored") return "is-active";
-  if (s === "paused" || s === "checkpointed") return "is-warning";
+  if (s === "paused" || s === "checkpointed" || s === "created") return "is-warning";
   if (s === "failed" || s === "stopped") return "is-critical";
-  return "is-healthy";
+  return "is-warning";
 }
 
 function mapHealthTone(s: HealthStatus): string {
@@ -526,7 +528,7 @@ function PositionsPanel({ data }: { data: DashboardSnapshotResponse }) {
           </Link>
         </div>
       </div>
-      {isFlat ? (
+      {isFlat || !open ? (
         <div className="tl-empty" role="status">
           <div className="tle-title">No Open Positions</div>
           <div className="tle-sub">
@@ -550,25 +552,23 @@ function PositionsPanel({ data }: { data: DashboardSnapshotResponse }) {
             </thead>
             <tbody>
               <tr>
-                <td>{open!.symbol}</td>
+                <td>{open.symbol}</td>
                 <td>
-                  <span className={`tl-side ${open!.side === "long" ? "long" : "short"}`}>
-                    {open!.side.toUpperCase()}
+                  <span className={`tl-side ${open.side === "long" ? "long" : "short"}`}>
+                    {open.side.toUpperCase()}
                   </span>
                 </td>
-                <td className="num">{open!.quantity.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</td>
-                <td className="num">{fmt.currency(open!.entry_price)}</td>
-                <td className="num">{fmt.currency(open!.current_price)}</td>
-                <td className="num">{fmt.currency(open!.position_value)}</td>
-                <td className={`num ${open!.unrealized_pnl >= 0 ? "pos" : "neg"}`}>
-                  {fmt.currency(open!.unrealized_pnl)}
+                <td className="num">
+                  {Number.isFinite(open.quantity) ? open.quantity.toLocaleString("en-IN", { maximumFractionDigits: 2 }) : "—"}
                 </td>
-                <td className={`num ${open!.unrealized_pnl >= 0 ? "pos" : "neg"}`}>
-                  {fmt.pct(
-                    open!.entry_price > 0
-                      ? (open!.current_price - open!.entry_price) / open!.entry_price
-                      : null,
-                  )}
+                <td className="num">{fmt.currency(open.entry_price)}</td>
+                <td className="num">{fmt.currency(open.current_price)}</td>
+                <td className="num">{fmt.currency(open.position_value)}</td>
+                <td className={`num ${open.unrealized_pnl != null && open.unrealized_pnl >= 0 ? "pos" : "neg"}`}>
+                  {fmt.currency(open.unrealized_pnl)}
+                </td>
+                <td className={`num ${open.unrealized_pnl != null && open.unrealized_pnl >= 0 ? "pos" : "neg"}`}>
+                  {fmt.pct(safeReturn(open.entry_price, open.current_price))}
                 </td>
               </tr>
             </tbody>
@@ -650,9 +650,18 @@ function ActivityTimeline({ data }: { data: DashboardSnapshotResponse }) {
 
 function toneForPnl(v: number | null | undefined): "pos" | "neg" | "muted" {
   if (v === null || v === undefined) return "muted";
+  if (!Number.isFinite(v)) return "muted";
   if (v > 0) return "pos";
   if (v < 0) return "neg";
   return "muted";
+}
+
+function safeReturn(entry: number, current: number): number | null {
+  if (!Number.isFinite(entry) || !Number.isFinite(current)) return null;
+  if (entry <= 0) return null;
+  const r = (current - entry) / entry;
+  if (!Number.isFinite(r)) return null;
+  return r;
 }
 
 function toneForEvent(type: string): string {

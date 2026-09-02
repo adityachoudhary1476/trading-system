@@ -479,6 +479,76 @@ describe("Paper Trading Frontend", () => {
       });
       expect(screen.getByText("Connection failed")).toBeDefined();
     });
+
+    it("does not crash on malformed dashboard payload", async () => {
+      const malformed = {
+        ...mockSnapshot,
+        account: {
+          ...mockSnapshot.account,
+          equity: null as unknown as number,
+          unrealized_pnl: null as unknown as number,
+          realized_pnl: null as unknown as number,
+          available_cash: null as unknown as number,
+          starting_equity: null as unknown as number,
+        },
+        performance: {
+          ...mockSnapshot.performance,
+          return: null as unknown as number,
+          drawdown: null as unknown as number,
+          exposure: null as unknown as number,
+        },
+      };
+      vi.mocked(paperApi.getDashboard).mockResolvedValue({ ok: true, data: malformed } as any);
+
+      renderWithRouter(<PaperOverview />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/dep-1/)).toBeDefined();
+      });
+
+      const select = screen.getByLabelText("Select deployment");
+      fireEvent.change(select, { target: { value: "dep-1" } });
+
+      await waitFor(() => {
+        expect(screen.getByText("Account & Performance Telemetry")).toBeDefined();
+      });
+      // NaN/null values must render as em-dash, never "NaN".
+      expect(screen.queryByText(/NaN/)).toBeNull();
+    });
+
+    it("renders open position safely when entry_price is zero", async () => {
+      const openZero = {
+        ...mockSnapshot,
+        positions: {
+          open_position: {
+            symbol: "NSE:SBIN",
+            quantity: 10,
+            side: "long" as const,
+            entry_price: 0,
+            current_price: 100,
+            unrealized_pnl: 1000,
+            position_value: 1000,
+          },
+          is_flat: false,
+        },
+      };
+      vi.mocked(paperApi.getDashboard).mockResolvedValue({ ok: true, data: openZero } as any);
+
+      renderWithRouter(<PaperOverview />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/dep-1/)).toBeDefined();
+      });
+
+      const select = screen.getByLabelText("Select deployment");
+      fireEvent.change(select, { target: { value: "dep-1" } });
+
+      await waitFor(() => {
+        expect(screen.getAllByText("Open Positions").length).toBeGreaterThan(0);
+      });
+      // Return cell must not produce NaN%.
+      expect(screen.queryByText(/NaN%/)).toBeNull();
+    });
   });
 
   describe("PaperDeploymentDetail", () => {
@@ -1075,6 +1145,23 @@ describe("Paper Trading Frontend", () => {
       await waitFor(() => {
         expect(screen.getByText("Paper Halted")).toBeDefined();
       });
+    });
+
+    it("does not crash when dashboard 500s", async () => {
+      vi.mocked(paperApi.getDashboard).mockResolvedValue({
+        ok: false,
+        error: { code: "internal_error", message: "Internal Server Error" },
+        status: 500,
+      } as any);
+
+      // No snapshot — header must still render without crashing.
+      renderWithParams(<PaperTradingPage />, "/paper/overview/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Paper Trading")).toBeDefined();
+      });
+      // Header falls back to neutral state.
+      expect(screen.getByText(/NO REAL MONEY/i)).toBeDefined();
     });
   });
 });

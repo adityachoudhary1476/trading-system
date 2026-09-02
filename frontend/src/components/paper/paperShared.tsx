@@ -89,23 +89,23 @@ export function EvidenceTimeline({
 /** Format helpers shared across paper-trading pages. */
 export const fmt = {
   currency: (v: number | null | undefined, digits = 2): string => {
-    if (v === null || v === undefined) return "—";
+    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
     return `₹${v.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
   },
   currencyPlain: (v: number | null | undefined, digits = 2): string => {
-    if (v === null || v === undefined) return "—";
+    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
     return v.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
   },
   pct: (v: number | null | undefined): string => {
-    if (v === null || v === undefined) return "—";
+    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
     return `${v >= 0 ? "+" : ""}${(v * 100).toFixed(2)}%`;
   },
   pctPlain: (v: number | null | undefined): string => {
-    if (v === null || v === undefined) return "—";
+    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
     return `${(v * 100).toFixed(2)}%`;
   },
   num: (v: number | null | undefined): string => {
-    if (v === null || v === undefined) return "—";
+    if (v === null || v === undefined || !Number.isFinite(v)) return "—";
     return v.toLocaleString("en-IN");
   },
 };
