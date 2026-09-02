@@ -10,6 +10,7 @@ DEFAULT FORMULA (documented, deterministic):
           + 0.15 * win_rate
           + 0.10 * norm_profit_factor
           + 0.05 * norm_trade_count
+          + 0.00 * search_count_penalty        (Phase 19; default 0)
 
 where each component is squashed to [-1, 1] (or [0, 1]) with fixed caps:
     norm_return        = clip(total_return / return_cap, -1, 1)
@@ -18,6 +19,7 @@ where each component is squashed to [-1, 1] (or [0, 1]) with fixed caps:
     win_rate           = as reported (0 when unavailable)
     norm_profit_factor = clip(profit_factor / profit_factor_cap, 0, 1)
     norm_trade_count   = min(1, n_trades / trade_count_target)  (rewards sample size)
+    search_count_penalty = 1 / sqrt(search_count) capped at 1 (Phase 19)
 
 Unavailable metrics contribute 0 (they never fabricate signal). Weights are
 configurable; unknown metric keys and negative weights are rejected. Ties are
@@ -27,7 +29,6 @@ This ranking is a research triage tool. It does NOT predict future returns and
 must not be described as doing so.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -42,6 +43,7 @@ ALLOWED_METRICS = (
     "win_rate",
     "profit_factor",
     "trade_count",
+    "search_count_penalty",
 )
 
 _DEFAULT_WEIGHTS = {
@@ -51,6 +53,7 @@ _DEFAULT_WEIGHTS = {
     "win_rate": 0.15,
     "profit_factor": 0.10,
     "trade_count": 0.05,
+    "search_count_penalty": 0.0,  # opt-in; see set_search_count
 }
 
 
@@ -86,15 +89,32 @@ class RankingConfig:
         if self.trade_count_target <= 0:
             raise ValueError("trade_count_target must be positive")
 
-    def normalized_score(self, evaluation: StrategyEvaluation) -> tuple:
-        """(total score, components dict). Pure function of the evaluation."""
+    def normalized_score(
+        self,
+        evaluation: StrategyEvaluation,
+        *,
+        search_count: int = 1,
+    ) -> tuple:
+        """(total score, components dict). Pure function of the evaluation.
+
+        ``search_count`` defaults to 1 (no penalty). When ``search_count`` > 1
+        the ``search_count_penalty`` component contributes
+        ``1 / sqrt(search_count)`` to the score (Phase 19). This penalizes
+        strategies discovered after extensive search and is fully transparent.
+        """
         comps: dict = {}
         for metric in ALLOWED_METRICS:
             weight = self.weights.get(metric, 0.0)
-            comps[metric] = weight * self._component(metric, evaluation)
+            comps[metric] = weight * self._component(metric, evaluation, search_count=search_count)
         return sum(comps.values()), comps
 
-    def _component(self, metric: str, ev: StrategyEvaluation) -> float:
+    def _component(
+        self,
+        metric: str,
+        ev: StrategyEvaluation,
+        *,
+        search_count: int = 1,
+    ) -> float:
         if metric == "total_return":
             return _clip(ev.total_return / self.return_cap, -1.0, 1.0)
         if metric == "max_drawdown":
@@ -111,6 +131,10 @@ class RankingConfig:
             return _clip(ev.profit_factor / self.profit_factor_cap, 0.0, 1.0)
         if metric == "trade_count":
             return min(1.0, ev.n_trades / self.trade_count_target)
+        if metric == "search_count_penalty":
+            # 1.0 for a pre-specified candidate (search_count=1); diminishing
+            # returns with sqrt(N) for searched candidates. Saturating at 1.0.
+            return min(1.0, 1.0 / max(1.0, float(search_count)) ** 0.5)
         raise KeyError(metric)  # pragma: no cover - guarded by __post_init__
 
 
@@ -119,20 +143,30 @@ class CandidateScore:
     key: str
     score: float
     components: dict
+    search_count: int = 1
 
 
 def rank_candidates(
     evaluations: dict,
     config: Optional[RankingConfig] = None,
+    *,
+    search_counts: Optional[dict] = None,
 ) -> list:
     """Rank {key: StrategyEvaluation} deterministically (best first).
+
+    ``search_counts`` is an optional {key: int} mapping used by the
+    ``search_count_penalty`` component (Phase 19). Missing keys default to 1.
 
     Ties break alphabetically by key, so the result is stable across runs.
     """
     cfg = config or RankingConfig()
+    search_counts = search_counts or {}
     scored = []
     for key in sorted(evaluations):
-        score, comps = cfg.normalized_score(evaluations[key])
-        scored.append(CandidateScore(key=key, score=float(score), components=comps))
+        sc = max(1, int(search_counts.get(key, 1)))
+        score, comps = cfg.normalized_score(
+            evaluations[key], search_count=sc
+        )
+        scored.append(CandidateScore(key=key, score=float(score), components=comps, search_count=sc))
     scored.sort(key=lambda c: (-c.score, c.key))
     return scored

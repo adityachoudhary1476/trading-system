@@ -16,6 +16,7 @@ import { PaperPositions } from "@/pages/paper/PaperPositions";
 import { PaperEvents } from "@/pages/paper/PaperEvents";
 import { PaperRiskHealth } from "@/pages/paper/PaperRiskHealth";
 import { PaperReports } from "@/pages/paper/PaperReports";
+import { PaperResearch } from "@/pages/paper/PaperResearch";
 
 const KEYS: Record<string, string> = {
   "1": "/",
@@ -70,6 +71,7 @@ export function App() {
             <Route path="risk/:deploymentId" element={<PaperRiskHealth />} />
             <Route path="reports" element={<PaperReports />} />
             <Route path="reports/:deploymentId" element={<PaperReports />} />
+            <Route path="research" element={<PaperResearch />} />
           </Route>
           <Route path="*" element={<DashboardPage />} />
         </Routes>

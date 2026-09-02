@@ -490,6 +490,9 @@ def test_ranking_unavailable_metrics_contribute_zero():
 
 def test_ranking_documented_default_weights():
     config = RankingConfig()
+    # Documented formula (Phase 13) -- unchanged. The new ``search_count_penalty``
+    # component (Phase 19) is opt-in and defaults to 0.0 so the legacy formula
+    # remains reproducible for callers that did not opt into the penalty.
     assert config.weights == {
         "total_return": 0.30,
         "max_drawdown": 0.20,
@@ -497,7 +500,71 @@ def test_ranking_documented_default_weights():
         "win_rate": 0.15,
         "profit_factor": 0.10,
         "trade_count": 0.05,
+        "search_count_penalty": 0.0,
     }
+
+
+def test_ranking_search_count_penalty_opt_in():
+    """Phase 19: search_count_penalty is opt-in (default weight 0.0)."""
+    config = RankingConfig()
+    config_default = RankingConfig()
+    assert config.weights["search_count_penalty"] == config_default.weights["search_count_penalty"] == 0.0
+
+
+def test_ranking_search_count_penalty_active_when_weighted():
+    """Phase 19: when the operator opts into the penalty, scores differ."""
+    config = RankingConfig(
+        weights={
+            "total_return": 0.0,
+            "max_drawdown": 0.0,
+            "risk_adjusted": 0.0,
+            "win_rate": 0.0,
+            "profit_factor": 0.0,
+            "trade_count": 0.0,
+            "search_count_penalty": 1.0,
+        }
+    )
+    from trading_system.research.strategy_lab.evaluation import StrategyEvaluation
+    ev = StrategyEvaluation(
+        spec_name="x", symbol="X", timeframe="1d", generated_by="t",
+        initial_capital=100.0, final_capital=100.0, net_pnl=0.0,
+        total_return=0.0, n_trades=0, winning=0, losing=0, win_rate=None,
+        avg_trade=None, avg_trade_return=None, max_drawdown=0.0,
+        transaction_costs=0.0, slippage_estimate=0.0, exposure_pct=0.0,
+        profit_factor=None, sharpe=None, sortino=None, reliable=True,
+        notes=[], unavailable_metrics=[],
+    )
+    score_pre, _ = config.normalized_score(ev, search_count=1)
+    score_100, _ = config.normalized_score(ev, search_count=100)
+    assert score_pre > score_100  # more searches -> lower score
+    assert score_pre == 1.0  # search_count=1 -> penalty=1.0
+    # search_count=100 -> 1/sqrt(100) = 0.10
+    assert score_100 == pytest.approx(0.10)
+
+
+def test_rank_candidates_supports_search_counts():
+    """Phase 19: rank_candidates accepts an optional {key: search_count} map."""
+    config = RankingConfig()
+    evaluations = {
+        "alpha": _empty_evaluation(),
+        "beta": _empty_evaluation(),
+    }
+    ranked = rank_candidates(evaluations, config, search_counts={"alpha": 1, "beta": 100})
+    assert len(ranked) == 2
+
+
+def _empty_evaluation():
+    """Construct a minimal empty StrategyEvaluation for ranking tests."""
+    from trading_system.research.strategy_lab.evaluation import StrategyEvaluation
+    return StrategyEvaluation(
+        spec_name="x", symbol="X", timeframe="1d", generated_by="t",
+        initial_capital=100.0, final_capital=100.0, net_pnl=0.0,
+        total_return=0.0, n_trades=0, winning=0, losing=0, win_rate=None,
+        avg_trade=None, avg_trade_return=None, max_drawdown=0.0,
+        transaction_costs=0.0, slippage_estimate=0.0, exposure_pct=0.0,
+        profit_factor=None, sharpe=None, sortino=None, reliable=True,
+        notes=[], unavailable_metrics=[],
+    )
 
 
 

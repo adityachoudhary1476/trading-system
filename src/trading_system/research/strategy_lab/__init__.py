@@ -93,6 +93,35 @@ from .ai_walk_forward import (
     walk_forward_ai_research,
     walk_forward_ai_validate,
 )
+from .cost_sensitivity import (
+    CostSensitivityConfig,
+    CostSensitivityPoint,
+    CostSensitivityResult,
+    run_cost_sensitivity,
+)
+from .regime_eval import (
+    RegimeEvalConfig,
+    RegimeEvaluationReport,
+    RegimeResult,
+    RegimeWindow,
+    run_regime_evaluation,
+)
+from .parameter_sensitivity import (
+    ParameterSensitivityConfig,
+    ParameterSensitivityPoint,
+    ParameterSensitivityResult,
+    run_parameter_sensitivity,
+)
+from .research_artifact import (
+    InvalidTransitionError,
+    LifecycleState,
+    ResearchArtifact,
+    RobustnessConfig,
+    RobustnessEvaluationConfig,
+    compute_regime_diversity,
+    evaluate_candidate_research,
+    transition,
+)
 
 __all__ = [
     # DSL
@@ -130,4 +159,14 @@ __all__ = [
     # AI walk-forward (Phase 15)
     "AIWalkForwardConfig", "FoldProvenance", "build_generation_context",
     "walk_forward_ai_research", "walk_forward_ai_validate",
+    # Phase 19 - Strategy Research & Robustness
+    "CostSensitivityConfig", "CostSensitivityPoint", "CostSensitivityResult",
+    "run_cost_sensitivity",
+    "RegimeEvalConfig", "RegimeEvaluationReport", "RegimeResult", "RegimeWindow",
+    "run_regime_evaluation",
+    "ParameterSensitivityConfig", "ParameterSensitivityPoint",
+    "ParameterSensitivityResult", "run_parameter_sensitivity",
+    "LifecycleState", "InvalidTransitionError", "transition",
+    "ResearchArtifact", "RobustnessConfig", "RobustnessEvaluationConfig",
+    "compute_regime_diversity", "evaluate_candidate_research",
 ]

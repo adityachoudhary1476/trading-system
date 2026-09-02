@@ -3,7 +3,7 @@ import { useApp, useIndianClock } from "@/store/AppContext";
 import { mockQuote, WATCHLIST_SYMBOLS } from "@/data/mock";
 import { dataSource } from "@/data/MarketDataSource";
 import { Sparkline } from "@/components/charts/Sparkline";
-import { fmtTime } from "@/lib/format";
+import { fmtTime, fmtPrice } from "@/lib/format";
 import { useEffect, useState } from "react";
 
 const MAIN_NAV = [
@@ -32,6 +32,7 @@ const PAPER_MONITORING = [
 
 const PAPER_REPORTING = [
   { to: "/paper/reports", label: "Reports", icon: "▤" },
+  { to: "/paper/research", label: "Research", icon: "✺" },
 ];
 
 export function Header() {
@@ -123,7 +124,7 @@ function WatchRow({ sym, active, onSelect }: { sym: string; active: boolean; onS
       aria-pressed={active}
     >
       <span className="watch-sym">{sym.replace("NSE:", "")}</span>
-      <span className="watch-px mono">{q.price.toLocaleString("en-IN", { minimumFractionDigits: 2 })}</span>
+      <span className="watch-px mono">₹{fmtPrice(q.price)}</span>
       <span className="watch-name">{q.name}</span>
       <span className={`watch-chg ${up ? "pos" : "neg"}`}>
         {up ? "+" : ""}

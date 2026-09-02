@@ -1,0 +1,672 @@
+[
+  {
+    "candidate_id": "breakout-bollinger-upper",
+    "name": "Bollinger upper-band breakout",
+    "category": "breakout",
+    "market": "nse_equity",
+    "source": "Bollinger 2001 'Bollinger on Bollinger Bands'",
+    "source_type": "book",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "bb_upper",
+      "bb_middle"
+    ],
+    "tags": [
+      "library",
+      "breakout"
+    ],
+    "claim": "Piercing the upper band in trending regimes signals continuation.",
+    "mechanism": "Volatility-scaled breakout; upper-band breakouts may persist in strong trends.",
+    "assumptions": [
+      "trending regime",
+      "band width meaningful"
+    ],
+    "risks": [
+      "mean reversion when regime shifts",
+      "regime-conditional performance"
+    ],
+    "known_failure_modes": [
+      "low-volatility chop",
+      "capitulation reversals"
+    ],
+    "research_notes": "Implemented by _bollinger_breakout."
+  },
+  {
+    "candidate_id": "breakout-donchian-20",
+    "name": "Donchian 20-bar breakout",
+    "category": "breakout",
+    "market": "nse_equity",
+    "source": "Faber 2007 'A Quantitative Approach to Tactical Asset Allocation' (Donchian / Turtle heritage)",
+    "source_type": "academic",
+    "evidence_quality": "peer_reviewed",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma"
+    ],
+    "tags": [
+      "library",
+      "breakout",
+      "trend"
+    ],
+    "claim": "A 20-bar breakout timing rule captures the persistent part of equity trends.",
+    "mechanism": "Trend persistence over monthly/weekly horizons.",
+    "assumptions": [
+      "trending markets",
+      "low transaction costs"
+    ],
+    "risks": [
+      "whipsaws in ranges",
+      "breakouts that immediately fail"
+    ],
+    "known_failure_modes": [
+      "sideways regimes",
+      "high-turnover regimes"
+    ],
+    "research_notes": "Donchian / Turtle heritage. Documented since Dennis & Eckhardt (1983)."
+  },
+  {
+    "candidate_id": "meanrev-bb-rsi-pullback",
+    "name": "Bollinger RSI pullback",
+    "category": "mean_reversion",
+    "market": "nse_equity",
+    "source": "Bollinger 2001 'Bollinger on Bollinger Bands'",
+    "source_type": "book",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "bb_lower",
+      "rsi"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "mean-reversion"
+    ],
+    "claim": "Two-factor oversold (price below band + momentum below threshold) reverts on mean.",
+    "mechanism": "Volatility-scaled reversion: extreme low prices relative to recent volatility attract buyers.",
+    "assumptions": [
+      "volatility is stationary",
+      "reversion completes within the holding window"
+    ],
+    "risks": [
+      "trending markets where 'oversold' persists",
+      "band width regime shifts"
+    ],
+    "known_failure_modes": [
+      "crash days",
+      "liquidity dry-ups"
+    ],
+    "research_notes": "Implemented by _spec_bollinger_squeeze in providers.py."
+  },
+  {
+    "candidate_id": "meanrev-rsi14-30-55",
+    "name": "RSI(14) mean reversion",
+    "category": "mean_reversion",
+    "market": "nse_equity",
+    "source": "Wilder 1978 'New Concepts in Technical Trading Systems'",
+    "source_type": "book",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "rsi"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "mean-reversion"
+    ],
+    "claim": "Oversold RSI readings revert toward the mean within a short horizon.",
+    "mechanism": "Behavioural: oversold conditions attract dip-buyers; mean reversion on short horizons.",
+    "assumptions": [
+      "short-horizon reversion",
+      "instrument is liquid enough to avoid execution slippage"
+    ],
+    "risks": [
+      "trending markets",
+      "mean reversion can fail in panic regimes"
+    ],
+    "known_failure_modes": [
+      "crash days",
+      "trending reversals"
+    ],
+    "research_notes": "Implemented by _spec_rsi_reversion in providers.py."
+  },
+  {
+    "candidate_id": "meanrev-rsi2",
+    "name": "RSI(2) mean reversion",
+    "category": "mean_reversion",
+    "market": "nse_index",
+    "source": "Connors 2009 'Short Term Trading Strategies That Work'",
+    "source_type": "practitioner_reference",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "rsi"
+    ],
+    "tags": [
+      "library",
+      "mean-reversion"
+    ],
+    "claim": "RSI(2) crossings of extreme thresholds revert within short horizons.",
+    "mechanism": "Behavioural mean reversion; high-turnover strategies; cost-sensitive.",
+    "assumptions": [
+      "short-horizon reversion",
+      "tight costs",
+      "liquidity for high turnover"
+    ],
+    "risks": [
+      "trending markets",
+      "extreme tail events"
+    ],
+    "known_failure_modes": [
+      "persistent trends",
+      "high costs"
+    ],
+    "research_notes": "Connors RSI(2) academic replication on US equity indices. Cost-sensitive on NSE."
+  },
+  {
+    "candidate_id": "momentum-10bar",
+    "name": "10-bar momentum breakout",
+    "category": "momentum",
+    "market": "nse_equity",
+    "source": "Jegadeesh & Titman 1993 'Returns to Buying Winners and Selling Losers'",
+    "source_type": "academic",
+    "evidence_quality": "peer_reviewed",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "momentum"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "momentum"
+    ],
+    "claim": "Recent winners continue to outperform over short horizons.",
+    "mechanism": "Under-reaction + slow information diffusion; behavioural herding.",
+    "assumptions": [
+      "persistent momentum",
+      "moderate liquidity"
+    ],
+    "risks": [
+      "momentum crashes",
+      "regime change"
+    ],
+    "known_failure_modes": [
+      "abrupt reversals",
+      "high turnover costs"
+    ],
+    "research_notes": "Implemented by _spec_momentum in providers.py."
+  },
+  {
+    "candidate_id": "momentum-12-1",
+    "name": "Momentum 12-1",
+    "category": "momentum",
+    "market": "nse_equity",
+    "source": "Jegadeesh & Titman 1993 'Returns to Buying Winners and Selling Losers'",
+    "source_type": "academic",
+    "evidence_quality": "peer_reviewed",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "momentum"
+    ],
+    "tags": [
+      "library",
+      "momentum"
+    ],
+    "claim": "Cross-sectional momentum of 12-month returns (skipping the most recent month) persists 3-12 months.",
+    "mechanism": "Under-reaction + slow information diffusion.",
+    "assumptions": [
+      "trend persistence on 12-bar horizon",
+      "low turnover costs"
+    ],
+    "risks": [
+      "momentum crashes",
+      "high turnover"
+    ],
+    "known_failure_modes": [
+      "regime reversals",
+      "liquidity crunches"
+    ],
+    "research_notes": "Single-instrument time-series analogue of a cross-sectional result."
+  },
+  {
+    "candidate_id": "multi-factor-trend",
+    "name": "Multi-factor trend - SMA MACD RSI",
+    "category": "multi_factor",
+    "market": "nse_equity",
+    "source": "Kestner 2003 'Quantitative Trading Strategies'; practitioner consensus",
+    "source_type": "book",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma",
+      "macd",
+      "macd_signal",
+      "rsi"
+    ],
+    "tags": [
+      "library",
+      "multi-factor"
+    ],
+    "claim": "Combining trend + momentum + momentum filter improves win rate but adds complexity penalty.",
+    "mechanism": "Three-factor confirmation.",
+    "assumptions": [
+      "factors are weakly independent",
+      "costs are tolerable"
+    ],
+    "risks": [
+      "complexity penalty",
+      "factor correlation in stress regimes"
+    ],
+    "known_failure_modes": [
+      "regime shifts",
+      "low-liquidity stress"
+    ],
+    "research_notes": "Multi-factor combination; search-count penalty applies."
+  },
+  {
+    "candidate_id": "trend-dual-ma-longshort",
+    "name": "Dual MA long-short 5-20",
+    "category": "trend_following",
+    "market": "nse_index",
+    "source": "Brock Lakonishok LeBaron 1992 'Simple Technical Trading Rules and the Stochastic Properties of Stock Returns'",
+    "source_type": "academic",
+    "evidence_quality": "peer_reviewed",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "ema",
+      "sma"
+    ],
+    "tags": [
+      "library",
+      "trend",
+      "long-short"
+    ],
+    "claim": "Simple moving-average timing rules produce statistically and economically significant returns on the Dow 30 (1897-1986).",
+    "mechanism": "Trend persistence at medium-term horizons.",
+    "assumptions": [
+      "trend persistence",
+      "shorting constraints not binding"
+    ],
+    "risks": [
+      "NSE shorting constraints",
+      "execution costs"
+    ],
+    "known_failure_modes": [
+      "prolonged ranges",
+      "post-2000 trend fragmentation"
+    ],
+    "research_notes": "Foundational academic reference; replication on Indian indices is a research question, not an assumption."
+  },
+  {
+    "candidate_id": "trend-ema-cross-12-26",
+    "name": "EMA cross 12-26 (long-only)",
+    "category": "trend_following",
+    "market": "nse_equity",
+    "source": "https://www.investopedia.com/terms/e/ema.asp",
+    "source_type": "practitioner_reference",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "ema"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "trend"
+    ],
+    "claim": "Moving-average crossovers produce small but persistent trends on equity indices.",
+    "mechanism": "Trend persistence: when the fast average exceeds the slow average, the recent move is more likely to continue than to reverse.",
+    "assumptions": [
+      "trend persistence on the chosen horizon",
+      "low transaction costs"
+    ],
+    "risks": [
+      "whipsaws in ranging markets",
+      "lag at trend turning points"
+    ],
+    "known_failure_modes": [
+      "sideways markets",
+      "high transaction costs eroding the edge"
+    ],
+    "research_notes": "Implemented by _spec_ema_cross in providers.py; baseline for trend-following literature."
+  },
+  {
+    "candidate_id": "trend-ema-cross-longshort",
+    "name": "EMA cross 12-26 long/short",
+    "category": "trend_following",
+    "market": "nse_equity",
+    "source": "Brock Lakonishok LeBaron 1992 'Simple Technical Trading Rules'",
+    "source_type": "academic",
+    "evidence_quality": "peer_reviewed",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "ema"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "trend",
+      "long-short"
+    ],
+    "claim": "A simple moving-average timing rule produces statistically significant returns on the Dow 30 over a 90-year sample.",
+    "mechanism": "Trend persistence over short horizons.",
+    "assumptions": [
+      "trending regimes dominate",
+      "shorting constraints are not binding"
+    ],
+    "risks": [
+      "NSE shorting constraints",
+      "whipsaw losses"
+    ],
+    "known_failure_modes": [
+      "prolonged ranges",
+      "shock-driven regime breaks"
+    ],
+    "research_notes": "Implemented by _spec_ema_cross_short in providers.py."
+  },
+  {
+    "candidate_id": "trend-macd-cross",
+    "name": "MACD trend confirmation",
+    "category": "trend_following",
+    "market": "nse_equity",
+    "source": "Appel 1979 'The Moving Average Convergence Divergence Method'",
+    "source_type": "practitioner_reference",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "macd",
+      "macd_signal",
+      "momentum"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "trend"
+    ],
+    "claim": "MACD cross + momentum filter reduces whipsaw vs. raw MACD cross.",
+    "mechanism": "Two-factor confirmation: MACD trend + short-term momentum.",
+    "assumptions": [
+      "trend persistence",
+      "low noise in selected horizon"
+    ],
+    "risks": [
+      "multi-indicator complexity penalty",
+      "false breakouts"
+    ],
+    "known_failure_modes": [
+      "low-volatility chop",
+      "whipsaws"
+    ],
+    "research_notes": "Implemented by _spec_macd_trend in providers.py."
+  },
+  {
+    "candidate_id": "trend-momentum-rsi-confirmation",
+    "name": "Trend momentum RSI confirmation",
+    "category": "multi_factor",
+    "market": "nse_equity",
+    "source": "Brock, Lakonishok & LeBaron 1992 'Simple Technical Trading Rules on the Stock Market'; Wang & Yu 2009 'Trading rule induction' (informational filter stacking literature)",
+    "source_type": "academic",
+    "evidence_quality": "peer_reviewed",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma",
+      "momentum",
+      "rsi"
+    ],
+    "tags": [
+      "library",
+      "multi-factor"
+    ],
+    "claim": "Multi-factor confirmation (trend + momentum + mean-reversion filter) reduces false-signal rate relative to single-indicator rules.",
+    "mechanism": "Multi-indicator confirmation acts as a poor-man's Bayesian filter: each rule eliminates trades that violate a coarse stylized fact.",
+    "assumptions": [
+      "liquidity sufficient",
+      "trend persistence"
+    ],
+    "risks": [
+      "complexity penalty",
+      "overfitting"
+    ],
+    "known_failure_modes": [
+      "ranges",
+      "shock regime changes"
+    ],
+    "research_notes": "Multi-factor confirmation pattern; higher search-count penalty due to combinatoric indicator choice."
+  },
+  {
+    "candidate_id": "trend-not-below-sma50",
+    "name": "Hold above SMA50 (NOT condition)",
+    "category": "market_regime",
+    "market": "nse_equity",
+    "source": "practitioner rule",
+    "source_type": "blog_or_marketing",
+    "evidence_quality": "blog_or_marketing",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "regime"
+    ],
+    "claim": "Avoiding exposure while below the long-term trend reduces drawdown.",
+    "mechanism": "Conservative regime filter via the DSL NOT primitive.",
+    "assumptions": [
+      "long-term trend is meaningful",
+      "low whipsaw frequency"
+    ],
+    "risks": [
+      "s",
+      "l",
+      "o",
+      "w",
+      " ",
+      "r",
+      "e",
+      "c",
+      "o",
+      "v",
+      "e",
+      "r",
+      "y",
+      " ",
+      "f",
+      "r",
+      "o",
+      "m",
+      " ",
+      "s",
+      "h",
+      "a",
+      "r",
+      "p",
+      " ",
+      "d",
+      "r",
+      "a",
+      "w",
+      "d",
+      "o",
+      "w",
+      "n",
+      "s"
+    ],
+    "known_failure_modes": [
+      "whipsaw around the SMA",
+      "long bear-market recoveries"
+    ],
+    "research_notes": "Implemented by _spec_not_condition in providers.py."
+  },
+  {
+    "candidate_id": "trend-not-falling-knife",
+    "name": "Avoid-falling-knife trend filter",
+    "category": "market_regime",
+    "market": "nse_equity",
+    "source": "Practitioner 'do not catch a falling knife' rule",
+    "source_type": "blog_or_marketing",
+    "evidence_quality": "blog_or_marketing",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma",
+      "momentum"
+    ],
+    "tags": [
+      "library",
+      "regime"
+    ],
+    "claim": "Avoiding exposure in extreme drawdowns reduces left-tail risk.",
+    "mechanism": "DSL NOT primitive applied as a drawdown filter.",
+    "assumptions": [
+      "a",
+      "v",
+      "o",
+      "i",
+      "d",
+      "i",
+      "n",
+      "g",
+      " ",
+      "t",
+      "a",
+      "i",
+      "l",
+      " ",
+      "e",
+      "v",
+      "e",
+      "n",
+      "t",
+      "s",
+      " ",
+      "h",
+      "e",
+      "l",
+      "p",
+      "s",
+      " ",
+      "r",
+      "i",
+      "s",
+      "k",
+      "-",
+      "a",
+      "d",
+      "j",
+      "u",
+      "s",
+      "t",
+      "e",
+      "d",
+      " ",
+      "r",
+      "e",
+      "t",
+      "u",
+      "r",
+      "n"
+    ],
+    "risks": [
+      "slow recovery",
+      "frequent exits"
+    ],
+    "known_failure_modes": [
+      "prolonged ranges",
+      "sharp V-shaped recoveries"
+    ],
+    "research_notes": "Demonstrates the NOT DSL primitive."
+  },
+  {
+    "candidate_id": "trend-regime-filtered",
+    "name": "Regime-filtered trend - SMA200",
+    "category": "market_regime",
+    "market": "nse_equity",
+    "source": "Practitioner observation; Covel 2005 'Trend Following'",
+    "source_type": "book",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma",
+      "momentum"
+    ],
+    "tags": [
+      "library",
+      "regime"
+    ],
+    "claim": "A trend-following filter reduces drawdown during regime transitions.",
+    "mechanism": "Two-factor: trend + stronger-than-noise momentum threshold.",
+    "assumptions": [
+      "trending regimes dominate",
+      "noise is bounded"
+    ],
+    "risks": [
+      "delayed entries",
+      "whipsaws"
+    ],
+    "known_failure_modes": [
+      "slow transitions",
+      "ranging markets"
+    ],
+    "research_notes": "Implemented by _regime_filtered_trend."
+  },
+  {
+    "candidate_id": "trend-sma20",
+    "name": "SMA20 trend filter",
+    "category": "trend_following",
+    "market": "nse_equity",
+    "source": "https://www.investopedia.com/terms/s/sma.asp",
+    "source_type": "practitioner_reference",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma"
+    ],
+    "tags": [
+      "deterministic-catalog",
+      "trend"
+    ],
+    "claim": "A simple price > SMA filter captures persistent uptrends.",
+    "mechanism": "Buy-and-hold analogue restricted to trending regimes; avoids drawdowns in persistent downtrends.",
+    "assumptions": [
+      "trending regime",
+      "liquid instrument"
+    ],
+    "risks": [
+      "whipsaws in ranges",
+      "misses sharp reversals"
+    ],
+    "known_failure_modes": [
+      "prolonged sideways",
+      "regime change without a confirmed cross"
+    ],
+    "research_notes": "Implemented by _spec_sma_trend in providers.py."
+  },
+  {
+    "candidate_id": "volatility-atr-breakout",
+    "name": "ATR volatility breakout",
+    "category": "volatility",
+    "market": "nse_equity",
+    "source": "Chan 2013 'Algorithmic Trading' (Keltner-style breakout)",
+    "source_type": "book",
+    "evidence_quality": "reputable_practitioner",
+    "timeframe_hint": "1d",
+    "indicators": [
+      "sma",
+      "atr"
+    ],
+    "tags": [
+      "library",
+      "volatility"
+    ],
+    "claim": "Volatility-scaled breakouts capture trend persistence while bounding exposure.",
+    "mechanism": "Breakout confirmed by both trend and recent volatility expansion.",
+    "assumptions": [
+      "volatility expansion accompanies trend",
+      "transaction costs bounded"
+    ],
+    "risks": [
+      "whipsaw in quiet ranges",
+      "cost-sensitive"
+    ],
+    "known_failure_modes": [
+      "low-volatility regimes",
+      "liquidity gaps"
+    ],
+    "research_notes": "Implemented by _atr_volatility_breakout."
+  }
+]
