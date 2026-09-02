@@ -1,0 +1,32 @@
+# Git
+.git
+.gitignore
+
+# Python
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+*.egg-info
+
+# Frontend
+frontend/node_modules
+frontend/dist
+frontend/.vercel
+
+# IDE
+.vscode
+.idea
+
+# Docs
+*.md
+!README.md
+
+# Tests
+tests/
+backend/tests/
+
+# Misc
+.env
+.env.*
+*.log

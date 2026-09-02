@@ -1,0 +1,28 @@
+# Web Framework
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+
+# Supabase
+supabase==2.7.4
+
+# Data Processing (existing dependencies)
+pandas==3.0.5
+numpy==2.4.6
+
+# HTTP Client
+requests==2.31.0
+
+# WebSocket Client (for Upstox live data)
+websocket-client==1.7.0
+
+# Protobuf (for Upstox V3 market data)
+protobuf==4.25.3
+
+# Cryptography (for token decryption)
+cryptography==43.0.1
+
+# Configuration
+pydantic-settings==2.5.2
+
+# Environment
+python-dotenv==1.2.3

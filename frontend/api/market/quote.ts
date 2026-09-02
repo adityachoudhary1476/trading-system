@@ -105,7 +105,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const json = (await resp.json()) as UpstoxQuoteResponse;
-    const quote = json.data?.[upstoxSymbol];
+    if (!json.data || Object.keys(json.data).length === 0) {
+      res.status(404).json({ error: "symbol_not_found" });
+      return;
+    }
+    // Try exact instrument key first, then colon-separated fallback,
+    // then fall back to the first entry (Upstox returns data keyed by instrument_key)
+    const upstoxKey = upstoxSymbol.replace("|", ":");
+    const quote =
+      json.data?.[upstoxSymbol] ??
+      json.data?.[upstoxKey] ??
+      Object.values(json.data)[0];
     if (!quote) {
       res.status(404).json({ error: "symbol_not_found" });
       return;

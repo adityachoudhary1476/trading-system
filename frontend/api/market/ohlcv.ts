@@ -10,7 +10,6 @@ const INTERVAL_MAP: Record<string, string> = {
   "5m": "5minute",
   "15m": "15minute",
   "30m": "30minute",
-  "60m": "1hour",
   "1h": "1hour",
   "1d": "day",
   "1D": "day",

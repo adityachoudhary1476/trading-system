@@ -10,14 +10,20 @@ describe("symbol-map: toUpstoxSymbol", () => {
     toUpstoxSymbol = mod.toUpstoxSymbol;
   });
 
-  it("maps NSE equity to NSE_EQ|SYMBOL", () => {
-    expect(toUpstoxSymbol("NSE:SBIN")).toBe("NSE_EQ|SBIN");
-    expect(toUpstoxSymbol("NSE:RELIANCE")).toBe("NSE_EQ|RELIANCE");
+  it("maps NSE equity to ISIN-based V2 instrument key", () => {
+    expect(toUpstoxSymbol("NSE:SBIN")).toBe("NSE_EQ|INE062A01020");
+    expect(toUpstoxSymbol("NSE:RELIANCE")).toBe("NSE_EQ|INE002A01018");
+    expect(toUpstoxSymbol("NSE:INFY")).toBe("NSE_EQ|INE009A01021");
   });
 
-  it("maps NSE index to NSE_INDEX|SYMBOL", () => {
-    expect(toUpstoxSymbol("NSE:NIFTY50")).toBe("NSE_INDEX|NIFTY50");
-    expect(toUpstoxSymbol("NSE:BANKNIFTY")).toBe("NSE_INDEX|BANKNIFTY");
+  it("maps unknown equity to NSE_EQ|SYMBOL", () => {
+    expect(toUpstoxSymbol("NSE:TCS")).toBe("NSE_EQ|TCS");
+  });
+
+  it("maps NSE index to full-name V2 instrument key", () => {
+    expect(toUpstoxSymbol("NSE:NIFTY50")).toBe("NSE_INDEX|Nifty 50");
+    expect(toUpstoxSymbol("NSE:BANKNIFTY")).toBe("NSE_INDEX|Nifty Bank");
+    expect(toUpstoxSymbol("NSE:FINNIFTY")).toBe("NSE_INDEX|Nifty Fin Service");
   });
 
   it("throws on malformed symbol", () => {

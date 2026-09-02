@@ -82,7 +82,7 @@ describe("market/quote API", () => {
       status: 200,
       json: async () => ({
         data: {
-          "NSE_EQ|SBIN": {
+          "NSE_EQ:INE062A01020": {
             last_price: 850.5,
             open: 845.0,
             high: 855.0,
