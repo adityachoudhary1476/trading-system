@@ -1,6 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 import { getServerSupabase } from "../lib/supabase.js";
-import { decryptToken } from "../lib/crypto.js";
+import { decryptToken, TokenDecryptionError } from "../lib/crypto.js";
 import { toUpstoxSymbol } from "../lib/symbol-map.js";
 
 const UPSTOX_BASE = "https://api.upstox.com/v2";
@@ -18,7 +18,11 @@ async function resolveUserId(bearer: string): Promise<string | null> {
   return data.user.id;
 }
 
-async function getUpstoxAccessToken(userId: string): Promise<string | null> {
+interface BrokerRow {
+  access_token_encrypted: string | null;
+}
+
+async function loadEncryptedToken(userId: string): Promise<string | null> {
   const sb = getServerSupabase();
   const { data, error } = await sb
     .from("broker_connections")
@@ -26,9 +30,13 @@ async function getUpstoxAccessToken(userId: string): Promise<string | null> {
     .eq("user_id", userId)
     .eq("provider", "upstox")
     .maybeSingle();
-
-  if (error || !data?.access_token_encrypted) return null;
-  return decryptToken(data.access_token_encrypted);
+  if (error) {
+    throw new Error(`Failed to load broker connection: ${error.message}`);
+  }
+  if (!data) return null;
+  const row = data as BrokerRow;
+  if (!row.access_token_encrypted) return null;
+  return row.access_token_encrypted;
 }
 
 export interface UpstoxQuote {
@@ -40,10 +48,22 @@ export interface UpstoxQuote {
   close?: number;
   volume?: number;
   prev_close?: number;
+  ohlc?: { open?: number; high?: number; low?: number; close?: number };
 }
 
 interface UpstoxQuoteResponse {
   data: Record<string, UpstoxQuote>;
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+function pickFinite(...candidates: unknown[]): number | null {
+  for (const c of candidates) {
+    if (isFiniteNumber(c)) return c;
+  }
+  return null;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -71,9 +91,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  const accessToken = await getUpstoxAccessToken(userId);
-  if (!accessToken) {
-    res.status(403).json({ error: "upstox_not_connected" });
+  let accessToken: string;
+  try {
+    const encrypted = await loadEncryptedToken(userId);
+    if (!encrypted) {
+      res.status(403).json({ error: "upstox_not_connected" });
+      return;
+    }
+    accessToken = decryptToken(encrypted);
+  } catch (e) {
+    if (e instanceof TokenDecryptionError) {
+      res.status(502).json({ error: "upstox_token_unreadable" });
+      return;
+    }
+    const message = e instanceof Error ? e.message : "Unknown error";
+    console.error("Quote token load failed:", { symbol, message });
+    res.status(502).json({ error: "upstox_token_unavailable" });
     return;
   }
 
@@ -86,7 +119,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const url = `${UPSTOX_BASE}/market-quote/quotes?symbol=${encodeURIComponent(upstoxSymbol)}`;
+    // Upstox V2 full-market-quote uses ``instrument_key`` as a comma-separated
+    // query parameter. The colon/pipe key choice does not affect Upstox — it
+    // is normalized by the symbol mapper above.
+    const url = `${UPSTOX_BASE}/market-quote/quotes?instrument_key=${encodeURIComponent(upstoxSymbol)}`;
     const resp = await fetch(url, {
       headers: {
         Authorization: `Bearer ${accessToken}`,
@@ -98,12 +134,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       res.status(403).json({ error: "upstox_token_expired" });
       return;
     }
-
+    if (resp.status === 429) {
+      res.setHeader("Retry-After", resp.headers.get("retry-after") ?? "1");
+      res.status(429).json({ error: "upstox_rate_limited" });
+      return;
+    }
     if (!resp.ok) {
       let errorDetail = `Upstox HTTP ${resp.status}`;
       try {
-        const errorBody = await resp.json();
-        errorDetail = errorBody.message || errorBody.error_message || errorBody.info || `Upstox HTTP ${resp.status}`;
+        const errorBody = (await resp.json()) as Record<string, unknown>;
+        const msg = errorBody["message"] ?? errorBody["error_message"] ?? errorBody["info"];
+        if (typeof msg === "string" && msg.length > 0) errorDetail = msg;
       } catch {
         // Response wasn't JSON; keep default errorDetail
       }
@@ -117,40 +158,78 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    const json = (await resp.json()) as UpstoxQuoteResponse;
+    let json: UpstoxQuoteResponse;
+    try {
+      json = (await resp.json()) as UpstoxQuoteResponse;
+    } catch {
+      res.status(502).json({ error: "upstox_malformed_response" });
+      return;
+    }
     if (!json.data || Object.keys(json.data).length === 0) {
       res.status(404).json({ error: "symbol_not_found" });
       return;
     }
-    // Try exact instrument key first, then colon-separated fallback,
-    // then fall back to the first entry (Upstox returns data keyed by instrument_key)
+    // Upstox keys responses by ``EXCHANGE:SYMBOL`` (colon) in current V2;
+    // older variants keyed by ``EXCHANGE|SYMBOL`` (pipe). Try both, then
+    // fall back to the only/first entry.
     const upstoxKey = upstoxSymbol.replace("|", ":");
     const quote =
-      json.data?.[upstoxSymbol] ??
       json.data?.[upstoxKey] ??
+      json.data?.[upstoxSymbol] ??
       Object.values(json.data)[0];
     if (!quote) {
       res.status(404).json({ error: "symbol_not_found" });
       return;
     }
 
-    const price = quote.last_price ?? 0;
-    const prevClose = quote.prev_close ?? quote.close ?? price;
-    const change = price - prevClose;
-    const changePct = prevClose !== 0 ? (change / prevClose) * 100 : 0;
+    // last_price is the only field that MUST exist for a usable quote.
+    // If it is missing or non-finite, the provider did not supply a trade
+    // value — surface this as a 404 so the frontend shows "—" instead of a
+    // fabricated 0.
+    const price = pickFinite(quote.last_price);
+    if (price === null) {
+      res.status(404).json({ error: "upstox_price_unavailable" });
+      return;
+    }
 
-    res.status(200).json({
+    // Previous close: prefer explicit prev_close, then close, then ohlc.close.
+    // No fabrication — if every candidate is missing/non-finite, return null
+    // and the frontend will render the field as unavailable.
+    const prevClose = pickFinite(
+      quote.prev_close,
+      quote.close,
+      quote.ohlc?.close,
+    );
+
+    // OHLC values: prefer top-level fields, then the nested ``ohlc`` object.
+    const dayOpen = pickFinite(quote.open, quote.ohlc?.open);
+    const dayHigh = pickFinite(quote.high, quote.ohlc?.high);
+    const dayLow = pickFinite(quote.low, quote.ohlc?.low);
+    const volume = pickFinite(quote.volume);
+
+    // Derive change/changePct ONLY when prevClose is a genuine number. When
+    // it is unavailable, the fields are emitted as null so the existing
+    // defensive renderer can show "—".
+    const change = prevClose !== null ? price - prevClose : null;
+    const changePct =
+      prevClose !== null && prevClose !== 0 ? (change! / prevClose) * 100 : null;
+
+    const response: Record<string, unknown> = {
       symbol,
       price,
-      previousClose: prevClose,
-      change: Math.round(change * 100) / 100,
-      changePct: Math.round(changePct * 100) / 100,
-      dayOpen: quote.open ?? price,
-      dayHigh: quote.high ?? price,
-      dayLow: quote.low ?? price,
-      volume: quote.volume ?? 0,
       lastUpdate: Date.now(),
-    });
+    };
+    if (prevClose !== null) {
+      response.previousClose = prevClose;
+      response.change = change !== null ? Math.round(change * 100) / 100 : null;
+      response.changePct =
+        changePct !== null ? Math.round(changePct * 100) / 100 : null;
+    }
+    if (dayOpen !== null) response.dayOpen = dayOpen;
+    if (dayHigh !== null) response.dayHigh = dayHigh;
+    if (dayLow !== null) response.dayLow = dayLow;
+    if (volume !== null) response.volume = volume;
+    res.status(200).json(response);
   } catch {
     res.status(502).json({ error: "upstox_request_failed" });
   }
