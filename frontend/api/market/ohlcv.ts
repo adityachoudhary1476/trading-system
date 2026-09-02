@@ -124,7 +124,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     if (!resp.ok) {
-      res.status(502).json({ error: "upstox_api_error" });
+      let errorDetail = `Upstox HTTP ${resp.status}`;
+      try {
+        const errorBody = await resp.json();
+        errorDetail = errorBody.message || errorBody.error_message || errorBody.info || `Upstox HTTP ${resp.status}`;
+      } catch {
+        // Response wasn't JSON; keep default errorDetail
+      }
+      // Log sanitized error for debugging (no tokens/keys exposed)
+      console.error("OHLCV Upstox error:", {
+        status: resp.status,
+        symbol,
+        upstoxSymbol,
+        interval,
+        error: errorDetail,
+      });
+      res.status(502).json({ error: "upstox_api_error", message: errorDetail });
       return;
     }
 
@@ -141,7 +156,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }));
 
     res.status(200).json(ohlcv);
-  } catch {
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Unknown error";
+    console.error("OHLCV request failed:", { symbol, upstoxSymbol, interval, message });
     res.status(502).json({ error: "upstox_request_failed" });
   }
 }

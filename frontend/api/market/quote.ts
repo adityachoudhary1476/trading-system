@@ -100,7 +100,20 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     if (!resp.ok) {
-      res.status(502).json({ error: "upstox_api_error" });
+      let errorDetail = `Upstox HTTP ${resp.status}`;
+      try {
+        const errorBody = await resp.json();
+        errorDetail = errorBody.message || errorBody.error_message || errorBody.info || `Upstox HTTP ${resp.status}`;
+      } catch {
+        // Response wasn't JSON; keep default errorDetail
+      }
+      console.error("Quote Upstox error:", {
+        status: resp.status,
+        symbol,
+        upstoxSymbol,
+        error: errorDetail,
+      });
+      res.status(502).json({ error: "upstox_api_error", message: errorDetail });
       return;
     }
 
