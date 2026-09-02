@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { dataSource } from "@/data/MarketDataSource";
 import type { FeedHealth } from "@/types";
 import { Panel, Badge, Loading, HealthDot } from "@/components/ui";
-import { fmtAgo } from "@/lib/format";
+import { fmtAgo, fmtNum } from "@/lib/format";
 
 export function DataHealthPanel() {
   const [h, setH] = useState<FeedHealth | null>(null);
@@ -51,7 +51,7 @@ export function DataHealthPanel() {
       <div className="grid cols-2" style={{ gap: 12 }}>
         <div className="stat">
           <span className="label">Feed</span>
-          <span className="value">{h.feed}</span>
+          <span className="value">{h.feed ?? "—"}</span>
         </div>
         <div className="stat">
           <span className="label">Last Tick</span>
@@ -59,15 +59,15 @@ export function DataHealthPanel() {
         </div>
         <div className="stat">
           <span className="label">Events Received</span>
-          <span className="value mono">{h.eventsReceived.toLocaleString("en-IN")}</span>
+          <span className="value mono">{fmtNum(h.eventsReceived, { useGrouping: true })}</span>
         </div>
         <div className="stat">
           <span className="label">Events Rejected</span>
-          <span className="value mono">{h.eventsRejected.toLocaleString("en-IN")}</span>
+          <span className="value mono">{fmtNum(h.eventsRejected, { useGrouping: true })}</span>
         </div>
         <div className="stat">
           <span className="label">Candles Generated</span>
-          <span className="value mono">{h.candlesGenerated.toLocaleString("en-IN")}</span>
+          <span className="value mono">{fmtNum(h.candlesGenerated, { useGrouping: true })}</span>
         </div>
         <div className="stat">
           <span className="label">Last Closed Candle</span>

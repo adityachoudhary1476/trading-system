@@ -4,6 +4,7 @@ import { paperApi } from "@/lib/paperApi";
 import type { DeploymentResponse, DashboardSnapshotResponse } from "@/types/paper-api";
 import { Panel, EmptyState, Button, StatusIndicator, MetricItem, Feedback, ConfirmDialog } from "@/components/ui";
 import { fmt } from "@/components/paper/paperShared";
+import { fmtNum } from "@/lib/format";
 
 export function PaperDeploymentDetail() {
   const { deploymentId } = useParams<{ deploymentId: string }>();
@@ -203,7 +204,7 @@ export function PaperDeploymentDetail() {
                     <tr className={snapshot.positions.open_position.unrealized_pnl >= 0 ? "" : "row-warning"}>
                       <td>{snapshot.positions.open_position.symbol}</td>
                       <td><StatusIndicator status={snapshot.positions.open_position.side === "long" ? "active" : "stopped"} /></td>
-                      <td className="num">{snapshot.positions.open_position.quantity.toLocaleString("en-IN")}</td>
+                      <td className="num">{fmtNum(snapshot.positions.open_position.quantity, { useGrouping: true })}</td>
                       <td className="num">{fmt.currency(snapshot.positions.open_position.entry_price)}</td>
                       <td className="num">{fmt.currency(snapshot.positions.open_position.current_price)}</td>
                       <td className={`num ${snapshot.positions.open_position.unrealized_pnl >= 0 ? "pos" : "neg"}`}>{fmt.currency(snapshot.positions.open_position.unrealized_pnl)}</td>

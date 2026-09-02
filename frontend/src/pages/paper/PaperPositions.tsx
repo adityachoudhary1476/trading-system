@@ -4,6 +4,7 @@ import { paperApi } from "@/lib/paperApi";
 import type { PositionsResponse, DeploymentResponse } from "@/types/paper-api";
 import { Panel, EmptyState, Button, StatusIndicator, MetricItem } from "@/components/ui";
 import { DeploymentPicker, fmt } from "@/components/paper/paperShared";
+import { fmtNum } from "@/lib/format";
 
 export function PaperPositions() {
   const { deploymentId } = useParams<{ deploymentId: string }>();
@@ -132,7 +133,7 @@ export function PaperPositions() {
               <div className="pos-banner-metrics">
                 <div className="pos-banner-metric">
                   <span className="m-label">Quantity</span>
-                  <span className="m-value">{open.quantity.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</span>
+                  <span className="m-value">{fmtNum(open.quantity, { maximumFractionDigits: 2 })}</span>
                 </div>
                 <div className="pos-banner-metric">
                   <span className="m-label">Unrealized P&L</span>
@@ -152,7 +153,7 @@ export function PaperPositions() {
               <div className="metric-grid">
                 <MetricItem label="Symbol" value={open.symbol} />
                 <MetricItem label="Side" value={open.side.toUpperCase()} tone={open.side === "long" ? "pos" : "neg"} />
-                <MetricItem label="Quantity" value={open.quantity.toLocaleString("en-IN", { maximumFractionDigits: 2 })} />
+                <MetricItem label="Quantity" value={fmtNum(open.quantity, { maximumFractionDigits: 2 })} />
                 <MetricItem label="Entry Price" value={fmt.currency(open.entry_price)} />
                 <MetricItem label="Current Price" value={fmt.currency(open.current_price)} />
                 <MetricItem label="Position Value" value={fmt.currency(open.position_value)} />

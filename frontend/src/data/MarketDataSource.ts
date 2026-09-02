@@ -12,6 +12,7 @@ import type {
 } from "@/types";
 import * as mock from "@/data/mock";
 import { getSupabaseClient } from "@/lib/supabase";
+import { isFiniteNumber } from "@/lib/format";
 
 export interface MarketDataSource {
   readonly mode: "mock" | "live";
@@ -124,9 +125,31 @@ export class ApiMarketDataSource implements MarketDataSource {
     const api = await this.fetchJson<ApiQuoteResponse>(
       `/api/market/quote?symbol=${encodeURIComponent(symbol)}`,
     );
+    // Runtime validation: the Upstox/Vercel API may return HTTP 200 with
+    // missing, null, or malformed numeric fields. We do NOT fabricate values.
+    // Any unparseable field is surfaced as `undefined`, which downstream
+    // components render as "—" (unavailable). `price` is the canonical
+    // sentinel — if it is missing/invalid, the entire quote is unusable.
+    if (!isFiniteNumber(api.price)) {
+      throw new Error("Market quote unavailable: price field missing or invalid");
+    }
     const meta = mock.getInstrument(symbol);
     const price = api.price;
-    const prevClose = api.previousClose ?? price;
+    // Use nullish coalescing to preserve legitimate 0 values, then validate
+    // with isFiniteNumber to guard against NaN/Infinity from malformed JSON.
+    const prevClose = isFiniteNumber(api.previousClose ?? price) ? (api.previousClose ?? price) : price;
+    const change = isFiniteNumber(api.change) ? api.change : price - prevClose;
+    const changePct = isFiniteNumber(api.changePct)
+      ? api.changePct
+      : prevClose !== 0
+        ? ((price - prevClose) / prevClose) * 100
+        : 0;
+    const dayOpen = isFiniteNumber(api.dayOpen) ? api.dayOpen : price;
+    const dayHigh = isFiniteNumber(api.dayHigh) ? api.dayHigh : price;
+    const dayLow = isFiniteNumber(api.dayLow) ? api.dayLow : price;
+    const volume = isFiniteNumber(api.volume) ? api.volume : 0;
+    // dayRange is a human-readable string; build it only from validated numerics
+    const dayRange = `${dayLow.toLocaleString("en-IN")} — ${dayHigh.toLocaleString("en-IN")}`;
     return {
       symbol: api.symbol,
       providerSymbol: meta.providerSymbol,
@@ -135,17 +158,17 @@ export class ApiMarketDataSource implements MarketDataSource {
       instrumentType: meta.instrumentType,
       price,
       previousClose: prevClose,
-      change: api.change ?? price - prevClose,
-      changePct: api.changePct ?? (prevClose !== 0 ? ((price - prevClose) / prevClose) * 100 : 0),
-      dayOpen: api.dayOpen ?? price,
-      dayHigh: api.dayHigh ?? price,
-      dayLow: api.dayLow ?? price,
-      volume: api.volume ?? 0,
+      change,
+      changePct,
+      dayOpen,
+      dayHigh,
+      dayLow,
+      volume,
       vwap: price,
-      dayRange: `${(api.dayLow ?? price).toLocaleString("en-IN")} — ${(api.dayHigh ?? price).toLocaleString("en-IN")}`,
+      dayRange,
       volatility: 0,
       sessionState: "REGULAR",
-      lastUpdate: api.lastUpdate ?? Date.now(),
+      lastUpdate: isFiniteNumber(api.lastUpdate) ? api.lastUpdate : Date.now(),
     };
   }
 

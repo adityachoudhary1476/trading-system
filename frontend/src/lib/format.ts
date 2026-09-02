@@ -1,28 +1,42 @@
 // Formatting helpers (Indian number formatting, signed values, time).
 
-export function fmtNum(v: number, opts?: Intl.NumberFormatOptions): string {
+/**
+ * Returns true when `v` is a finite number suitable for numeric formatting.
+ * Rejects undefined, null, NaN, Infinity, -Infinity, and non-numbers.
+ * A valid zero (0) is accepted as a legitimate value.
+ */
+export function isFiniteNumber(v: unknown): v is number {
+  return typeof v === "number" && Number.isFinite(v);
+}
+
+/** Safe numeric formatting — never throws on undefined/null/NaN/Infinity. */
+export function fmtNum(v: number | null | undefined, opts?: Intl.NumberFormatOptions): string {
+  if (!isFiniteNumber(v)) return "—";
   return v.toLocaleString("en-IN", opts);
 }
 
 /** Price with 2 decimals and thousands separators. */
-export function fmtPrice(v: number): string {
+export function fmtPrice(v: number | null | undefined): string {
   return fmtNum(v, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
 /** Signed price delta, e.g. +184.20 / -12.40 */
-export function fmtSigned(v: number, digits = 2): string {
+export function fmtSigned(v: number | null | undefined, digits = 2): string {
+  if (!isFiniteNumber(v)) return "—";
   const s = fmtNum(Math.abs(v), { minimumFractionDigits: digits, maximumFractionDigits: digits });
   return v >= 0 ? `+${s}` : `-${s}`;
 }
 
 /** Percent with sign, e.g. +0.75% */
-export function fmtPct(v: number, digits = 2): string {
+export function fmtPct(v: number | null | undefined, digits = 2): string {
+  if (!isFiniteNumber(v)) return "—";
   const s = Math.abs(v).toFixed(digits);
   return `${v >= 0 ? "+" : "-"}${s}%`;
 }
 
 /** Compact volume, e.g. 1.2Cr / 84.3L (Indian crore/lakh style). */
-export function fmtVolume(v: number): string {
+export function fmtVolume(v: number | null | undefined): string {
+  if (!isFiniteNumber(v)) return "—";
   if (v >= 1e7) return `${(v / 1e7).toFixed(2)} Cr`;
   if (v >= 1e5) return `${(v / 1e5).toFixed(2)} L`;
   return fmtNum(Math.round(v));
