@@ -146,4 +146,85 @@ describe("ApiMarketDataSource", () => {
       expect.objectContaining({ cache: "no-store" }),
     );
   });
+
+  // --- Auth flow verification for Analysis and Signals (Issue 2) ---
+  it("getAIAnalysis sends Authorization Bearer header", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({ symbol: "NSE:NIFTY50", bias: "neutral", confidence: 0.5, signal: "no_signal", summary: "", factors: [], generatedAt: 0, model: "test", timeframe: "1d" }),
+    });
+    await source.getAIAnalysis("NSE:NIFTY50");
+    const callArgs = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(callArgs[1].headers).toHaveProperty("Authorization", "Bearer test-token");
+  });
+
+  it("getAIAnalysis throws on 401 (authentication required)", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 401,
+      ok: false,
+      headers: { get: () => "application/json" },
+    });
+    await expect(source.getAIAnalysis("NSE:NIFTY50")).rejects.toThrow(
+      "Authentication required: please sign in",
+    );
+  });
+
+  it("getSignals sends Authorization Bearer header", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => [],
+    });
+    await source.getSignals(12);
+    const callArgs = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(callArgs[0]).toMatch(/\/api\/market\/signals\?limit=12/);
+    expect(callArgs[1].headers).toHaveProperty("Authorization", "Bearer test-token");
+  });
+
+  it("getSignals throws on 401 (authentication required)", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 401,
+      ok: false,
+      headers: { get: () => "application/json" },
+    });
+    await expect(source.getSignals(12)).rejects.toThrow(
+      "Authentication required: please sign in",
+    );
+  });
+
+  it("omits Authorization header when no session for getAIAnalysis", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: null },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 401,
+      ok: false,
+      headers: { get: () => "application/json" },
+    });
+    await expect(source.getAIAnalysis("NSE:NIFTY50")).rejects.toThrow(
+      "Authentication required: please sign in",
+    );
+    const callArgs = (fetch as unknown as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(callArgs[1].headers).not.toHaveProperty("Authorization");
+  });
 });

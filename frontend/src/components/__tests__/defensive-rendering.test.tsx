@@ -139,6 +139,27 @@ describe("DataHealthPanel — defensive rendering", () => {
       expect(screen.getByText("Data health unavailable")).toBeTruthy();
     });
   });
+
+  it("does NOT render misleading 'Mock metrics' disclaimer", async () => {
+    ds.getFeedHealth.mockResolvedValue({
+      feed: "Upstox",
+      status: "healthy",
+      lastTick: Date.now(),
+      eventsReceived: 100,
+      eventsRejected: 0,
+      candlesGenerated: 50,
+      lastClosedCandle: Date.now() - 300000,
+      connected: true,
+    });
+    render(<DataHealthPanel />);
+    await waitFor(() => {
+      expect(screen.getByText("Pipeline is healthy.")).toBeTruthy();
+    });
+    // Must not contain the misleading mock-data text
+    expect(screen.queryByText(/Mock metrics/i)).toBeNull();
+    // Must not fabricate values with any placeholder text
+    expect(screen.queryByText(/real backend replaces/i)).toBeNull();
+  });
 });
 
 describe("AIAnalysisPanel — defensive rendering", () => {

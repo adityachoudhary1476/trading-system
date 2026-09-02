@@ -51,9 +51,14 @@ describe("ApiMarketDataSource.getQuote — runtime validation", () => {
     expect(q.price).toBe(850.5);
     expect(q.previousClose).toBe(840.0);
     expect(q.change).toBe(10.5);
+    expect(q.changePct).toBe(1.25);
+    expect(q.dayOpen).toBe(845.0);
     expect(q.dayHigh).toBe(855.0);
     expect(q.dayLow).toBe(840.0);
     expect(q.volume).toBe(1500000);
+    expect(q.vwap).toBeUndefined(); // not in response → unavailable
+    expect(q.volatility).toBeUndefined(); // not in response → unavailable
+    expect(q.dayRange).toBe("840 — 855"); // constructed from dayLow/dayHigh
   });
 
   it("throws on HTTP 500", async () => {
@@ -135,33 +140,102 @@ describe("ApiMarketDataSource.getQuote — runtime validation", () => {
     expect(q.volume).toBe(0);
   });
 
-  it("falls back to price when previousClose is missing (preserving price)", async () => {
+  it("does NOT fabricate values when optional fields are missing (200 with partial body)", async () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...baseSuccess,
       json: async () => ({
         symbol: "NSE:SBIN",
+        // price is present; all other numeric fields are absent
         price: 100,
-        // previousClose, change, changePct, dayOpen, etc. all missing
       }),
     });
     const q = await source.getQuote("NSE:SBIN");
     expect(q.price).toBe(100);
-    expect(q.previousClose).toBe(100); // falls back to price
-    expect(q.volume).toBe(0); // falls back to 0
+    // Optional fields must remain undefined — NEVER fabricated to price or 0
+    expect(q.previousClose).toBeUndefined();
+    expect(q.change).toBeUndefined();
+    expect(q.changePct).toBeUndefined();
+    expect(q.dayOpen).toBeUndefined();
+    expect(q.dayHigh).toBeUndefined();
+    expect(q.dayLow).toBeUndefined();
+    expect(q.volume).toBeUndefined();
+    expect(q.vwap).toBeUndefined();
+    expect(q.volatility).toBeUndefined();
+    expect(q.dayRange).toBe("—");
   });
 
-  it("does not fabricate values for change/changePct when missing", async () => {
+  it("computes change/changePct only from actual price and previousClose", async () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       ...baseSuccess,
       json: async () => ({
         symbol: "NSE:SBIN",
         price: 100,
         previousClose: 95,
-        // change, changePct missing — should be computed from price/prevClose
+        // change, changePct missing — computed from price - prevClose
       }),
     });
     const q = await source.getQuote("NSE:SBIN");
     expect(q.change).toBe(5); // price - prevClose
     expect(q.changePct).toBeCloseTo((5 / 95) * 100, 5);
+  });
+
+  it("leaves dayRange as '—' when dayLow or dayHigh is missing", async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...baseSuccess,
+      json: async () => ({
+        symbol: "NSE:SBIN",
+        price: 100,
+        dayLow: 90,
+        // dayHigh missing
+      }),
+    });
+    const q = await source.getQuote("NSE:SBIN");
+    expect(q.dayRange).toBe("—");
+  });
+
+  it("constructs dayRange string from actual dayLow and dayHigh", async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...baseSuccess,
+      json: async () => ({
+        symbol: "NSE:SBIN",
+        price: 100,
+        dayLow: 90,
+        dayHigh: 110,
+      }),
+    });
+    const q = await source.getQuote("NSE:SBIN");
+    expect(q.dayRange).toBe("90 — 110");
+  });
+
+  it("preserves valid zero values for all numeric fields", async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...baseSuccess,
+      json: async () => ({
+        symbol: "NSE:SBIN",
+        price: 0,
+        previousClose: 0,
+        change: 0,
+        changePct: 0,
+        dayOpen: 0,
+        dayHigh: 0,
+        dayLow: 0,
+        volume: 0,
+        vwap: 0,
+        volatility: 0,
+        lastUpdate: 1704067200000,
+      }),
+    });
+    const q = await source.getQuote("NSE:SBIN");
+    expect(q.price).toBe(0);
+    expect(q.previousClose).toBe(0);
+    expect(q.change).toBe(0);
+    expect(q.changePct).toBe(0);
+    expect(q.dayOpen).toBe(0);
+    expect(q.dayHigh).toBe(0);
+    expect(q.dayLow).toBe(0);
+    expect(q.volume).toBe(0);
+    expect(q.vwap).toBe(0);
+    expect(q.volatility).toBe(0);
+    expect(q.dayRange).toBe("0 — 0");
   });
 });

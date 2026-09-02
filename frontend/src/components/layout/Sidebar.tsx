@@ -101,7 +101,7 @@ export function Header() {
 
 function WatchRow({ sym, active, onSelect }: { sym: string; active: boolean; onSelect: (s: string) => void }) {
   const q = mockQuote(sym);
-  const up = q.change >= 0;
+  const up = q.change !== undefined ? q.change >= 0 : true;
   const [series, setSeries] = useState<number[]>([]);
   useEffect(() => {
     let alive = true;
@@ -128,7 +128,7 @@ function WatchRow({ sym, active, onSelect }: { sym: string; active: boolean; onS
       <span className="watch-name">{q.name}</span>
       <span className={`watch-chg ${up ? "pos" : "neg"}`}>
         {up ? "+" : ""}
-        {q.changePct.toFixed(2)}%
+        {q.changePct !== undefined ? `${q.changePct.toFixed(2)}%` : "—"}
       </span>
       <span className="watch-spark">
         <Sparkline data={series} positive={up} width={64} height={22} />

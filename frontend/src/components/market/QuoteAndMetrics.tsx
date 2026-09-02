@@ -33,7 +33,7 @@ export function QuoteHeader({ symbol }: { symbol: string }) {
     );
   }
   if (!q) return null;
-  const up = q.change >= 0;
+  const up = q.change !== undefined ? q.change >= 0 : true;
   return (
     <div className="page-head instrument-head">
       <div className="instrument-id">
@@ -119,8 +119,8 @@ export function MetricsPanel({ symbol }: { symbol: string }) {
     ["Prev Close", fmtPrice(q.previousClose)],
     ["Volume", fmtVolume(q.volume)],
     ["VWAP", fmtPrice(q.vwap)],
-    ["Day Range", q.dayRange],
-    ["Volatility", `${(q.volatility * 100).toFixed(1)}%`],
+    ["Day Range", q.dayRange ?? "—"],
+    ["Volatility", q.volatility !== undefined ? `${(q.volatility * 100).toFixed(1)}%` : "—"],
   ];
   return (
     <div className="grid cols-4" style={{ gap: 10 }}>

@@ -75,7 +75,7 @@ export function DataHealthPanel() {
         </div>
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 12, marginBottom: 0 }}>
-        {healthy ? "Pipeline is healthy." : "Feed issue detected — signals suppressed."} Mock metrics; real backend replaces these via FeedHealth.
+        {healthy ? "Pipeline is healthy." : "Feed issue detected — signals suppressed."}
       </p>
     </Panel>
   );

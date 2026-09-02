@@ -23,24 +23,29 @@ export interface OHLCVBar {
   volume: number;
 }
 
-/** Top-of-book quote for an instrument. */
+/** Top-of-book quote for an instrument.
+ * `price` is the canonical sentinel — it is always present (validated at the API boundary).
+ * All other numeric fields are optional; they may be `undefined` when the
+ * upstream API returns them as missing/null/invalid. Downstream formatting
+ * helpers render `undefined` as "—" (unavailable).
+ */
 export interface MarketQuote {
   symbol: string; // internal symbol, e.g. "NSE:SBIN"
   providerSymbol: string; // e.g. "NSE:SBIN-EQ"
   name: string;
   exchange: string; // e.g. "NSE"
   instrumentType: "index" | "equity" | "future" | "option";
-  price: number;
-  previousClose: number;
-  change: number; // absolute
-  changePct: number; // percent
-  dayOpen: number;
-  dayHigh: number;
-  dayLow: number;
-  volume: number;
-  vwap: number;
-  dayRange: string; // human, e.g. "1020.10 — 1061.80"
-  volatility: number; // annualized-ish mock metric
+  price: number; // required — validated at API boundary
+  previousClose: number | undefined;
+  change: number | undefined; // absolute
+  changePct: number | undefined; // percent
+  dayOpen: number | undefined;
+  dayHigh: number | undefined;
+  dayLow: number | undefined;
+  volume: number | undefined;
+  vwap: number | undefined;
+  dayRange: string; // human, e.g. "1020.10 — 1061.80", or "—" when unavailable
+  volatility: number | undefined; // annualized-ish metric
   sessionState: "PRE_MARKET" | "REGULAR" | "POST_MARKET" | "CLOSED";
   lastUpdate: number; // epoch ms
 }

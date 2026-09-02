@@ -37,7 +37,7 @@ export function MarketsPage() {
     [rows, q, typeFilter],
   );
 
-  const adv = filtered.filter((r) => r.change >= 0).length;
+  const adv = filtered.filter((r) => r.change !== undefined ? r.change >= 0 : true).length;
   const dec = filtered.length - adv;
 
   const open = (sym: string) => {
@@ -69,7 +69,7 @@ export function MarketsPage() {
           </thead>
           <tbody>
             {data.map((r) => {
-              const up = r.change >= 0;
+              const up = r.change !== undefined ? r.change >= 0 : true;
               return (
                 <tr key={r.symbol} onClick={() => open(r.symbol)} tabIndex={0}
                     onKeyDown={(e) => e.key === "Enter" && open(r.symbol)}>

@@ -59,6 +59,9 @@ interface ApiQuoteResponse {
   dayHigh: number;
   dayLow: number;
   volume: number;
+  vwap: number;
+  volatility: number;
+  sessionState: "PRE_MARKET" | "REGULAR" | "POST_MARKET" | "CLOSED";
   lastUpdate: number;
 }
 
@@ -127,29 +130,39 @@ export class ApiMarketDataSource implements MarketDataSource {
     );
     // Runtime validation: the Upstox/Vercel API may return HTTP 200 with
     // missing, null, or malformed numeric fields. We do NOT fabricate values.
-    // Any unparseable field is surfaced as `undefined`, which downstream
-    // components render as "—" (unavailable). `price` is the canonical
-    // sentinel — if it is missing/invalid, the entire quote is unusable.
+    // `price` is required — if it is missing/invalid, the quote is unusable.
     if (!isFiniteNumber(api.price)) {
       throw new Error("Market quote unavailable: price field missing or invalid");
     }
     const meta = mock.getInstrument(symbol);
     const price = api.price;
-    // Use nullish coalescing to preserve legitimate 0 values, then validate
-    // with isFiniteNumber to guard against NaN/Infinity from malformed JSON.
-    const prevClose = isFiniteNumber(api.previousClose ?? price) ? (api.previousClose ?? price) : price;
-    const change = isFiniteNumber(api.change) ? api.change : price - prevClose;
+    // For optional fields, preserve the actual value when it is a valid
+    // finite number (including 0). Otherwise leave as `undefined` — the
+    // formatting helpers render `undefined` as "—".
+    const prevClose = isFiniteNumber(api.previousClose) ? api.previousClose : undefined;
+    // change/changePct may only be calculated when both price and prevClose
+    // are valid numbers.
+    const change = isFiniteNumber(api.change)
+      ? api.change
+      : prevClose !== undefined
+        ? price - prevClose
+        : undefined;
     const changePct = isFiniteNumber(api.changePct)
       ? api.changePct
-      : prevClose !== 0
-        ? ((price - prevClose) / prevClose) * 100
-        : 0;
-    const dayOpen = isFiniteNumber(api.dayOpen) ? api.dayOpen : price;
-    const dayHigh = isFiniteNumber(api.dayHigh) ? api.dayHigh : price;
-    const dayLow = isFiniteNumber(api.dayLow) ? api.dayLow : price;
-    const volume = isFiniteNumber(api.volume) ? api.volume : 0;
-    // dayRange is a human-readable string; build it only from validated numerics
-    const dayRange = `${dayLow.toLocaleString("en-IN")} — ${dayHigh.toLocaleString("en-IN")}`;
+      : change !== undefined && prevClose !== undefined && prevClose !== 0
+        ? (change / prevClose) * 100
+        : undefined;
+    const dayOpen = isFiniteNumber(api.dayOpen) ? api.dayOpen : undefined;
+    const dayHigh = isFiniteNumber(api.dayHigh) ? api.dayHigh : undefined;
+    const dayLow = isFiniteNumber(api.dayLow) ? api.dayLow : undefined;
+    const volume = isFiniteNumber(api.volume) ? api.volume : undefined;
+    const vwap = isFiniteNumber(api.vwap) ? api.vwap : undefined;
+    const volatility = isFiniteNumber(api.volatility) ? api.volatility : undefined;
+    // dayRange is only constructed when both endpoints are actual values
+    const dayRange =
+      dayLow !== undefined && dayHigh !== undefined
+        ? `${dayLow.toLocaleString("en-IN")} — ${dayHigh.toLocaleString("en-IN")}`
+        : "—";
     return {
       symbol: api.symbol,
       providerSymbol: meta.providerSymbol,
@@ -164,10 +177,10 @@ export class ApiMarketDataSource implements MarketDataSource {
       dayHigh,
       dayLow,
       volume,
-      vwap: price,
+      vwap,
       dayRange,
-      volatility: 0,
-      sessionState: "REGULAR",
+      volatility,
+      sessionState: api.sessionState ?? "REGULAR",
       lastUpdate: isFiniteNumber(api.lastUpdate) ? api.lastUpdate : Date.now(),
     };
   }

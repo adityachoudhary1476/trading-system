@@ -24,7 +24,7 @@ export function TickerStrip() {
     <div className="ticker" aria-label="Market ticker">
       <div className="ticker-track">
         {[...quotes, ...quotes].map((q, i) => {
-          const up = q.change >= 0;
+          const up = q.change !== undefined ? q.change >= 0 : true;
           return (
             <button key={`${q.symbol}-${i}`} className="ticker-item" onClick={() => open(q.symbol)}>
               <span className="tk-sym">{q.symbol.replace("NSE:", "")}</span>
