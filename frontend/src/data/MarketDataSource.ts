@@ -88,13 +88,34 @@ export class ApiMarketDataSource implements MarketDataSource {
     if (token) {
       headers.Authorization = `Bearer ${token}`;
     }
-    const resp = await fetch(path, {
-      ...init,
-      headers,
-      cache: "no-store",
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(path, {
+        ...init,
+        headers,
+        cache: "no-store",
+      });
+    } catch {
+      throw new Error("Service unavailable: network request failed");
+    }
+    if (resp.status === 401) {
+      throw new Error("Authentication required: please sign in");
+    }
+    if (resp.status === 403) {
+      throw new Error("Authorization forbidden: insufficient permissions");
+    }
+    if (resp.status === 404) {
+      throw new Error(`API endpoint not found: ${path}`);
+    }
+    if (resp.status >= 500) {
+      throw new Error(`Backend server error: ${resp.status}`);
+    }
     if (!resp.ok) {
       throw new Error(`API request failed: ${resp.status}`);
+    }
+    const contentType = resp.headers.get("content-type") ?? "";
+    if (!contentType.includes("application/json")) {
+      throw new Error("API routing error: expected JSON response");
     }
     return (await resp.json()) as T;
   }

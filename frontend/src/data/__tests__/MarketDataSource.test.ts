@@ -34,6 +34,7 @@ describe("ApiMarketDataSource", () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
+      headers: { get: () => "application/json" },
       json: async () => ({ symbol: "NSE:SBIN", price: 100 }),
     });
     const result = await source.getQuote("NSE:SBIN");
@@ -52,6 +53,7 @@ describe("ApiMarketDataSource", () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
+      headers: { get: () => "application/json" },
       json: async () => ({ symbol: "NSE:SBIN", price: 100 }),
     });
     await source.getQuote("NSE:SBIN");
@@ -67,6 +69,7 @@ describe("ApiMarketDataSource", () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
+      headers: { get: () => "application/json" },
       json: async () => ({ symbol: "NSE:SBIN", price: 100 }),
     });
     await source.getQuote("NSE:SBIN");
@@ -82,6 +85,7 @@ describe("ApiMarketDataSource", () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
+      headers: { get: () => "application/json" },
       json: async () => [],
     });
     await source.getOHLCV("NSE:SBIN", "1d", 100);
@@ -101,6 +105,7 @@ describe("ApiMarketDataSource", () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
+      headers: { get: () => "application/json" },
       json: async () => ({ connected: true, provider: "upstox" }),
     });
     const result = await source.getFeedHealth();
@@ -119,8 +124,9 @@ describe("ApiMarketDataSource", () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 500,
       ok: false,
+      headers: { get: () => "application/json" },
     });
-    await expect(source.getQuote("NSE:SBIN")).rejects.toThrow("API request failed");
+    await expect(source.getQuote("NSE:SBIN")).rejects.toThrow("Backend server error");
   });
 
   it("uses no-store cache", async () => {
@@ -131,6 +137,7 @@ describe("ApiMarketDataSource", () => {
     (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
       status: 200,
       ok: true,
+      headers: { get: () => "application/json" },
       json: async () => ({}),
     });
     await source.getSignals();
