@@ -1,8 +1,13 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { paperApi } from "@/lib/paperApi";
-import type { DashboardSnapshotResponse } from "@/types/paper-api";
-import { Panel, EmptyState, Button, StatusIndicator, MetricItem } from "@/components/ui";
+import type {
+  DashboardSnapshotResponse,
+  SessionStatus,
+  HealthStatus,
+  RiskDecision,
+} from "@/types/paper-api";
+import { EmptyState, Button, MetricItem } from "@/components/ui";
 import { DeploymentPicker, fmt } from "@/components/paper/paperShared";
 
 export function PaperOverview() {
@@ -11,7 +16,7 @@ export function PaperOverview() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const fetchData = async (id: string) => {
+  const fetchData = useCallback(async (id: string) => {
     if (!id) return;
     setLoading(true);
     setError(null);
@@ -23,11 +28,11 @@ export function PaperOverview() {
       setSnapshot(null);
     }
     setLoading(false);
-  };
+  }, []);
 
   useEffect(() => {
     if (deploymentId) fetchData(deploymentId);
-  }, [deploymentId]);
+  }, [deploymentId, fetchData]);
 
   return (
     <div className="paper-shell">
@@ -36,278 +41,612 @@ export function PaperOverview() {
       {!deploymentId && !loading && (
         <EmptyState
           title="No paper deployment selected"
-          hint="Select a deployment above to inspect its performance and operational state."
+          hint="Select a deployment above to inspect its terminal state."
         />
       )}
 
-      {loading && deploymentId && <LoadingSkeleton />}
+      {loading && deploymentId && <TerminalSkeleton />}
 
       {error && deploymentId && !loading && (
         <div className="error-state" role="alert">
           <div className="es-icon" aria-hidden="true">!</div>
-          <div className="es-title">Unable to load paper overview</div>
+          <div className="es-title">Unable to load paper terminal</div>
           <div className="es-hint">{error}</div>
           <Button variant="secondary" size="sm" onClick={() => fetchData(deploymentId)}>Retry</Button>
         </div>
       )}
 
-      {snapshot && !loading && <SnapshotView data={snapshot} onRefresh={() => fetchData(deploymentId)} />}
+      {snapshot && !loading && (
+        <TerminalView
+          data={snapshot}
+          onRefresh={() => fetchData(deploymentId)}
+        />
+      )}
     </div>
   );
 }
 
-function LoadingSkeleton() {
+function TerminalSkeleton() {
   return (
-    <div className="stack gap-lg" aria-label="Loading dashboard">
+    <div className="stack gap-lg" aria-label="Loading terminal">
       <div className="skel skel-block" style={{ height: 110 }} />
-      <div className="kpi-row">
-        {Array.from({ length: 6 }).map((_, i) => (
-          <div key={i} className="skel skel-block" style={{ height: 78 }} />
-        ))}
-      </div>
-      <div className="grid cols-2" style={{ gap: 12 }}>
-        <div className="skel skel-block" style={{ height: 180 }} />
-        <div className="skel skel-block" style={{ height: 180 }} />
+      <div className="skel skel-block" style={{ height: 78 }} />
+      <div className="tl-split">
+        <div className="skel skel-block" style={{ height: 280 }} />
+        <div className="skel skel-block" style={{ height: 280 }} />
       </div>
       <div className="skel skel-block" style={{ height: 160 }} />
-      <div className="skel skel-block" style={{ height: 180 }} />
+      <div className="skel skel-block" style={{ height: 160 }} />
+      <div className="skel skel-block" style={{ height: 200 }} />
     </div>
   );
 }
 
-function SnapshotView({ data, onRefresh }: { data: DashboardSnapshotResponse; onRefresh: () => void }) {
+/* ---------------------------------------------------------------------- */
+/* Terminal view                                                           */
+/* ---------------------------------------------------------------------- */
+
+function TerminalView({
+  data,
+  onRefresh,
+}: {
+  data: DashboardSnapshotResponse;
+  onRefresh: () => void;
+}) {
   const isHalted = data.health.status === "halted";
-  const isFailed = data.deployment.status === "failed";
   const isCircuitOpen = data.circuit_breaker.state === "open";
-  const isCritical = isHalted || isFailed || isCircuitOpen;
+  const isFailed = data.deployment.status === "failed";
+  const isCritical = isHalted || isCircuitOpen || isFailed;
 
   return (
     <div className="stack gap-lg">
-      {/* Deployment Context Header */}
-      <div className={`detail-head${isCritical ? " circuit-open" : ""}`}>
-        <div className="dh-top">
-          <div>
-            <div className="dh-title">
-              {data.deployment.symbol} · {data.deployment.timeframe}
-            </div>
-            <div className="dh-sub">
-              {data.strategy?.name ?? data.deployment.strategy_id}
-            </div>
-          </div>
-          <div className="row gap-sm">
-            <StatusIndicator status={data.deployment.status} />
-            <span className="pill">{data.deployment.execution_mode.toUpperCase()}</span>
-          </div>
-        </div>
-        <div className="dh-metrics">
-          <div className="dh-metric">
-            <span className="m-label">Session</span>
-            <span className="m-value">{data.session.session_status}</span>
-          </div>
-          <div className="dh-metric">
-            <span className="m-label">Bars</span>
-            <span className="m-value">{fmt.num(data.performance.bar_count)}</span>
-          </div>
-          <div className="dh-metric">
-            <span className="m-label">Return</span>
-            <span className="m-value">{fmt.pct(data.performance.return)}</span>
-          </div>
-        </div>
+      <TerminalKPIs data={data} onRefresh={onRefresh} />
+
+      {isCritical && <CriticalBanner data={data} />}
+
+      <div className="tl-split">
+        <EquityPanel data={data} />
+        <SystemStatusPanel data={data} />
       </div>
 
-      {/* Critical State Banner */}
-      {isCritical && (
-        <div className="risk-block rb-critical" role="alert">
-          <div className="rb-top">
-            <StatusIndicator status={isHalted ? "halted" : isFailed ? "failed" : "open"} />
-            <span className="rb-status">
-              {isHalted ? "HALTED" : isFailed ? "FAILED" : "CIRCUIT OPEN"}
-            </span>
-          </div>
-          <div className="rb-reason">
-            {isHalted && (data.health.halt_reason || "Paper execution is currently blocked.")}
-            {isFailed && "Deployment has failed."}
-            {isCircuitOpen && (data.circuit_breaker.reason || "Circuit breaker is open.")}
-          </div>
-        </div>
-      )}
+      <PositionsPanel data={data} />
+      <ActivityTimeline data={data} />
+    </div>
+  );
+}
 
-      {/* KPI Row */}
-      <div>
-        <div className="pt-section">
-          <h2>Key Metrics</h2>
+/* ---------------------------------------------------------------------- */
+/* KPI strip                                                                */
+/* ---------------------------------------------------------------------- */
+
+function TerminalKPIs({
+  data,
+  onRefresh,
+}: {
+  data: DashboardSnapshotResponse;
+  onRefresh: () => void;
+}) {
+  const acct = data.account;
+  const perf = data.performance;
+  const sess = data.session;
+
+  const startCap = acct.starting_equity ?? acct.initial_cash ?? null;
+  const equity = acct.equity;
+  const cash = acct.available_cash;
+  const todayPnl = acct.unrealized_pnl;
+  const totalPnl =
+    perf.total_pnl ?? (acct.realized_pnl != null && acct.unrealized_pnl != null
+      ? acct.realized_pnl + acct.unrealized_pnl
+      : acct.realized_pnl);
+  const positions = data.positions.is_flat ? 0 : 1;
+  const trades = perf.trade_count ?? 0;
+  const drawdown = perf.drawdown;
+
+  const equityFillPct = useMemo(() => {
+    if (startCap == null || equity == null || startCap <= 0) return 0;
+    const pct = Math.max(0, Math.min(1, equity / startCap));
+    return pct;
+  }, [startCap, equity]);
+
+  const drawdownPct = useMemo(() => {
+    if (drawdown == null) return 0;
+    return Math.max(0, Math.min(1, Math.abs(drawdown)));
+  }, [drawdown]);
+
+  return (
+    <div className="tl-panel">
+      <div className="tl-panel-head">
+        <div className="tl-panel-title">
+          <span className="tl-bar2" aria-hidden="true" />
+          Account &amp; Performance Telemetry
+        </div>
+        <div className="tl-panel-actions">
           <Button variant="ghost" size="xs" onClick={onRefresh}>Refresh</Button>
         </div>
-        <div className="kpi-row">
-          <KpiCard
-            label="Equity"
-            value={fmt.currency(data.account.equity)}
-            sub={`Start ${fmt.currency(data.account.starting_equity)}`}
-            tone="accent"
-          />
-          <KpiCard
-            label="Realized P&L"
-            value={fmt.currency(data.account.realized_pnl)}
-            sub={fmt.pct(data.performance.return)}
-            tone={toneForPnl(data.account.realized_pnl)}
-          />
-          <KpiCard
-            label="Return"
-            value={fmt.pct(data.performance.return)}
-            tone={toneForPnl(data.performance.return)}
-          />
-          <KpiCard
-            label="Drawdown"
-            value={fmt.pctPlain(data.performance.drawdown)}
-            tone="neg"
-          />
-          <KpiCard
-            label="Positions"
-            value={data.positions.is_flat ? "0" : "1"}
-            sub={data.positions.is_flat ? "Flat" : data.positions.open_position?.symbol}
-            tone="muted"
-          />
-          <KpiCard
-            label="Orders"
-            value={fmt.num(data.performance.orders_submitted)}
-            sub={`${data.performance.fills_received} fills`}
-            tone="muted"
-          />
-        </div>
       </div>
-
-      {/* Performance History - Empty State (no historical data) */}
-      <div>
-        <div className="pt-section"><h2>Performance History</h2></div>
-        <Panel subtle>
-          <EmptyState
-            title="Historical performance data is not available"
-            hint="Live performance history will appear here once time-series data is available."
-          />
-        </Panel>
-      </div>
-
-      {/* Operations + Risk & Health */}
-      <div className="grid cols-2" style={{ gap: 12 }}>
-        <Panel title="Operations">
-          <div className="metric-grid">
-            <MetricItem label="Bars Processed" value={fmt.num(data.performance.bar_count)} />
-            <MetricItem label="Signals Generated" value={fmt.num(data.performance.generated_signals)} />
-            <MetricItem label="Orders Submitted" value={fmt.num(data.performance.orders_submitted)} />
-            <MetricItem label="Fills Received" value={fmt.num(data.performance.fills_received)} />
-            <MetricItem label="Rejected Orders" value={String(data.performance.rejected_orders)} tone={data.performance.rejected_orders > 0 ? "neg" : undefined} />
-            <MetricItem label="Consecutive Errors" value={String(data.session.consecutive_errors)} tone={data.session.consecutive_errors > 0 ? "neg" : undefined} />
-          </div>
-        </Panel>
-
-        <Panel title="Risk & Health" className={isCircuitOpen ? "circuit-open" : undefined}>
-          <div className="stack gap-md">
-            <div>
-              <div className="cg-label">Health</div>
-              <StatusIndicator status={data.health.status} />
-              {data.health.halt_reason && <div className="faint mt-sm" style={{ fontSize: 11.5 }}>{data.health.halt_reason}</div>}
-              {data.health.warnings.length > 0 && (
-                <ul className="tag-list mt-sm">
-                  {data.health.warnings.map((w, i) => <li key={i}>{w}</li>)}
-                </ul>
-              )}
-            </div>
-            <div>
-              <div className="cg-label">Risk Decision</div>
-              <StatusIndicator status={data.risk.decision === "allow" ? "active" : data.risk.decision === "warning" ? "paused" : "stopped"} />
-              {data.risk.reason && <div className="faint mt-sm" style={{ fontSize: 11.5 }}>{data.risk.reason}</div>}
-            </div>
-            <div>
-              <div className="cg-label">Circuit Breaker</div>
-              <div className="row gap-sm">
-                <StatusIndicator status={isCircuitOpen ? "open" : "closed"} />
-                <span className="pill">Trips: {data.circuit_breaker.trip_count}</span>
-              </div>
-              {data.circuit_breaker.reason && <div className="faint mt-sm" style={{ fontSize: 11.5 }}>{data.circuit_breaker.reason}</div>}
-            </div>
-          </div>
-        </Panel>
-      </div>
-
-      {/* Positions */}
-      <div>
-        <div className="pt-section">
-          <h2>Positions</h2>
-          <Link to={`/paper/positions/${data.deployment.deployment_id}`} className="section-sub">Details ›</Link>
-        </div>
-        {data.positions.is_flat || !data.positions.open_position ? (
-          <Panel subtle>
-            <EmptyState title="No open positions" hint="The paper account currently has no open positions." />
-          </Panel>
-        ) : (
-          <Panel subtle>
-            <table className="data dense">
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>Side</th>
-                  <th className="num">Qty</th>
-                  <th className="num">Entry</th>
-                  <th className="num">Current</th>
-                  <th className="num">Unreal. P&L</th>
-                  <th className="num">Value</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr className={data.positions.open_position.unrealized_pnl >= 0 ? "" : "row-warning"}>
-                  <td>{data.positions.open_position.symbol}</td>
-                  <td><StatusIndicator status={data.positions.open_position.side === "long" ? "active" : "stopped"} /></td>
-                  <td className="num">{data.positions.open_position.quantity.toLocaleString("en-IN")}</td>
-                  <td className="num">{fmt.currency(data.positions.open_position.entry_price)}</td>
-                  <td className="num">{fmt.currency(data.positions.open_position.current_price)}</td>
-                  <td className={`num ${data.positions.open_position.unrealized_pnl >= 0 ? "pos" : "neg"}`}>{fmt.currency(data.positions.open_position.unrealized_pnl)}</td>
-                  <td className="num">{fmt.currency(data.positions.open_position.position_value)}</td>
-                </tr>
-              </tbody>
-            </table>
-          </Panel>
-        )}
-      </div>
-
-      {/* Recent Events */}
-      <div>
-        <div className="pt-section">
-          <h2>Recent Activity</h2>
-          <Link to={`/paper/events/${data.deployment.deployment_id}`} className="section-sub">View all ›</Link>
-        </div>
-        {data.recent_events.recent.length === 0 ? (
-          <Panel subtle>
-            <EmptyState title="No recent events" hint="Events will appear here as the deployment processes data." />
-          </Panel>
-        ) : (
-          <Panel subtle>
-            <div className="event-log">
-              {[...data.recent_events.recent].reverse().slice(0, 8).map((ev) => (
-                <div key={ev.sequence} className={`el-row${isCriticalEvent(ev.event_type) ? " el-critical" : isWarningEvent(ev.event_type) ? " el-warn" : " el-info"}`}>
-                  <span className="el-seq">#{ev.sequence}</span>
-                  <span className="el-time">{ev.timestamp ? ev.timestamp.slice(11, 19) : "—"}</span>
-                  <span className="el-type">{ev.event_type.replace(/_/g, " ")}</span>
-                  <span className="el-msg">{ev.message}</span>
-                </div>
-              ))}
-            </div>
-          </Panel>
-        )}
+      <div className="tl-kpis" role="list">
+        <KpiCell
+          label="Starting Capital"
+          value={fmt.currency(startCap)}
+          tone="muted"
+        />
+        <KpiCell
+          label="Current Equity"
+          value={fmt.currency(equity)}
+          tone="accent"
+          sub={startCap != null ? `vs ${fmt.currency(startCap)}` : undefined}
+          bar={equityFillPct}
+        />
+        <KpiCell
+          label="Available Cash"
+          value={fmt.currency(cash)}
+          tone="muted"
+        />
+        <KpiCell
+          label="Today's P&L"
+          value={fmt.currency(todayPnl)}
+          tone={toneForPnl(todayPnl)}
+        />
+        <KpiCell
+          label="Total P&L"
+          value={fmt.currency(totalPnl)}
+          tone={toneForPnl(totalPnl)}
+          sub={fmt.pct(perf.return)}
+        />
+        <KpiCell
+          label="Open Positions"
+          value={String(positions)}
+          tone={positions > 0 ? "accent" : "muted"}
+          sub={data.positions.is_flat ? "Flat" : data.positions.open_position?.symbol ?? undefined}
+        />
+        <KpiCell
+          label="Trades"
+          value={String(trades)}
+          tone="muted"
+          sub={`${fmt.num(sess.orders_submitted ?? perf.orders_submitted)} orders`}
+        />
+        <KpiCell
+          label="Drawdown"
+          value={fmt.pctPlain(drawdown)}
+          tone="neg"
+          bar={drawdownPct}
+        />
       </div>
     </div>
   );
 }
 
-function KpiCard({ label, value, sub, tone }: { label: string; value: string; sub?: string; tone?: "pos" | "neg" | "warn" | "accent" | "muted" }) {
-  const toneClass = tone === "pos" ? "kpi-pos" : tone === "neg" ? "kpi-neg" : tone === "warn" ? "kpi-warn" : tone === "accent" ? "kpi-accent" : "";
+function KpiCell({
+  label,
+  value,
+  sub,
+  tone,
+  bar,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+  tone?: "pos" | "neg" | "warn" | "accent" | "muted";
+  bar?: number;
+}) {
   return (
-    <div className={`kpi-card ${toneClass}`}>
-      <span className="kpi-label">{label}</span>
-      <span className={`kpi-value${tone === "pos" ? " pos" : tone === "neg" ? " neg" : ""}`}>{value}</span>
-      {sub && <span className={`kpi-sub${tone === "pos" ? " pos" : tone === "neg" ? " neg" : ""}`}>{sub}</span>}
+    <div className={`tl-kpi${tone ? ` ${tone}` : ""}`} role="listitem">
+      <div className="tl-k">{label}</div>
+      <div className="tl-v">{value}</div>
+      {sub && <div className="tl-s">{sub}</div>}
+      {bar != null && bar > 0 && (
+        <div className="tl-bar" aria-hidden="true">
+          <span style={{ width: `${Math.round(bar * 100)}%` }} />
+        </div>
+      )}
     </div>
   );
 }
+
+/* ---------------------------------------------------------------------- */
+/* Critical banner                                                          */
+/* ---------------------------------------------------------------------- */
+
+function CriticalBanner({ data }: { data: DashboardSnapshotResponse }) {
+  const isHalted = data.health.status === "halted";
+  const isCircuitOpen = data.circuit_breaker.state === "open";
+  const isFailed = data.deployment.status === "failed";
+  let title = "CRITICAL STATE";
+  let sub: string | null = null;
+  if (isHalted) {
+    title = "Paper Execution Halted";
+    sub = data.health.halt_reason || "Paper execution is currently blocked.";
+  } else if (isCircuitOpen) {
+    title = "Circuit Breaker Open";
+    sub = data.circuit_breaker.reason || "Trading halted by circuit breaker.";
+  } else if (isFailed) {
+    title = "Deployment Failed";
+    sub = "Deployment has failed and lifecycle actions are unavailable.";
+  }
+  return (
+    <div className="tl-banner" role="alert">
+      <div className="tlb-icon" aria-hidden="true">!</div>
+      <div className="tlb-text">
+        <div className="tlb-title">{title}</div>
+        {sub && <div className="tlb-sub">{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Equity curve panel                                                       */
+/* ---------------------------------------------------------------------- */
+
+function EquityPanel({ data }: { data: DashboardSnapshotResponse }) {
+  const acct = data.account;
+  const perf = data.performance;
+  const startCap = acct.starting_equity ?? acct.initial_cash ?? null;
+  const equity = acct.equity;
+  const totalPnl =
+    perf.total_pnl ?? (acct.realized_pnl != null && acct.unrealized_pnl != null
+      ? acct.realized_pnl + acct.unrealized_pnl
+      : acct.realized_pnl);
+
+  return (
+    <section className="tl-panel tl-equity" aria-label="Equity Curve">
+      <div className="tl-panel-head">
+        <div className="tl-panel-title">
+          <span className="tl-bar2" aria-hidden="true" />
+          Equity Curve
+        </div>
+        <div className="tl-panel-actions">
+          <span>Current</span>
+          <span className="pos mono">{fmt.currency(equity)}</span>
+        </div>
+      </div>
+      <div className="tl-equity-chart">
+        <div className="tl-equity-empty" role="status">
+          <div className="tle-title">No Performance History</div>
+          <div className="tle-sub">Waiting for session data…</div>
+        </div>
+      </div>
+      <div className="tl-panel-head" style={{ borderTop: "1px solid var(--panel-border-soft)", borderBottom: "none" }}>
+        <div className="tl-panel-title">
+          <span className="tl-bar2" aria-hidden="true" />
+          Session P&amp;L Breakdown
+        </div>
+        <div className="tl-panel-actions">
+          <span>Total</span>
+          <span className={`mono ${toneForPnl(totalPnl)}`}>{fmt.currency(totalPnl)}</span>
+        </div>
+      </div>
+      <div className="metric-grid" style={{ padding: 12 }}>
+        <MetricItem label="Starting Equity" value={fmt.currency(startCap)} />
+        <MetricItem
+          label="Realized"
+          value={fmt.currency(acct.realized_pnl)}
+          tone={toneForPnl(acct.realized_pnl)}
+        />
+        <MetricItem
+          label="Unrealized"
+          value={fmt.currency(acct.unrealized_pnl)}
+          tone={toneForPnl(acct.unrealized_pnl)}
+        />
+        <MetricItem
+          label="Return"
+          value={fmt.pct(perf.return)}
+          tone={toneForPnl(perf.return)}
+        />
+        <MetricItem
+          label="Drawdown"
+          value={fmt.pctPlain(perf.drawdown)}
+          tone="neg"
+        />
+        <MetricItem
+          label="Exposure"
+          value={fmt.pct(perf.exposure)}
+          tone="muted"
+        />
+      </div>
+    </section>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* System status panel                                                      */
+/* ---------------------------------------------------------------------- */
+
+function SystemStatusPanel({ data }: { data: DashboardSnapshotResponse }) {
+  const sess = data.session;
+  const cb = data.circuit_breaker;
+  const risk = data.risk;
+  const health = data.health;
+
+  const sessionTone = mapSessionTone(sess.session_status);
+  const deploymentTone = mapSessionTone(sess.deployment_status);
+  const healthTone = mapHealthTone(health.status);
+  const riskTone = mapRiskTone(risk.decision);
+  const cbTone = cb.state === "open" ? "is-critical" : "is-healthy";
+  const brokerTone = sessionTone === "is-critical" ? "is-warning" : "is-active";
+  const strategyTone = sessionTone === "is-critical" ? "is-warning" : "is-active";
+  const dataTone = sessionTone === "is-critical" ? "is-warning" : "is-active";
+
+  const lastBar = sess.last_processed_bar_timestamp;
+
+  return (
+    <section className="tl-panel tl-system" aria-label="System Status">
+      <div className="tl-panel-head">
+        <div className="tl-panel-title">
+          <span className="tl-bar2" aria-hidden="true" />
+          System Status
+        </div>
+        <div className="tl-panel-actions">
+          <span>Command Center</span>
+        </div>
+      </div>
+      <div>
+        <SystemRow
+          label="Market Data"
+          state={mapStateLabel(dataTone)}
+          tone={dataTone}
+        />
+        <SystemRow
+          label="Strategy"
+          state={mapStateLabel(strategyTone)}
+          tone={strategyTone}
+        />
+        <SystemRow
+          label="Risk Engine"
+          state={risk.decision.toUpperCase()}
+          tone={riskTone}
+          hint={risk.reason}
+        />
+        <SystemRow
+          label="Paper Broker"
+          state={mapStateLabel(brokerTone)}
+          tone={brokerTone}
+        />
+        <SystemRow
+          label="Session"
+          state={sess.session_status.toUpperCase()}
+          tone={sessionTone}
+        />
+        <SystemRow
+          label="Circuit Breaker"
+          state={cb.state.toUpperCase()}
+          tone={cbTone}
+          hint={cb.reason}
+        />
+        <SystemRow
+          label="Health"
+          state={health.status.toUpperCase()}
+          tone={healthTone}
+          hint={health.halt_reason ?? (health.warnings.length ? health.warnings.join(" · ") : null)}
+        />
+        <SystemRow
+          label="Deployment"
+          state={sess.deployment_status.toUpperCase()}
+          tone={deploymentTone}
+        />
+      </div>
+      <div className="tl-system-foot">
+        <span>Last Bar</span>
+        <span className="mono">
+          {lastBar ? formatTs(lastBar) : "—"}
+        </span>
+      </div>
+    </section>
+  );
+}
+
+function SystemRow({
+  label,
+  state,
+  tone,
+  hint,
+}: {
+  label: string;
+  state: string;
+  tone: string;
+  hint?: string | null;
+}) {
+  return (
+    <>
+      <div className={`tl-system-row ${tone}`}>
+        <div className="tlsr-label">
+          <span className="tlsr-dot" aria-hidden="true" />
+          <span>{label}</span>
+        </div>
+        <div className="tlsr-state">{state}</div>
+      </div>
+      {hint && (
+        <div
+          style={{
+            padding: "4px 14px 8px",
+            fontFamily: "var(--mono)",
+            fontSize: 10.5,
+            color: "var(--text-faint)",
+            borderBottom: "1px solid var(--panel-border-soft)",
+            letterSpacing: 0.3,
+          }}
+        >
+          {hint}
+        </div>
+      )}
+    </>
+  );
+}
+
+function mapSessionTone(s: SessionStatus): string {
+  if (s === "active" || s === "restored") return "is-active";
+  if (s === "paused" || s === "checkpointed") return "is-warning";
+  if (s === "failed" || s === "stopped") return "is-critical";
+  return "is-healthy";
+}
+
+function mapHealthTone(s: HealthStatus): string {
+  if (s === "healthy") return "is-healthy";
+  if (s === "warning") return "is-warning";
+  if (s === "halted") return "is-critical";
+  return "is-warning";
+}
+
+function mapRiskTone(d: RiskDecision): string {
+  if (d === "allow") return "is-healthy";
+  if (d === "warning") return "is-warning";
+  if (d === "halt") return "is-critical";
+  return "is-warning";
+}
+
+function mapStateLabel(tone: string): string {
+  if (tone === "is-active") return "ACTIVE";
+  if (tone === "is-warning") return "WARNING";
+  if (tone === "is-critical") return "HALTED";
+  return "READY";
+}
+
+/* ---------------------------------------------------------------------- */
+/* Positions panel                                                          */
+/* ---------------------------------------------------------------------- */
+
+function PositionsPanel({ data }: { data: DashboardSnapshotResponse }) {
+  const dep = data.deployment;
+  const open = data.positions.open_position;
+  const isFlat = data.positions.is_flat || !open;
+
+  return (
+    <section className="tl-panel" aria-label="Open Positions">
+      <div className="tl-panel-head">
+        <div className="tl-panel-title">
+          <span className="tl-bar2" aria-hidden="true" />
+          Open Positions
+        </div>
+        <div className="tl-panel-actions">
+          <Link
+            to={`/paper/positions/${dep.deployment_id}`}
+            className="section-sub"
+          >
+            Details ›
+          </Link>
+        </div>
+      </div>
+      {isFlat ? (
+        <div className="tl-empty" role="status">
+          <div className="tle-title">No Open Positions</div>
+          <div className="tle-sub">
+            The paper portfolio currently has no open positions.
+          </div>
+        </div>
+      ) : (
+        <div className="tl-table-wrap">
+          <table className="tl-table" aria-label="Open positions">
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th className="num">Qty</th>
+                <th className="num">Avg Entry</th>
+                <th className="num">LTP</th>
+                <th className="num">Market Value</th>
+                <th className="num">Unrealized P&amp;L</th>
+                <th className="num">Return</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>{open!.symbol}</td>
+                <td>
+                  <span className={`tl-side ${open!.side === "long" ? "long" : "short"}`}>
+                    {open!.side.toUpperCase()}
+                  </span>
+                </td>
+                <td className="num">{open!.quantity.toLocaleString("en-IN", { maximumFractionDigits: 2 })}</td>
+                <td className="num">{fmt.currency(open!.entry_price)}</td>
+                <td className="num">{fmt.currency(open!.current_price)}</td>
+                <td className="num">{fmt.currency(open!.position_value)}</td>
+                <td className={`num ${open!.unrealized_pnl >= 0 ? "pos" : "neg"}`}>
+                  {fmt.currency(open!.unrealized_pnl)}
+                </td>
+                <td className={`num ${open!.unrealized_pnl >= 0 ? "pos" : "neg"}`}>
+                  {fmt.pct(
+                    open!.entry_price > 0
+                      ? (open!.current_price - open!.entry_price) / open!.entry_price
+                      : null,
+                  )}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Activity timeline                                                        */
+/* ---------------------------------------------------------------------- */
+
+function ActivityTimeline({ data }: { data: DashboardSnapshotResponse }) {
+  const recent = data.recent_events;
+  const reversed = recent.recent ? [...recent.recent].reverse() : [];
+
+  return (
+    <section className="tl-panel" aria-label="Decision Timeline">
+      <div className="tl-panel-head">
+        <div className="tl-panel-title">
+          <span className="tl-bar2" aria-hidden="true" />
+          Decision Timeline
+        </div>
+        <div className="tl-panel-actions">
+          <span>
+            {recent.total_events ?? 0} events · last #{recent.last_event_sequence ?? "—"}
+          </span>
+          <Link
+            to={`/paper/events/${data.deployment.deployment_id}`}
+            className="section-sub"
+          >
+            View all ›
+          </Link>
+        </div>
+      </div>
+      <div className="tl-panel-body">
+        {reversed.length === 0 ? (
+          <div className="tl-empty">
+            <div className="tle-title">No Activity Yet</div>
+            <div className="tle-sub">
+              Decision events will appear here as the deployment processes data.
+            </div>
+          </div>
+        ) : (
+          <div className="tl-timeline">
+            {reversed.slice(0, 12).map((ev) => {
+              const tone = toneForEvent(ev.event_type);
+              const time = ev.timestamp ? ev.timestamp.slice(11, 19) : "—";
+              return (
+                <div key={ev.sequence} className={`tl-timeline-row ${tone}`}>
+                  <div className="tltr-time">{time}</div>
+                  <div className="tltr-axis" aria-hidden="true" />
+                  <div className="tltr-body">
+                    <div className="tltr-head">
+                      <span className="tltr-type">
+                        {ev.event_type.replace(/_/g, " ")}
+                      </span>
+                      <span className="faint mono" style={{ fontSize: 10 }}>
+                        #{ev.sequence}
+                      </span>
+                    </div>
+                    <div className="tltr-detail">{ev.message || "—"}</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+/* ---------------------------------------------------------------------- */
+/* Helpers                                                                  */
+/* ---------------------------------------------------------------------- */
 
 function toneForPnl(v: number | null | undefined): "pos" | "neg" | "muted" {
   if (v === null || v === undefined) return "muted";
@@ -316,10 +655,32 @@ function toneForPnl(v: number | null | undefined): "pos" | "neg" | "muted" {
   return "muted";
 }
 
-function isCriticalEvent(type: string): boolean {
-  return ["order_rejected", "health_warning", "circuit_breaker_tripped", "deployment_stopped"].includes(type);
+function toneForEvent(type: string): string {
+  if (
+    type === "order_rejected" ||
+    type === "health_warning" ||
+    type === "circuit_breaker_tripped" ||
+    type === "deployment_stopped"
+  )
+    return "tone-neg";
+  if (
+    type === "circuit_breaker_reset" ||
+    type === "session_restored" ||
+    type === "deployment_paused" ||
+    type === "deployment_resumed"
+  )
+    return "tone-warn";
+  if (type === "fill_received") return "tone-pos";
+  if (type === "signal_generated") return "tone-pos";
+  return "tone-muted";
 }
 
-function isWarningEvent(type: string): boolean {
-  return ["risk_warning", "order_rejected"].includes(type);
+function formatTs(ts: string): string {
+  try {
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) return ts;
+    return d.toLocaleString();
+  } catch {
+    return ts;
+  }
 }

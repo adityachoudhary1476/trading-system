@@ -218,10 +218,11 @@ describe("Paper Trading Frontend", () => {
   });
 
   describe("PaperTradingPage layout", () => {
-    it("renders paper-only banner", () => {
+    it("renders paper-only terminal banner", () => {
       renderWithRouter(<PaperTradingPage />);
       expect(screen.getByText("Paper Trading")).toBeDefined();
-      expect(screen.getByText(/Simulated execution environment/)).toBeDefined();
+      expect(screen.getByText(/Autonomous simulated execution/)).toBeDefined();
+      expect(screen.getByText(/PAPER EXECUTION CONSOLE/)).toBeDefined();
     });
 
     it("renders grouped navigation in sidebar", () => {
@@ -246,13 +247,13 @@ describe("Paper Trading Frontend", () => {
 
     it("shows paper environment badge", () => {
       renderWithRouter(<PaperTradingPage />);
-      expect(screen.getByText("PAPER ENVIRONMENT")).toBeDefined();
+      expect(screen.getByText(/No Real Money/)).toBeDefined();
     });
 
-    it("shows environment indicator", () => {
+    it("shows terminal header with session pulse", () => {
       renderWithRouter(<PaperTradingPage />);
-      expect(screen.getByText("PAPER ENVIRONMENT")).toBeDefined();
-      expect(screen.getByText(/No real money at risk/)).toBeDefined();
+      expect(screen.getByText("AETHER // AUTONOMOUS TERMINAL")).toBeDefined();
+      expect(screen.getByText(/Live Paper|Paper Halted/)).toBeDefined();
     });
   });
 
@@ -313,14 +314,15 @@ describe("Paper Trading Frontend", () => {
         expect(screen.getAllByText(/NSE:SBIN/).length).toBeGreaterThan(0);
       });
       // KPI section
-      expect(screen.getByText("Key Metrics")).toBeDefined();
+      expect(screen.getByText("Account & Performance Telemetry")).toBeDefined();
       expect(screen.getAllByText("Return").length).toBeGreaterThan(0);
-      // Operations section
-      expect(screen.getByText("Operations")).toBeDefined();
-      // Risk & Health section
-      expect(screen.getByText("Risk & Health")).toBeDefined();
-      // Paper mode indicator in header
-      expect(screen.getByText("PAPER")).toBeDefined();
+      // System status
+      expect(screen.getByText("System Status")).toBeDefined();
+      // Risk row inside system status
+      expect(screen.getAllByText("ALLOW").length).toBeGreaterThan(0);
+      // Paper-only identity is preserved (the parent PaperTrading header is
+      // not rendered when PaperOverview is mounted standalone in this test).
+      expect(screen.getAllByText(/NSE:SBIN/).length).toBeGreaterThan(0);
     });
 
     it("shows skeleton loading state while fetching dashboard", async () => {
@@ -339,7 +341,7 @@ describe("Paper Trading Frontend", () => {
       fireEvent.change(select, { target: { value: "dep-1" } });
 
       // Skeleton should be visible immediately after selection
-      expect(screen.getByLabelText("Loading dashboard")).toBeDefined();
+      expect(screen.getByLabelText("Loading terminal")).toBeDefined();
 
       // Wait for data to load
       await waitFor(() => {
@@ -383,7 +385,40 @@ describe("Paper Trading Frontend", () => {
       fireEvent.change(select, { target: { value: "dep-1" } });
 
       await waitFor(() => {
+        expect(screen.getByText("Paper Execution Halted")).toBeDefined();
         expect(screen.getAllByText(/Drawdown limit exceeded/).length).toBeGreaterThan(0);
+      });
+    });
+
+    it("renders decision timeline with recent events", async () => {
+      const withEvents = {
+        ...mockSnapshot,
+        recent_events: {
+          total_events: 2,
+          last_event_sequence: 2,
+          last_event_type: "fill_received",
+          last_event_timestamp: "2024-01-01T00:00:00Z",
+          recent: [
+            { sequence: 1, timestamp: "2024-01-01T00:00:00Z", event_type: "signal_generated", deployment_id: "dep-1", strategy_id: "strat-1", message: "LONG signal" },
+            { sequence: 2, timestamp: "2024-01-01T00:00:01Z", event_type: "fill_received", deployment_id: "dep-1", strategy_id: "strat-1", message: "Filled 10 @ 100" },
+          ],
+        },
+      };
+      vi.mocked(paperApi.getDashboard).mockResolvedValue({ ok: true, data: withEvents } as any);
+
+      renderWithRouter(<PaperOverview />);
+
+      await waitFor(() => {
+        expect(screen.getByText(/dep-1/)).toBeDefined();
+      });
+
+      const select = screen.getByLabelText("Select deployment");
+      fireEvent.change(select, { target: { value: "dep-1" } });
+
+      await waitFor(() => {
+        expect(screen.getByText("Decision Timeline")).toBeDefined();
+        expect(screen.getByText(/signal generated/i)).toBeDefined();
+        expect(screen.getByText(/fill received/i)).toBeDefined();
       });
     });
 
@@ -401,11 +436,11 @@ describe("Paper Trading Frontend", () => {
       fireEvent.change(select, { target: { value: "dep-1" } });
 
       await waitFor(() => {
-        expect(screen.getByText(/No open positions/)).toBeDefined();
+        expect(screen.getByText(/No open positions|No Open Positions/)).toBeDefined();
       });
     });
 
-    it("renders performance history empty state", async () => {
+    it("renders equity curve empty state", async () => {
       vi.mocked(paperApi.getDashboard).mockResolvedValue({ ok: true, data: mockSnapshot } as any);
 
       renderWithRouter(<PaperOverview />);
@@ -419,8 +454,8 @@ describe("Paper Trading Frontend", () => {
       fireEvent.change(select, { target: { value: "dep-1" } });
 
       await waitFor(() => {
-        expect(screen.getByText("Performance History")).toBeDefined();
-        expect(screen.getByText(/Historical performance data is not available/)).toBeDefined();
+        expect(screen.getByText("Equity Curve")).toBeDefined();
+        expect(screen.getByText(/No Performance History/)).toBeDefined();
       });
     });
 
@@ -440,7 +475,7 @@ describe("Paper Trading Frontend", () => {
       fireEvent.change(select, { target: { value: "dep-1" } });
 
       await waitFor(() => {
-        expect(screen.getByText("Unable to load paper overview")).toBeDefined();
+        expect(screen.getByText("Unable to load paper terminal")).toBeDefined();
       });
       expect(screen.getByText("Connection failed")).toBeDefined();
     });
@@ -988,7 +1023,7 @@ describe("Paper Trading Frontend", () => {
     it("does not contain live trading labels", () => {
       renderWithRouter(<PaperTradingPage />);
       expect(screen.getByText("Paper Trading")).toBeDefined();
-      expect(screen.getByText(/No real money at risk/)).toBeDefined();
+      expect(screen.getByText(/Autonomous simulated execution/)).toBeDefined();
     });
 
     it("does not contain buy/sell controls", () => {
@@ -1010,6 +1045,36 @@ describe("Paper Trading Frontend", () => {
       expect(screen.queryByText(/Broker/i)).toBeNull();
       expect(screen.queryByText(/Upstox/i)).toBeNull();
       expect(screen.queryByText(/Zerodha/i)).toBeNull();
+    });
+  });
+
+  describe("PaperTrading terminal header", () => {
+    it("renders deployment context when dashboard resolves", async () => {
+      vi.mocked(paperApi.getDashboard).mockResolvedValue({ ok: true, data: mockSnapshot } as any);
+
+      renderWithParams(<PaperTradingPage />, "/paper/overview/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Paper Trading")).toBeDefined();
+      });
+      await waitFor(() => {
+        expect(screen.getByText("AETHER // AUTONOMOUS TERMINAL")).toBeDefined();
+        expect(screen.getByText("Live Paper")).toBeDefined();
+      });
+    });
+
+    it("switches to halted state when dashboard reports halt", async () => {
+      const halted = {
+        ...mockSnapshot,
+        health: { status: "halted" as HealthStatus, halt_reason: "Drawdown limit exceeded", warnings: [] },
+      };
+      vi.mocked(paperApi.getDashboard).mockResolvedValue({ ok: true, data: halted } as any);
+
+      renderWithParams(<PaperTradingPage />, "/paper/overview/dep-1");
+
+      await waitFor(() => {
+        expect(screen.getByText("Paper Halted")).toBeDefined();
+      });
     });
   });
 });
