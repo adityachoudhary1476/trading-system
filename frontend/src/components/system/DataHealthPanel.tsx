@@ -37,13 +37,14 @@ export function DataHealthPanel() {
 
   if (!h) return <Panel title="Data Health"><Loading /></Panel>;
   const healthy = h.status === "healthy";
+  const status = h.status ?? "disconnected";
   return (
     <Panel
       title="Data Health"
       actions={
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-          <HealthDot status={h.status} pulse />
-          <Badge kind={h.status}>{h.status.replace("_", " ")}</Badge>
+          <HealthDot status={status} pulse />
+          <Badge kind={status}>{status.replace("_", " ")}</Badge>
         </span>
       }
     >

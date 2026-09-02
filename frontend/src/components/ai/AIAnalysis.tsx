@@ -36,7 +36,8 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
   }
 
   if (!ai) return null;
-  const confPct = Math.round(ai.confidence * 100);
+  const confPct = Math.round((ai.confidence ?? 0) * 100);
+  const signal = ai.signal ?? "no_signal";
   return (
     <Panel
       title="AI Market Intelligence"
@@ -72,7 +73,7 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
             Signal
           </div>
           <div style={{ fontSize: 18, fontWeight: 700, textTransform: "uppercase" }}>
-            <Badge kind={ai.signal}>{ai.signal.replace("_", " ")}</Badge>
+            <Badge kind={signal}>{signal.replace("_", " ")}</Badge>
           </div>
         </div>
       </div>
@@ -140,11 +141,12 @@ export function SignalCard({ symbol }: { symbol: string }) {
   }
 
   if (!ai) return null;
-  const confPct = Math.round(ai.confidence * 100);
+  const confPct = Math.round((ai.confidence ?? 0) * 100);
+  const signal = ai.signal ?? "no_signal";
   return (
-    <Panel title="Signal" actions={<Badge kind={ai.signal}>{ai.signal.replace("_", " ")}</Badge>}>
+    <Panel title="Signal" actions={<Badge kind={signal}>{signal.replace("_", " ")}</Badge>}>
       <div className="signal-emphasis">
-        <span className={`signal-word sig-${ai.signal}`}>{ai.signal.replace("_", " ")}</span>
+        <span className={`signal-word sig-${signal}`}>{signal.replace("_", " ")}</span>
         <span className="faint" style={{ fontSize: 11 }}>generated on candle close</span>
       </div>
       <div className="grid cols-2" style={{ gap: 12, marginTop: 12 }}>

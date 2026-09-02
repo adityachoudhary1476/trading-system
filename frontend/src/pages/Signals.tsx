@@ -81,7 +81,7 @@ export function SignalsPage() {
           <select className="search" value={sym} onChange={(e) => setSym(e.target.value)} aria-label="Filter by symbol"
             style={{ padding: 7, color: "var(--text)", background: "var(--bg-elev-2)", border: "1px solid var(--panel-border)", borderRadius: 6 }}>
             <option value="">All symbols</option>
-            {symbols.map((s) => <option key={s} value={s}>{s.replace("NSE:", "")}</option>)}
+            {symbols.map((s) => <option key={s} value={s}>{(s || "").replace("NSE:", "")}</option>)}
           </select>
           <div className="tf-controls" role="group" aria-label="Filter by signal">
             {SIGNAL_FILTERS.map((d) => (
@@ -114,19 +114,21 @@ export function SignalsPage() {
             </thead>
             <tbody>
               {rows.map((s) => {
-                const conf = Math.round(s.confidence * 100);
+                const conf = Math.round((s.confidence ?? 0) * 100);
+                const direction = s.direction ?? "no_signal";
+                const symbol = s.symbol ?? "";
                 return (
-                  <tr key={s.id} className={`sig-row sig-${s.direction}`}>
+                  <tr key={s.id} className={`sig-row sig-${direction}`}>
                     <td className="mono">{fmtDateTime(s.generatedAt)}</td>
-                    <td style={{ fontWeight: 600 }}>{s.symbol.replace("NSE:", "")}</td>
-                    <td><Badge kind={s.direction}>{s.direction.replace("_", " ")}</Badge></td>
+                    <td style={{ fontWeight: 600 }}>{symbol.replace("NSE:", "")}</td>
+                    <td><Badge kind={direction}>{direction.replace("_", " ")}</Badge></td>
                     <td className="num" style={{ minWidth: 120 }}>
                       <div className="conf-bar" style={{ marginTop: 2 }}>
-                        <span className={s.direction === "short" ? "neg" : s.direction === "long" ? "pos" : "muted"} style={{ width: `${conf}%` }} />
+                        <span className={direction === "short" ? "neg" : direction === "long" ? "pos" : "muted"} style={{ width: `${conf}%` }} />
                       </div>
                       <span className="mono" style={{ fontSize: 11 }}>{conf}%</span>
                     </td>
-                    <td className="mono">₹{fmtPrice(s.price)}</td>
+                    <td className="mono">₹{fmtPrice(s.price ?? 0)}</td>
                     <td><Badge kind={s.bias}>{s.bias}</Badge></td>
                     <td className="muted" style={{ maxWidth: 360 }}>{s.reason}</td>
                   </tr>
