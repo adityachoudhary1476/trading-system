@@ -71,6 +71,8 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         self.max_retries = max_retries
         self.registry = registry or InstrumentRegistry()
         self._ws: Optional[object] = None
+        # V3 resolver is lazily initialised by the V3 WebSocket owner (the
+        # backend runtime) so legacy REST callers don't pay the lookup cost.
 
     @property
     def is_real_time(self) -> bool:
