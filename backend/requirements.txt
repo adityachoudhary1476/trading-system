@@ -7,7 +7,7 @@ supabase==2.7.4
 
 # JWT verification (local, JWKS-based; replaces remote auth.get_user)
 PyJWT[crypto]==2.13.0
-httpx==0.28.1
+httpx==0.27.2
 
 # Data Processing (existing dependencies)
 pandas==3.0.5
