@@ -10,7 +10,12 @@ import { MarketStatusPanel } from "@/components/layout/MarketStatusPanel";
 import { TickerStrip } from "@/components/market/TickerStrip";
 import { Panel, Loading } from "@/components/ui";
 
-const TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1D"];
+// Timeframes exposed to the operator. Each entry is a key that the
+// Upstox-backed Vercel OHLCV handler accepts verbatim (see
+// `frontend/api/market/ohlcv.ts` INTERVAL_MAP). Do NOT add entries that the
+// handler will reject with 400 — unsupported timeframes produce empty charts
+// and force the user to guess the supported set.
+const TIMEFRAMES = ["1m", "1D", "1W", "1M"] as const;
 const INDICATOR_KEYS: { key: keyof IndicatorConfig; label: string }[] = [
   { key: "sma20", label: "SMA 20" },
   { key: "sma50", label: "SMA 50" },
@@ -22,7 +27,12 @@ const INDICATOR_KEYS: { key: keyof IndicatorConfig; label: string }[] = [
 
 export function DashboardPage() {
   const { selectedSymbol } = useApp();
-  const [tf, setTf] = useState("5m");
+  // Default to a timeframe that the Vercel OHLCV handler actually supports.
+  // Choosing an unsupported default (e.g. "5m") would cause the chart to
+  // mount empty on first paint. The default value is also constrained to
+  // exist in TIMEFRAMES below; an unsupported default would also let
+  // operators pick buttons that 400 the API.
+  const [tf, setTf] = useState<string>("1D");
   const [bars, setBars] = useState<OHLCVBar[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

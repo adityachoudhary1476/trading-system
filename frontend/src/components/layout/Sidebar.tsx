@@ -1,10 +1,11 @@
 import { NavLink, useLocation } from "react-router-dom";
 import { useApp, useIndianClock } from "@/store/AppContext";
-import { mockQuote, WATCHLIST_SYMBOLS } from "@/data/mock";
+import { WATCHLIST_SYMBOLS, getInstrument } from "@/data/mock";
 import { dataSource } from "@/data/MarketDataSource";
 import { Sparkline } from "@/components/charts/Sparkline";
 import { fmtTime, fmtPrice } from "@/lib/format";
 import { useEffect, useState } from "react";
+import type { MarketQuote } from "@/types";
 
 const MAIN_NAV = [
   { to: "/", label: "Dashboard", end: true },
@@ -99,24 +100,23 @@ export function Header() {
   );
 }
 
-function WatchRow({ sym, active, onSelect }: { sym: string; active: boolean; onSelect: (s: string) => void }) {
-  const q = mockQuote(sym);
-  const up = q.change !== undefined ? q.change >= 0 : true;
-  const [series, setSeries] = useState<number[]>([]);
-  useEffect(() => {
-    let alive = true;
-    dataSource
-      .getOHLCV(sym, "1D", 40)
-      .then((bars) => {
-        if (alive) setSeries(bars.map((b) => b.close));
-      })
-      .catch(() => {
-        if (alive) setSeries([]);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [sym]);
+function WatchRow({
+  sym,
+  active,
+  onSelect,
+  quote,
+  quoteLoading,
+  series,
+}: {
+  sym: string;
+  active: boolean;
+  onSelect: (s: string) => void;
+  quote: MarketQuote | null;
+  quoteLoading: boolean;
+  series: number[];
+}) {
+  const meta = getInstrument(sym);
+  const up = quote?.change !== undefined ? quote.change >= 0 : true;
   return (
     <button
       className={`watch-item${active ? " active" : ""}`}
@@ -124,11 +124,18 @@ function WatchRow({ sym, active, onSelect }: { sym: string; active: boolean; onS
       aria-pressed={active}
     >
       <span className="watch-sym">{sym.replace("NSE:", "")}</span>
-      <span className="watch-px mono">₹{fmtPrice(q.price)}</span>
-      <span className="watch-name">{q.name}</span>
+      <span className="watch-px mono">
+        {quote
+          ? `₹${fmtPrice(Math.abs(quote.price))}`
+          : quoteLoading
+            ? "…"
+            : "—"}
+      </span>
+      <span className="watch-name">{meta.name}</span>
       <span className={`watch-chg ${up ? "pos" : "neg"}`}>
-        {up ? "+" : ""}
-        {q.changePct !== undefined ? `${q.changePct.toFixed(2)}%` : "—"}
+        {quote?.changePct !== undefined
+          ? `${quote.changePct >= 0 ? "+" : ""}${quote.changePct.toFixed(2)}%`
+          : "—"}
       </span>
       <span className="watch-spark">
         <Sparkline data={series} positive={up} width={64} height={22} />
@@ -162,6 +169,49 @@ export function Sidebar() {
   const ist = new Date(now.getTime() + now.getTimezoneOffset() * 60000 + 5.5 * 3600000);
   const location = useLocation();
   const isPaper = location.pathname.startsWith("/paper");
+
+  // Per-symbol quote + sparkline caches. Lifted to the parent so each
+  // watchlist row does not issue its own request — one fetch per symbol
+  // regardless of how many rows render it, and no re-fetch when an
+  // unrelated state change re-renders the parent.
+  const [quotes, setQuotes] = useState<Record<string, MarketQuote | null>>({});
+  const [quotesLoading, setQuotesLoading] = useState<Record<string, boolean>>({});
+  const [series, setSeries] = useState<Record<string, number[]>>({});
+
+  useEffect(() => {
+    if (isPaper) return;
+    let alive = true;
+    for (const sym of WATCHLIST_SYMBOLS) {
+      setQuotesLoading((prev) => (prev[sym] ? prev : { ...prev, [sym]: true }));
+      dataSource
+        .getQuote(sym)
+        .then((q) => {
+          if (!alive) return;
+          setQuotes((prev) => ({ ...prev, [sym]: q }));
+          setQuotesLoading((prev) => ({ ...prev, [sym]: false }));
+        })
+        .catch(() => {
+          if (!alive) return;
+          // Genuine unavailable state — leave the row in "—". Do NOT
+          // substitute a mock or fabricated value.
+          setQuotes((prev) => ({ ...prev, [sym]: null }));
+          setQuotesLoading((prev) => ({ ...prev, [sym]: false }));
+        });
+      dataSource
+        .getOHLCV(sym, "1D", 40)
+        .then((bars) => {
+          if (!alive) return;
+          setSeries((prev) => ({ ...prev, [sym]: bars.map((b) => b.close) }));
+        })
+        .catch(() => {
+          if (!alive) return;
+          setSeries((prev) => ({ ...prev, [sym]: [] }));
+        });
+    }
+    return () => {
+      alive = false;
+    };
+  }, [isPaper]);
 
   const close = () => {
     document.getElementById("sidebar")?.classList.remove("open");
@@ -198,7 +248,15 @@ export function Sidebar() {
         <div className="sidebar-section">
           <div className="sidebar-title">Watchlist</div>
           {WATCHLIST_SYMBOLS.map((sym) => (
-            <WatchRow key={sym} sym={sym} active={sym === selectedSymbol} onSelect={(s) => { setSelectedSymbol(s); close(); }} />
+            <WatchRow
+              key={sym}
+              sym={sym}
+              active={sym === selectedSymbol}
+              onSelect={(s) => { setSelectedSymbol(s); close(); }}
+              quote={quotes[sym] ?? null}
+              quoteLoading={!!quotesLoading[sym]}
+              series={series[sym] ?? []}
+            />
           ))}
           <button className="add-sym" disabled title="Add symbol (coming soon)">
             + Add symbol
