@@ -61,8 +61,14 @@ async def generate_signals(
         config = SignalConfig(min_data_points=30, min_confidence=0.5)
         signal = generate_signal(snapshot, view, config)
 
-        # Convert to DTO
-        return [_signal_to_dto(signal, symbol)]
+        # Convert to DTO using the *real* source-candle close and bar
+        # timestamp, never fabricated or zeroed values.  _signal_to_dto
+        # may return None if the source candle has no usable price or
+        # timestamp; we drop those instead of emitting a fake signal.
+        dto = _signal_to_dto(signal, symbol, snapshot)
+        if dto is None:
+            return []
+        return [dto]
 
     except Exception as e:
         logger.error("Failed to generate signals for %s: %s", symbol, str(e))
@@ -236,18 +242,61 @@ def _extract_invalidating_conditions(candidate) -> list[str]:
     return []
 
 
-def _signal_to_dto(signal, symbol: str) -> SignalDTO:
-    """Convert a Signal dataclass to SignalDTO."""
+def _signal_to_dto(signal, symbol: str, snapshot) -> SignalDTO:
+    """Convert a Signal dataclass to SignalDTO using real market data.
+
+    The price and timestamp are taken from the *source* market snapshot
+    (the last closed candle) — never from ``time.time()`` and never
+    defaulted to ``0.0`` if missing.  If the snapshot has no finite
+    close or no tz-aware timestamp, this function returns ``None`` so
+    the caller can drop the signal rather than emit a fake one.
+    """
+    import math
+    from datetime import timezone
+
     direction_val = signal.direction.value if hasattr(signal.direction, "value") else str(signal.direction)
+
+    # Price: the latest closed candle's close, only if finite.
+    raw_price = getattr(snapshot, "latest_price", None)
+    price: Optional[float]
+    if isinstance(raw_price, (int, float)) and math.isfinite(float(raw_price)) and float(raw_price) > 0:
+        price = float(raw_price)
+    else:
+        price = None
+
+    # Timestamp: epoch ms of the source candle, in UTC.  The snapshot
+    # guarantees a tz-aware UTC datetime (see build_snapshot_from_df).
+    bar_ts = getattr(snapshot, "timestamp", None)
+    ts_ms: Optional[int]
+    if bar_ts is None:
+        ts_ms = None
+    else:
+        if getattr(bar_ts, "tzinfo", None) is None:
+            bar_ts = bar_ts.replace(tzinfo=timezone.utc)
+        else:
+            bar_ts = bar_ts.astimezone(timezone.utc)
+        ts_ms = int(bar_ts.timestamp() * 1000)
+
+    if price is None or ts_ms is None:
+        # The source candle did not provide a usable observation.  We
+        # refuse to emit a signal with a fabricated price or wall-clock
+        # timestamp — the route will see an empty list and the frontend
+        # will render an explicit empty state.
+        logger.warning(
+            "Dropping signal for %s: snapshot lacks finite price (%r) or "
+            "bar timestamp (%r)",
+            symbol, raw_price, bar_ts,
+        )
+        return None  # type: ignore[return-value]
 
     return SignalDTO(
         id=str(uuid.uuid4()),
         symbol=symbol,
         direction=direction_val,
         confidence=float(signal.confidence),
-        generated_at=int(time.time() * 1000),
-        price=float(getattr(signal, "price", 0.0)),
-        bias=getattr(signal, "market_view", "neutral"),
-        reason=signal.reason,
-        source=signal.source,
+        price=price,
+        bias=getattr(signal, "market_view", "neutral") or "neutral",
+        reason=signal.reason or "",
+        timestamp=ts_ms,
+        source=signal.source or "deterministic",
     )

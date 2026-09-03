@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class FactorDTO(BaseModel):
@@ -29,17 +29,39 @@ class AIAnalysisDTO(BaseModel):
 
 
 class SignalDTO(BaseModel):
-    """A trading signal."""
+    """A trading signal.
 
-    id: str
-    symbol: str
-    direction: str  # long, short, hold, no_signal
-    confidence: float = Field(ge=0, le=1)
-    generated_at: int  # epoch ms
-    price: float
-    bias: str  # bullish, bearish, neutral, choppy
-    reason: str
-    source: str
+    Contract (all fields are required and non-null on the wire):
+
+    * ``id``        — unique identifier (uuid4 string)
+    * ``symbol``    — internal symbol (e.g. ``"NSE:SBIN"``)
+    * ``direction`` — one of ``long`` / ``short`` / ``hold`` / ``no_signal``
+    * ``confidence`` — analytical confidence in ``[0, 1]``
+    * ``price``     — finite close of the source candle (never ``0``/``None``)
+    * ``bias``      — AI market view: ``bullish`` / ``bearish`` / ``neutral`` / ``choppy``
+    * ``reason``    — natural-language reason from the strategy engine
+    * ``timestamp`` — epoch ms of the source candle (tz-aware UTC origin)
+    * ``source``    — model identifier (e.g. ``"deterministic"``)
+
+    The ``generatedAt`` alias exists so the wire format matches the
+    existing frontend ``Signal`` interface (camelCase).  The route uses
+    ``response_model_by_alias=True`` to emit ``generatedAt`` in JSON.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str = Field(description="Unique signal id (uuid4)")
+    symbol: str = Field(description='Internal symbol, e.g. "NSE:SBIN"')
+    direction: str = Field(description="long | short | hold | no_signal")
+    confidence: float = Field(ge=0, le=1, description="Analytical confidence in [0, 1]")
+    price: float = Field(description="Finite close price of the source candle")
+    bias: str = Field(description="bullish | bearish | neutral | choppy")
+    reason: str = Field(description="Natural-language reason for the decision")
+    timestamp: int = Field(
+        description="Epoch ms of the source candle (tz-aware UTC)",
+        serialization_alias="generatedAt",
+    )
+    source: str = Field(description="Originating strategy/model identifier")
 
 
 class PipelineStageDTO(BaseModel):

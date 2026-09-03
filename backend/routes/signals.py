@@ -39,6 +39,7 @@ def _http_status_for_upstox_error(
 @router.get(
     "/signals",
     response_model=list[SignalDTO],
+    response_model_by_alias=True,
     responses={
         200: {"description": "Signals (possibly empty if no symbol has a usable signal)"},
         401: {"model": ErrorResponse, "description": "Authentication required"},

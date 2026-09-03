@@ -76,17 +76,32 @@ export interface AIAnalysis {
   model: string;
 }
 
-/** A trading signal (analytical only — NEVER execution). */
+/** A trading signal (analytical only — NEVER execution).
+ *
+ * Wire-format contract (mirrors backend `SignalDTO`):
+ *
+ * | field         | type                                      | source                         |
+ * |---------------|-------------------------------------------|--------------------------------|
+ * | id            | string (uuid4)                            | backend                        |
+ * | symbol        | string  (e.g. "NSE:SBIN")                 | backend                        |
+ * | direction     | "long" | "short" | "hold" | "no_signal"   | strategy engine                 |
+ * | confidence    | number in [0, 1]                          | strategy engine                 |
+ * | price         | number > 0  (finite close of source bar)  | latest candle close from data  |
+ * | bias          | Direction ("bullish" | "bearish" | "neutral" | "choppy") | AI market view         |
+ * | reason        | string                                    | strategy reason                 |
+ * | generatedAt   | number  (epoch ms of source bar)          | snapshot timestamp             |
+ * | source        | string  (e.g. "deterministic")           | strategy identifier             |
+ */
 export interface Signal {
   id: string;
   symbol: string;
-  direction: SignalDirection; // long | short | hold | no_signal
-  confidence: number; // 0..1
-  generatedAt: number; // epoch ms
+  direction: SignalDirection;
+  confidence: number;
   price: number;
   bias: Direction;
   reason: string;
-  source: string; // e.g. "deterministic"
+  generatedAt: number;
+  source: string;
 }
 
 /** Feed health (maps backend DataHealthMonitor.snapshot). */

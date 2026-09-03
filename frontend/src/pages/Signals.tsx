@@ -2,7 +2,7 @@ import { useMemo, useState, useEffect } from "react";
 import { dataSource } from "@/data/MarketDataSource";
 import type { Signal, SignalDirection } from "@/types";
 import { Badge, EmptyState } from "@/components/ui";
-import { fmtPrice, fmtDateTime } from "@/lib/format";
+import { fmtPrice, fmtDateTime, isFiniteNumber } from "@/lib/format";
 
 const SIGNAL_FILTERS: ("all" | SignalDirection)[] = ["all", "long", "short", "hold", "no_signal"];
 
@@ -117,6 +117,9 @@ export function SignalsPage() {
                 const conf = Math.round((s.confidence ?? 0) * 100);
                 const direction = s.direction ?? "no_signal";
                 const symbol = s.symbol ?? "";
+                const priceText = isFiniteNumber(s.price) && s.price > 0
+                  ? fmtPrice(s.price)
+                  : "—";
                 return (
                   <tr key={s.id} className={`sig-row sig-${direction}`}>
                     <td className="mono">{fmtDateTime(s.generatedAt)}</td>
@@ -128,7 +131,7 @@ export function SignalsPage() {
                       </div>
                       <span className="mono" style={{ fontSize: 11 }}>{conf}%</span>
                     </td>
-                    <td className="mono">₹{fmtPrice(s.price ?? 0)}</td>
+                    <td className="mono">₹{priceText}</td>
                     <td><Badge kind={s.bias}>{s.bias}</Badge></td>
                     <td className="muted" style={{ maxWidth: 360 }}>{s.reason}</td>
                   </tr>
@@ -138,7 +141,6 @@ export function SignalsPage() {
           </table>
         )}
       </div>
-      <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>Mock signal history.</p>
     </>
   );
 }
