@@ -196,4 +196,69 @@ __all__ = [
     "CircuitBreakerResponse",
     "EventsResponse",
     "EvidenceResponse",
+    "OrderIntentRequest",
+    "OrderIntentResponse",
 ]
+
+
+# --------------------------------------------------------------------------- #
+# External order-intent (Day-13 autonomous-agent boundary)
+# --------------------------------------------------------------------------- #
+class OrderIntentRequest(BaseModel):
+    """Request body for ``POST /deployments/{id}/orders``.
+
+    This is the ONLY way an external caller can submit a paper-trading order.
+    Every field maps 1:1 to the existing ``OrderIntent`` type accepted by
+    ``PaperTradingControlCenter.submit_order_intent``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    symbol: str = Field(..., min_length=1, description="Trading symbol (e.g. 'AAPL')")
+    side: str = Field(..., description="Either 'BUY' or 'SELL'")
+    quantity: float = Field(..., gt=0, description="Positive number of shares/contracts")
+    order_type: str = Field(default="MARKET", description="MARKET or LIMIT")
+    limit_price: Optional[float] = Field(
+        default=None, description="Required for LIMIT orders; ignored for MARKET"
+    )
+    client_order_id: Optional[str] = Field(
+        default=None, min_length=1, max_length=128,
+        description="Caller-supplied idempotency key. If set, retries with the "
+                    "same key return the original result without creating a "
+                    "duplicate order/fill.",
+    )
+    current_price: Optional[float] = Field(
+        default=None, gt=0,
+        description="Reference market price for MARKET fills. Required when the "
+                    "deployment has no live price feed.",
+    )
+
+
+class OrderIntentResponse(BaseModel):
+    """Response body for ``POST /deployments/{id}/orders``.
+
+    Always carries the order status so agents can distinguish accepted,
+    partially-filled, rejected, and idempotent-retry responses.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    order_id: str = ""
+    client_order_id: Optional[str] = None
+    symbol: str
+    side: str
+    quantity: float
+    order_type: str
+    limit_price: Optional[float]
+    status: str
+    filled_quantity: float
+    avg_fill_price: float
+    fills: list[dict]
+    cash_after: Optional[float]
+    equity_after: Optional[float]
+    realized_pnl_after: Optional[float]
+    unrealized_pnl_after: Optional[float]
+    position_qty_after: Optional[float]
+    reject_reason: str = ""
+    idempotent: bool = False
+    schema_version: int = 1

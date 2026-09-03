@@ -1,4 +1,4 @@
-"""Market Intelligence Engine (Day 8) — DATA/ANALYSIS ONLY, no execution.
+﻿"""Market Intelligence Engine (Day 8) — DATA/ANALYSIS ONLY, no execution.
 
 Provider-independent. Takes normalized OHLCV (+ instrument metadata) and produces a
 structured, explainable analysis an AI model can reason over. The output is a
@@ -85,6 +85,157 @@ class SetupType(str, Enum):
     MEAN_REVERSION = "mean_reversion"
     MOMENTUM = "momentum"
     NO_SETUP = "no_setup"
+# --------------------------------------------------------------------------- #
+# Time Horizon Enum
+# --------------------------------------------------------------------------- #
+class TimeHorizon(str, Enum):
+    INTRADAY = "intraday"
+    SHORT_TERM = "short_term"
+    SWING = "swing"
+
+
+# --------------------------------------------------------------------------- #
+# Evidence Ledger — tracks supporting/contradicting evidence
+# --------------------------------------------------------------------------- #
+@dataclass
+class EvidenceLedger:
+    """Structured evidence for explainable analysis."""
+    positive: list[str] = field(default_factory=list)
+    negative: list[str] = field(default_factory=list)
+    neutral: list[str] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+
+    @property
+    def agreement(self) -> str:
+        """Classify evidence agreement level."""
+        pos = len(self.positive)
+        neg = len(self.negative)
+        total = pos + neg
+        if total == 0:
+            return "neutral"
+        ratio = abs(pos - neg) / total
+        if ratio >= 0.6:
+            return "strong"
+        elif ratio >= 0.3:
+            return "moderate"
+        else:
+            return "mixed"
+
+
+# --------------------------------------------------------------------------- #
+# Multi-Timeframe Analysis Result
+# --------------------------------------------------------------------------- #
+@dataclass
+class TimeframeAnalysis:
+    """Analysis for a single timeframe."""
+    timeframe: str
+    bias: TrendEnum
+    confidence: float  # 0..100
+    trend_score: float = 0.0
+    momentum_score: float = 0.0
+    volume_score: float = 0.0
+    volatility_score: float =  0.0
+    evidence: EvidenceLedger = field(default_factory=EvidenceLedger)
+
+
+# --------------------------------------------------------------------------- #
+# Expected Move Estimate
+# --------------------------------------------------------------------------- #
+@dataclass
+class ExpectedMove:
+    """Estimated price range based on volatility."""
+    lower_pct: float  # e.g., -1.4 for -1.4%
+    upper_pct: float  # e.g., -0.8 for -0.8%
+    basis: str  # "atr" or "volatility"
+    horizon: TimeHorizon = TimeHorizon.INTRADAY
+
+
+# --------------------------------------------------------------------------- #
+# Options Candidate
+# --------------------------------------------------------------------------- #
+@dataclass
+class OptionsCandidate:
+    """A scored options contract candidate."""
+    strike: float
+    option_type: str  # CE or PE
+    expiry: Optional[str] = None
+    moneyness: Optional[float] = None
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega: Optional[float] = None
+    implied_vol: Optional[float] = None
+    open_interest: Optional[float] = None
+    volume: Optional[float] = None
+    bid_ask_spread: Optional[float] = None
+    score: float = 0.0  # 0..100
+    rationale: list[str] = field(default_factory=list)
+    risks: list[str] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# Instrument-specific analysis context
+# --------------------------------------------------------------------------- #
+@dataclass
+class InstrumentContext:
+    """Instrument-specific analysis parameters."""
+    instrument_class: InstrumentClass
+    symbol: str
+    # Index-specific
+    is_index: bool = False
+    is_bank_nifty: bool = False
+    is_nifty: bool = False
+    # Stock-specific
+    is_sector_available: bool = False
+    sector: Optional[str] = None
+    # Volatility parameters (instrument-specific)
+    high_vol_threshold: float = 0.30
+    low_vol_threshold: float = 0.15
+    # ATR-based expected move multiplier
+    atr_move_multiplier: float =  1.0
+
+
+def _build_instrument_context(symbol: str, instrument=None) -> InstrumentContext:
+    """Build instrument-specific context for analysis.
+
+    Index detection: prefer the instrument object's class; when no instrument
+    object is available, infer index-ness from well-known index symbols
+    (NIFTY50 / BANKNIFTY / FINNIFTY / MIDCPNIFTY / SENSEX). Never fabricates
+    data — this is classification only.
+    """
+    iclass = instrument_class_of(instrument) if instrument is not None else None
+
+    sym_upper = symbol.upper()
+    _INDEX_TOKENS = ("NIFTY50", "NIFTY 50", "NIFTYBANK", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX")
+    _looks_like_index = any(tok in sym_upper for tok in _INDEX_TOKENS)
+    if iclass is None:
+        iclass = InstrumentClass.INDEX if _looks_like_index else InstrumentClass.EQUITY
+
+    ctx = InstrumentContext(
+        instrument_class=iclass,
+        symbol=symbol,
+        is_index=iclass == InstrumentClass.INDEX,
+    )
+
+    # Identify specific indices
+    ctx.is_nifty = "NIFTY" in sym_upper and "BANK" not in sym_upper and "FIN" not in sym_upper
+    ctx.is_bank_nifty = "BANK" in sym_upper and "NIFTY" in sym_upper
+
+    # Instrument-specific volatility thresholds
+    if ctx.is_bank_nifty:
+        ctx.high_vol_threshold = 0.35  # BANK NIFTY is more volatile
+        ctx.low_vol_threshold = 0.18
+        ctx.atr_move_multiplier = 1.2
+    elif ctx.is_nifty:
+        ctx.high_vol_threshold = 0.25
+        ctx.low_vol_threshold = 0.12
+        ctx.atr_move_multiplier = 1.0
+    elif iclass == InstrumentClass.EQUITY:
+        ctx.high_vol_threshold = 0.40  # Individual stocks can be more volatile
+        ctx.low_vol_threshold = 0.20
+        ctx.atr_move_multiplier = 0.9
+
+    return ctx
 
 
 # --------------------------------------------------------------------------- #
@@ -334,6 +485,328 @@ def classify_regime(f: TechnicalFeatures) -> MarketRegime:
 
 
 # --------------------------------------------------------------------------- #
+# Evidence-based confidence calculation
+# --------------------------------------------------------------------------- #
+def compute_evidence_confidence(
+    features: TechnicalFeatures,
+    regime: MarketRegime,
+    context: InstrumentContext,
+) -> tuple[float, EvidenceLedger]:
+    """Compute confidence from structured evidence (0..100."""
+    ledger = EvidenceLedger()
+    scores = {}
+    weights = {}
+
+    # --- Trend alignment (weight: 25) ---
+    trend_score = 50.0
+    if features.price_vs_sma20 is not None:
+        if features.price_vs_sma20 >  0.03:
+            trend_score = 80.0
+            ledger.positive.append(f"Price {features.price_vs_sma20*100:.1f}% above SMA20")
+        elif features.price_vs_sma20 >  0:
+            trend_score =  65.0
+            ledger.positive.append(f"Price {features.price_vs_sma20*100:.1f}% above SMA20")
+        elif features.price_vs_sma20 > -0.03:
+            trend_score =  40.0
+            ledger.negative.append(f"Price {abs(features.price_vs_sma20)*100:.1f}% below SMA20")
+        else:
+            trend_score =  25.0
+            ledger.negative.append(f"Price {abs(features.price_vs_sma20)*100:.1f}% below SMA20")
+    else:
+        ledger.missing.append("SMA20 unavailable")
+
+    if features.price_vs_sma50 is not None:
+        
+        if features.price_vs_sma50 >  0:
+            trend_score = min(trend_score +  10, 100)
+        else:
+            trend_score = max(trend_score -  10, 0)
+
+    scores["trend"] = trend_score
+    weights["trend"] =  25
+
+    # --- Momentum (weight:  20) ---
+    mom_score =  50.0
+    if features.rsi_14 is not None:
+        
+        if features.rsi_14 >  70:
+            mom_score =  30.0
+            ledger.negative.append(f"RSI {features.rsi_14:.1f} overbought")
+        elif features.rsi_14 >  60:
+            mom_score =  65.0
+            ledger.positive.append(f"RSI {features.rsi_14:.1f} momentum positive")
+        elif features.rsi_14 >  40:
+            mom_score =  50.0
+            ledger.neutral.append(f"RSI {features.rsi_14:.1f} neutral")
+        elif features.rsi_14 >  30:
+            mom_score =  40.0
+            ledger.negative.append(f"RSI {features.rsi_14:.1f} momentum weak")
+        else:
+            mom_score =  70.0
+            ledger.positive.append(f"RSI {features.rsi_14:.1f} oversold (potential bounce)")
+    else:
+        ledger.missing.append("RSI unavailable")
+
+    if features.roc is not None:
+        if features.roc >  0.03:
+            mom_score = min(mom_score +  10, 100)
+        elif features.roc < -0.03:
+            mom_score = max(mom_score - 10, 0)
+
+    scores["momentum"] = mom_score
+    weights["momentum"] =  20
+
+    # --- Volume (weight: 15) ---
+    vol_score =  50.0
+    if features.relative_volume is not None:
+        if features.unusual_volume and features.relative_volume >  2.0:
+            vol_score =  75.0
+            ledger.positive.append(f"Unusual volume: {features.relative_volume:.1f}x average")
+        elif features.relative_volume >  1.2:
+            vol_score =  60.0
+            ledger.neutral.append(f"Volume {features.relative_volume:.1f}x average")
+        elif features.relative_volume <  0.7:
+            vol_score =  35.0
+            ledger.negative.append(f"Low volume: {features.relative_volume:.1f}x average")
+        else:
+            vol_score =  50.0
+            ledger.neutral.append(f"Volume near average ({features.relative_volume:.1f}x)")
+    else:
+        ledger.missing.append("Volume data unavailable")
+
+    scores["volume"] = vol_score
+    weights["volume"] =  15
+
+    # --- Volatility/Regime (weight: 15, instrument-aware) ---
+    reg_score =  50.0
+    if regime.regime == RegimeEnum.TRENDING_UP:
+        reg_score =  75.0
+        ledger.positive.append("Market in confirmed uptrend")
+    elif regime.regime == RegimeEnum.TRENDING_DOWN:
+                
+        reg_score =  25.0
+        ledger.negative.append("Market in confirmed downtrend")
+    elif regime.regime == RegimeEnum.HIGH_VOLATILITY:
+ 
+        reg_score =  40.0
+        ledger.negative.append("High volatility regime")
+        # Instrument-specific annualized-vol check: an index is far less
+        # tolerant of elevated vol than a single stock (thresholds differ).
+        if features.hist_vol is not None:
+            if features.hist_vol > context.high_vol_threshold:
+                reg_score = 25.0
+                ledger.negative.append(
+                    f"Annualized vol {features.hist_vol:.0%} above "
+                    f"{context.symbol} normal band ({context.high_vol_threshold:.0%})"
+                )
+            elif features.hist_vol < context.low_vol_threshold:
+                reg_score = 55.0
+                ledger.neutral.append(
+                    f"Annualized vol {features.hist_vol:.0%} below "
+                    f"{context.symbol} typical band ({context.low_vol_threshold:.0%})"
+                )
+        else:
+            ledger.missing.append("Annualized volatility unavailable")
+    elif regime.regime == RegimeEnum.RANGE_BOUND: 
+                
+        reg_score =  50.0
+        ledger.neutral.append("Range-bound market")
+    elif regime.regime == RegimeEnum.LOW_VOLATILITY: 
+            
+        reg_score =  60.0
+        ledger.positive.append("Low volatility (potential breakout setup)")
+
+    scores["regime"] = reg_score
+    weights["regime"] =  15
+
+    # --- Structure (weight: 10) ---
+    sr_score =  50.0
+    if features.recent_high is not None and features.recent_low is not None:
+
+        rng_size = features.recent_high - features.recent_low  
+        if rng_size >  0:
+            position = (features.close - features.recent_low) / rng_size  
+            if position >  0.8:
+                sr_score =  70.0
+                ledger.positive.append("Price near recent high (breakout candidate)")
+            elif position >  0.5:
+                sr_score =  60.0
+                ledger.neutral.append("Price in upper half of recent range")
+            elif position >  0.2:
+                sr_score =  45.0
+                ledger.neutral.append("Price in lower half of recent range")
+            else:
+                sr_score =  35.0
+                ledger.negative.append("Price near recent low")
+
+    scores["structure"] = sr_score
+    weights["structure"] =  10
+
+    # --- Data quality (weight: 15) ---
+    dq_score =  100.0
+    if features.insufficient:
+        dq_score =  30.0
+        ledger.missing.append("Insufficient historical data")
+    elif features.data_points <  50:
+        dq_score =  60.0
+        ledger.missing.append("Limited data points")
+    if features.sma_200 is None:
+        dq_score -=  10
+    if features.rsi_14 is None:
+        dq_score -=  10
+
+    scores["data_quality"] = max(dq_score, 0)
+    weights["data_quality"] =  15
+
+    # --- Compute weighted average ---
+    total_weight = sum(weights.values())
+    weighted_sum = sum(scores[k] * weights[k] for k in scores)
+    confidence = weighted_sum / total_weight if total_weight >  0 else  50.0
+
+    # Adjust for evidence agreement
+    agreement = ledger.agreement
+    if agreement == "mixed":
+        confidence *=  0.85
+    elif agreement == "strong":
+        confidence = min(confidence *  1.1, 100)
+
+    return round(min(max(confidence, 0), 100), 1), ledger
+
+
+# --------------------------------------------------------------------------- #
+# Expected move calculation
+# --------------------------------------------------------------------------- #
+def compute_expected_move(
+    features: TechnicalFeatures,
+    horizon: TimeHorizon,
+    context: InstrumentContext,
+) -> Optional[ExpectedMove]:
+    """Calculate expected price move based on ATR/volatility.
+
+    Uses ATR when available (daily-anchored), otherwise annualized
+    historical volatility scaled to the horizon. Instrument context
+    provides a volatility scaling multiplier (indices move differently
+    than single stocks).
+    """
+    if features.close is None or features.close <= 0:
+        return None
+
+    atr = features.atr_14
+    vol = features.hist_vol
+
+    if atr is None and vol is None:
+        return None
+
+    multiplier = context.atr_move_multiplier
+
+    if horizon == TimeHorizon.INTRADAY:
+        if atr is not None:
+            pct = (atr / features.close) * 100 * multiplier
+            return ExpectedMove(
+                lower_pct=round(-pct, 2),
+                upper_pct=round(pct, 2),
+                basis="atr",
+                horizon=horizon,
+            )
+        elif vol is not None:
+            pct = vol * 100 * 0.5 * multiplier
+            return ExpectedMove(
+                lower_pct=round(-pct, 2),
+                upper_pct=round(pct, 2),
+                basis="volatility",
+                horizon=horizon,
+            )
+    elif horizon == TimeHorizon.SHORT_TERM:
+        if atr is not None:
+            pct = (atr / features.close) * 100 * 1.5 * multiplier
+            return ExpectedMove(
+                lower_pct=round(-pct, 2),
+                upper_pct=round(pct, 2),
+                basis="atr",
+                horizon=horizon,
+            )
+        elif vol is not None:
+            pct = vol * 100 * np.sqrt(5) * multiplier
+            return ExpectedMove(
+                lower_pct=round(-pct, 2),
+                upper_pct=round(pct, 2),
+                basis="volatility",
+                horizon=horizon,
+            )
+    elif horizon == TimeHorizon.SWING:
+        if atr is not None:
+            pct = (atr / features.close) * 100 * 2.0 * multiplier
+            return ExpectedMove(
+                lower_pct=round(-pct, 2),
+                upper_pct=round(pct, 2),
+                basis="atr",
+                horizon=horizon,
+            )
+        elif vol is not None:
+            pct = vol * 100 * np.sqrt(20) * multiplier
+            return ExpectedMove(
+                lower_pct=round(-pct, 2),
+                upper_pct=round(pct, 2),
+                basis="volatility",
+                horizon=horizon,
+            )
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Time horizon determination
+# --------------------------------------------------------------------------- #
+def determine_horizon(features: TechnicalFeatures, regime: MarketRegime) -> TimeHorizon:
+
+    """Determine the most relevant time horizon based on evidence."""
+    if features.insufficient:
+        return TimeHorizon.INTRADAY
+
+    if regime.regime in (RegimeEnum.TRENDING_UP, RegimeEnum.TRENDING_DOWN):
+        return TimeHorizon.SWING
+ 
+    elif regime.regime == RegimeEnum.HIGH_VOLATILITY:
+        
+        return TimeHorizon.SHORT_TERM
+ 
+    elif regime.regime == RegimeEnum.RANGE_BOUND: 
+        
+        return TimeHorizon.INTRADAY
+
+    elif regime.regime == RegimeEnum.LOW_VOLATILITY: 
+        
+        return TimeHorizon.SHORT_TERM
+
+    return TimeHorizon.SHORT_TERM
+
+
+# --------------------------------------------------------------------------- #
+# Invalidation level calculation
+# --------------------------------------------------------------------------- #
+def compute_invalidation(features: TechnicalFeatures, direction: SignalDirection) -> Optional[str]:
+    """Compute invalidation level based on market structure."""
+    if features.close is None:
+        return None
+
+    if direction == SignalDirection.LONG:
+        if features.recent_low is not None:
+            return f"Sustained move below {features.recent_low:.2f}"
+        if features.sma_50 is not None:
+            return f"Close below SMA50 ({features.sma_50:.2f})"
+        if features.sma_20 is not None:
+            return f"Close below SMA20 ({features.sma_20:.2f})"
+    elif direction == SignalDirection.SHORT:
+        if features.recent_high is not None:
+            return f"Sustained move above {features.recent_high:.2f}"
+        if features.sma_50 is not None:
+            return f"Close above SMA50 ({features.sma_50:.2f})"
+        if features.sma_20 is not None:
+            return f"Close above SMA20 ({features.sma_20:.2f})"
+
+    return None
+
+
+# --------------------------------------------------------------------------- #
 # Signal candidate (analytical hypothesis — NOT an order)
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -350,6 +823,8 @@ class SignalCandidate:
     risk_flags: list[str] = field(default_factory=list)
     timestamp: Optional[datetime] = None
     instrument_class: InstrumentClass = InstrumentClass.EQUITY
+    horizon: Optional[TimeHorizon] = None
+    expected_move: Optional["ExpectedMove"] = None
 
     def __post_init__(self) -> None:
         self.confidence = float(min(1.0, max(0.0, self.confidence)))
@@ -362,65 +837,69 @@ def generate_signal_candidate(
     features: TechnicalFeatures,
     regime: MarketRegime,
     instrument_class: InstrumentClass = InstrumentClass.EQUITY,
+    context: Optional[InstrumentContext] = None,
     ts: Optional[datetime] = None,
 ) -> SignalCandidate:
     """Deterministic analytical hypothesis from features + regime. No LLM."""
-    bull = 0
-    bear = 0
-    sup: list[str] = []
-    if features.trend == TrendEnum.BULLISH:
-        bull += 2
-        sup.append("trend bullish (EMA20>EMA50, price>SMA20)")
-    elif features.trend == TrendEnum.BEARISH:
-        bear += 2
-        sup.append("trend bearish (EMA20<EMA50, price<SMA20)")
-    if features.rsi_14 is not None:
-        if features.rsi_14 >= 55:
-            bull += 1
-            sup.append(f"RSI {features.rsi_14:.1f} momentum positive")
-        elif features.rsi_14 <= 45:
-            bear += 1
-            sup.append(f"RSI {features.rsi_14:.1f} momentum weak")
-    if features.breakout_candidate:
-        bull += 1
-        sup.append("near recent-high breakout candidate")
-    if features.breakdown_candidate:
-        bear += 1
-        sup.append("near recent-low breakdown candidate")
-    if features.unusual_volume and bull > bear:
-        sup.append("breakout supported by unusual volume")
+    # Build instrument context if not provided
+    if context is None:
+        context = _build_instrument_context(symbol)
 
-    if features.insufficient:
-        return SignalCandidate(
-            symbol, contract_id, timeframe, SignalDirection.NEUTRAL, SetupType.NO_SETUP, 0.0,
-            entry_context="insufficient data", invalidation_context="n/a",
-            supporting_features=[], risk_flags=["insufficient_history"], timestamp=ts, instrument_class=instrument_class,
-        )
-
-    if bull > bear and bull >= 2:
+    # Direction determination
+    if regime.regime == RegimeEnum.TRENDING_UP:
         direction = SignalDirection.LONG
-        setup = SetupType.TREND_CONTINUATION if features.trend == TrendEnum.BULLISH else SetupType.BREAKOUT
-        conf = min(0.9, 0.5 + bull * 0.1)
-        inv = "trend structure breaks (price < SMA20 and EMA20 < EMA50)"
-    elif bear > bull and bear >= 2:
+    elif regime.regime == RegimeEnum.TRENDING_DOWN:
         direction = SignalDirection.SHORT
-        setup = SetupType.TREND_CONTINUATION if features.trend == TrendEnum.BEARISH else SetupType.BREAKDOWN
-        conf = min(0.9, 0.5 + bear * 0.1)
-        inv = "trend structure breaks (price > SMA20 and EMA20 > EMA50)"
+    elif features.trend == TrendEnum.BULLISH:
+        direction = SignalDirection.LONG
+    elif features.trend == TrendEnum.BEARISH:
+        direction = SignalDirection.SHORT
     else:
         direction = SignalDirection.NEUTRAL
-        setup = SetupType.NO_SETUP
-        conf = 0.4
-        inv = "no clear edge; wait for confirmation"
 
+    # Setup type
+    if features.breakout_candidate:
+        setup = SetupType.BREAKOUT
+    elif features.breakdown_candidate:
+        setup = SetupType.BREAKDOWN
+    elif regime.regime in (RegimeEnum.TRENDING_UP, RegimeEnum.TRENDING_DOWN):
+        setup = SetupType.TREND_CONTINUATION
+    elif regime.regime == RegimeEnum.RANGE_BOUND:
+        setup = SetupType.MEAN_REVERSION
+    elif features.roc is not None and abs(features.roc) >  0.03:
+        setup = SetupType.MOMENTUM
+    else:
+        setup = SetupType.NO_SETUP
+
+    # Evidence-based confidence (0..100 scale, convert to 0..1)
+    confidence_score, ledger = compute_evidence_confidence(features, regime, context)
+    confidence = confidence_score / 100.0
+
+    # Horizon
+    horizon = determine_horizon(features, regime)
+
+    # Expected move
+    expected_move = compute_expected_move(features, horizon, context)
+
+    # Invalidation
+    inv = compute_invalidation(features, direction) or "Structure break"
+
+    # Supporting features from ledger
+    sup = ledger.positive + ledger.negative
+
+    # Risk flags
     risks = list(regime.warnings)
-    if regime.regime == RegimeEnum.HIGH_VOLATILITY:
+    if regime.regime == RegimeEnum.HIGH_VOLATILITY:        
         risks.append("elevated volatility => wider invalidation")
+    if features.insufficient:
+        risks.append("insufficient_history")
+
     return SignalCandidate(
-        symbol, contract_id, timeframe, direction, setup, conf,
+        symbol, contract_id, timeframe, direction, setup, round(confidence, 4),
         entry_context=f"last close {features.close:.2f}, SMA20 {features.sma_20}",
         invalidation_context=inv, supporting_features=sup, risk_flags=risks,
         timestamp=ts, instrument_class=instrument_class,
+        horizon=horizon, expected_move=expected_move,
     )
 
 
@@ -643,11 +1122,18 @@ class MarketIntelligenceEngine:
         contract_id: str = "",
         health_status: Optional[str] = None,  # FeedStatus.value or None
         as_of: Optional[datetime] = None,
+        option_chain: Optional[list[dict]] = None,
     ) -> dict:
         """Run the full deterministic analysis. Returns a serializable dict.
 
         If health_status is not HEALTHY (or data insufficient) the result is marked
         BLOCKED with a reason — no fake indicators.
+
+        ``option_chain``: optional live option-chain rows (dicts with strike /
+        option_type / delta / theta / implied_vol / open_interest / volume /
+        bid / ask). When provided, scored OptionsCandidate objects are generated
+        for directional views. When absent, options intelligence is explicitly
+        reported as unavailable — NEVER fabricated.
         """
         from ..india.data_health import FeedStatus
 
@@ -666,14 +1152,26 @@ class MarketIntelligenceEngine:
             }
 
         iclass = instrument_class_of(instrument) if instrument is not None else InstrumentClass.EQUITY
+        context = _build_instrument_context(symbol, instrument)
         features = self.engine.compute(df, iclass)
         regime = classify_regime(features)
 
         ts = as_of or (df.index[-1] if getattr(df.index[-1], "tzinfo", None) else df.index[-1].tz_localize("UTC"))
         candidate = generate_signal_candidate(
-            symbol, contract_id or symbol, timeframe, features, regime, iclass, ts=ts
+            symbol, contract_id or symbol, timeframe, features, regime, iclass, context, ts=ts
         )
         explanation = AnalysisExplanation.from_features(features, regime, candidate)
+
+        # Options intelligence: only from a real chain. No chain => explicit
+        # unavailability, never synthetic candidates.
+        options_candidates: list[OptionsCandidate] = []
+        options_status = "unavailable_no_chain"
+        if option_chain:
+            options_candidates = generate_options_candidates(
+                features, regime, candidate.direction, features.close, option_chain
+            )
+            options_status = f"{len(options_candidates)} candidate(s)" if options_candidates else "no_attractive_setup"
+
         # Derivative fields (OI/IV/greeks stay None unless provided).
         deriv = DerivativeFeatures(
             underlying=getattr(instrument, "underlying", None),
@@ -696,15 +1194,231 @@ class MarketIntelligenceEngine:
             "timeframe": timeframe,
             "contract_id": contract_id or symbol,
             "instrument_class": iclass.value,
+            "instrument_context": context,
             "features": features,
             "regime": regime,
             "signal_candidate": candidate,
             "explanation": explanation,
             "derivative": deriv,
+            "options_candidates": options_candidates,
+            "options_status": options_status,
             "data_quality": {
                 "rows": features.data_points,
                 "insufficient": features.insufficient,
                 "missing": explanation.missing_data,
             },
         }
+
+# --------------------------------------------------------------------------- #
+# Multi-timeframe analysis (per-horizon directional assessments)
+# --------------------------------------------------------------------------- #
+def analyze_multi_timeframe(
+    symbol: str,
+    dfs: dict[str, pd.DataFrame],
+    context: InstrumentContext,
+) -> dict[str, TimeframeAnalysis]:
+    """Analyze multiple timeframes and produce per-timeframe assessments.
+
+    Each timeframe gets its OWN features, regime, evidence ledger and
+    confidence — horizons may legitimately disagree (e.g. bearish intraday,
+    bullish swing). No data is fabricated: insufficient data produces an
+    explicit NEUTRAL assessment with the reason recorded.
+    """
+    results: dict[str, TimeframeAnalysis] = {}
+    engine = FeatureEngine(lookback=60)
+
+    for tf, df in dfs.items():
+        if df is None or len(df) < FeatureEngine.MIN_BARS:
+            results[tf] = TimeframeAnalysis(
+                timeframe=tf,
+                bias=TrendEnum.NEUTRAL,
+                confidence=0.0,
+                evidence=EvidenceLedger(missing=[f"Insufficient data for {tf}"]),
+            )
+            continue
+
+        features = engine.compute(df, context.instrument_class)
+        regime = classify_regime(features)
+        confidence, ledger = compute_evidence_confidence(features, regime, context)
+
+        if regime.regime == RegimeEnum.TRENDING_UP:
+            bias = TrendEnum.BULLISH
+        elif regime.regime == RegimeEnum.TRENDING_DOWN:
+            bias = TrendEnum.BEARISH
+        else:
+            bias = features.trend
+
+        results[tf] = TimeframeAnalysis(
+            timeframe=tf,
+            bias=bias,
+            confidence=confidence,
+            trend_score=getattr(regime, "confidence", 0.0) * 100,
+            momentum_score=features.rsi_14 if features.rsi_14 else 50.0,
+            volume_score=min(features.relative_volume * 50, 100) if features.relative_volume else 50.0,
+            volatility_score=min(features.hist_vol * 100, 100) if features.hist_vol else 50.0,
+            evidence=ledger,
+        )
+
+    return results
+
+
+
+# --------------------------------------------------------------------------- #
+# Options Strategy Engine (chain-driven candidate generation + scoring)
+# --------------------------------------------------------------------------- #
+def generate_options_candidates(
+    features: TechnicalFeatures,
+    regime: MarketRegime,
+    direction: SignalDirection,
+    spot_price: float,
+    option_chain: Optional[list[dict]] = None,
+) -> list[OptionsCandidate]:
+    """Generate scored options candidates from a directional forecast.
+
+    Candidates come ONLY from the provided (live) option chain — strikes are
+    never invented. A NEUTRAL forecast or a missing/empty chain yields an
+    empty list: "no attractive options setup" is a valid result.
+    """
+    candidates: list[OptionsCandidate] = []
+
+    if direction == SignalDirection.NEUTRAL:
+        return candidates
+
+    if not option_chain:
+        return candidates
+
+    # Filter by direction: calls for bullish, puts for bearish.
+    if direction == SignalDirection.LONG:
+        relevant = [c for c in option_chain if c.get("option_type") == "CE"]
+    else:
+        relevant = [c for c in option_chain if c.get("option_type") == "PE"]
+
+    for contract in relevant:
+        score = 0.0
+        rationale: list[str] = []
+        risks: list[str] = []
+
+        strike = contract.get("strike", 0)
+        delta = contract.get("delta")
+        gamma = contract.get("gamma")
+        theta = contract.get("theta")
+        vega = contract.get("vega")
+        iv = contract.get("implied_vol")
+        oi = contract.get("open_interest")
+        volume = contract.get("volume")
+        bid = contract.get("bid")
+        ask = contract.get("ask")
+
+        bid_ask_spread: Optional[float] = None
+        if bid is not None and ask is not None and bid > 0:
+            bid_ask_spread = (ask - bid) / bid * 100
+
+        # Hard liquidity gate: untradeable contracts are REJECTED outright
+        # (not merely downscored) — "no attractive setup" is the honest result.
+        _vol = volume if volume is not None else 0
+        _oi = oi if oi is not None else 0
+        if _vol < 100 and _oi < 500:
+            continue
+        if bid_ask_spread is not None and bid_ask_spread > 20:
+            continue
+
+        # Moneyness scoring (ATM / slightly OTM preferred for directional trades)
+        moneyness = None
+        if strike and strike > 0 and spot_price and spot_price > 0:
+            moneyness = (spot_price - strike) / strike
+            if direction == SignalDirection.LONG:
+                if -0.02 <= moneyness <= 0.03:
+                    score += 25
+                    rationale.append("ATM/slightly OTM (good directional exposure)")
+                elif moneyness > 0.03:
+                    score += 15
+                else:
+                    score += 10
+            else:
+                if -0.03 <= moneyness <= 0.02:
+                    score += 25
+                    rationale.append("ATM/slightly OTM (good directional exposure)")
+                elif moneyness > 0.02:
+                    score += 15
+                else:
+                    score += 10
+
+        # Delta suitability
+        if delta is not None:
+            abs_delta = abs(delta)
+            if 0.3 <= abs_delta <= 0.6:
+                score += 20
+                rationale.append(f"Delta {delta:.2f} (good balance)")
+            elif 0.2 <= abs_delta <= 0.7:
+                score += 15
+            else:
+                score += 5
+                risks.append(f"Delta {delta:.2f} (extreme)")
+
+        # Liquidity (volume + OI)
+        if volume is not None and volume > 1000:
+            score += 15
+        elif volume is not None and volume > 100:
+            score += 10
+        else:
+            risks.append("Low liquidity")
+
+        if oi is not None and oi > 5000:
+            score += 10
+            rationale.append("High open interest")
+        elif oi is not None and oi > 500:
+            score += 5
+        elif oi is not None:
+            risks.append("Thin open interest")
+
+        # Spread quality
+        if bid_ask_spread is not None:
+            if bid_ask_spread < 5:
+                score += 10
+                rationale.append(f"Tight spread ({bid_ask_spread:.1f}%)")
+            elif bid_ask_spread < 10:
+                score += 5
+            else:
+                risks.append(f"Wide spread: {bid_ask_spread:.1f}%")
+        else:
+            risks.append("Bid/ask unavailable")
+
+        # Theta risk
+        if theta is not None and theta < -0.05:
+            risks.append("High theta decay")
+            score -= 5
+
+        # IV suitability
+        if iv is not None:
+            if iv > 0.5:
+                risks.append(f"High IV: {iv:.0%}")
+                score -= 5
+            elif iv < 0.1:
+                score -= 3
+            else:
+                score += 5
+                rationale.append(f"IV {iv:.0%} in workable range")
+
+        candidates.append(
+            OptionsCandidate(
+                strike=strike,
+                option_type=contract.get("option_type", "CE" if direction == SignalDirection.LONG else "PE"),
+                expiry=contract.get("expiry"),
+                moneyness=moneyness,
+                delta=delta,
+                gamma=gamma,
+                theta=theta,
+                vega=vega,
+                implied_vol=iv,
+                open_interest=oi,
+                volume=volume,
+                bid_ask_spread=bid_ask_spread,
+                score=min(max(score, 0), 100),
+                rationale=rationale,
+                risks=risks,
+            )
+        )
+
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates[:5]
 

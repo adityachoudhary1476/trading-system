@@ -41,6 +41,8 @@ from .models import (
     HealthEndpointResponse,
     HealthResponse,
     LifecycleRequest,
+    OrderIntentRequest,
+    OrderIntentResponse,
     PerformanceResponse,
     PositionsResponse,
     RestoreRequest,
@@ -185,6 +187,8 @@ class PaperAPIRouter:
                   frozenset({"POST"}), self._route_checkpoint)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/restore$",
                   frozenset({"POST"}), self._route_restore)
+        self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/orders$",
+                  frozenset({"POST"}), self._route_submit_order)
 
     def _add(self, pattern: str, methods: frozenset[str], handler: RouteHandler) -> None:
         self._routes.append((re.compile(pattern), methods, handler))
@@ -512,6 +516,90 @@ class PaperAPIRouter:
         session = self.center.inspect_session(sid)
         body = SessionResponse(session=session, checkpoint=cp)
         return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_submit_order(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /deployments/{id}/orders — external order-intent endpoint.
+
+        Parses and validates the request, resolves the session, then delegates
+        to ``PaperTradingControlCenter.submit_order_intent``. PaperBroker is
+        never instantiated by this layer.
+        """
+        sid, _deployment = self._require_live_session(ctx)
+        if ctx.body is None:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="request body is required",
+                status=400,
+            )
+        try:
+            req = OrderIntentRequest.model_validate(ctx.body)
+        except ValidationError as exc:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message=f"invalid order intent: {exc}",
+                status=400,
+            ) from exc
+        # Translate validated request into the domain OrderIntent.
+        from ..execution.orders import OrderIntent
+        from ..paper.control import (
+            ControlCenterError,
+        )
+        intent = OrderIntent(
+            symbol=req.symbol,
+            side=req.side,
+            quantity=req.quantity,
+            order_type=req.order_type,
+            limit_price=req.limit_price,
+            client_order_id=req.client_order_id,
+            current_price=req.current_price,
+        )
+        try:
+            result = self.center.submit_order_intent(session_id=sid, intent=intent)
+        except APIErrorException:
+            raise
+        except ControlCenterError as exc:
+            # Lifecycle / risk / short-selling rejections.
+            msg = str(exc)
+            if "not active" in msg or "is not active" in msg:
+                code = APIErrorCode.LIFECYCLE_LOCKED
+                status = 409
+            elif "risk guard" in msg:
+                code = APIErrorCode.RISK_HALTED
+                status = 409
+            elif "short selling" in msg:
+                code = APIErrorCode.SHORTING_DISABLED
+                status = 403
+            else:
+                code = APIErrorCode.ORDER_REJECTED
+                status = 400
+            raise APIErrorException(
+                code=code, message=msg, status=status,
+            ) from exc
+        body = OrderIntentResponse(
+            order_id=result.order_id,
+            client_order_id=result.client_order_id,
+            symbol=result.symbol,
+            side=result.side,
+            quantity=result.quantity,
+            order_type=result.order_type,
+            limit_price=result.limit_price,
+            status=result.status,
+            filled_quantity=result.filled_quantity,
+            avg_fill_price=result.avg_fill_price,
+            fills=result.fills,
+            cash_after=result.cash_after,
+            equity_after=result.equity_after,
+            realized_pnl_after=result.realized_pnl_after,
+            unrealized_pnl_after=result.unrealized_pnl_after,
+            position_qty_after=result.position_qty_after,
+            reject_reason=result.reject_reason,
+            idempotent=result.is_idempotent_replay,
+        )
+        # A rejected broker validation is reported as a 400; otherwise 201.
+        status_code = 201
+        if result.status in ("REJECTED",):
+            status_code = 400
+        return ResponseEnvelope(status=status_code, body=_safe_dump(body))
 
     def _route_account(self, ctx: RequestContext) -> ResponseEnvelope:
         sid, _ = self._resolve_session_id(ctx)

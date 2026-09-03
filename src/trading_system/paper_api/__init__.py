@@ -34,6 +34,8 @@ from .models import (
     ErrorResponse,
     HealthResponse,
     LifecycleRequest,
+    OrderIntentRequest,
+    OrderIntentResponse,
     RestoreRequest,
     SessionResponse,
 )
@@ -52,6 +54,8 @@ __all__ = [
     "ErrorResponse",
     "HealthResponse",
     "LifecycleRequest",
+    "OrderIntentRequest",
+    "OrderIntentResponse",
     "PaperAPIRouter",
     "RestoreRequest",
     "RouteHandler",

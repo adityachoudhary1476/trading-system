@@ -38,6 +38,8 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
   if (!ai) return null;
   const confPct = Math.round((ai.confidence ?? 0) * 100);
   const signal = ai.signal ?? "no_signal";
+  const horizon = ai.horizon ?? "short_term";
+  const evidence = ai.evidence;
   return (
     <Panel
       title="AI Market Intelligence"
@@ -66,7 +68,7 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
           <div className="conf-bar" role="progressbar" aria-valuenow={confPct} aria-valuemin={0} aria-valuemax={100}>
             <span style={{ width: `${confPct}%` }} className={ai.bias === "bearish" ? "neg" : ai.bias === "bullish" ? "pos" : "muted"} />
           </div>
-          <div className="mono" style={{ fontSize: 12, marginTop: 4 }}>{confPct}%</div>
+          <div className="mono" style={{ fontSize: 12, marginTop: 4 }}>{confPct}/100</div>
         </div>
         <div>
           <div className="faint" style={{ fontSize: 10.5, textTransform: "uppercase", letterSpacing: 0.6 }}>
@@ -77,6 +79,55 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
           </div>
         </div>
       </div>
+
+      {/* Horizon and Expected Move */}
+      <div style={{ display: "flex", gap: 16, marginTop: 12, padding: "8px 12px", background: "var(--surface-2)", borderRadius: 6 }}>
+        <div>
+          <div className="faint" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5 }}>Horizon</div>
+          <div style={{ fontSize: 13, fontWeight: 600 }}>{horizon.replace("_", " ")}</div>
+        </div>
+        {ai.expectedMove && (
+          <div>
+            <div className="faint" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5 }}>Expected Range</div>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>
+              {ai.expectedMove.lowerPct > 0 ? "+" : ""}{ai.expectedMove.lowerPct}% to {ai.expectedMove.upperPct > 0 ? "+" : ""}{ai.expectedMove.upperPct}%
+            </div>
+          </div>
+        )}
+        {ai.invalidation && (
+          <div>
+            <div className="faint" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5 }}>Invalidation</div>
+            <div style={{ fontSize: 13, fontWeight: 600 }}>{ai.invalidation}</div>
+          </div>
+        )}
+      </div>
+
+      {/* Evidence Ledger */}
+      {evidence && (
+        <div style={{ marginTop: 12, padding: "8px 12px", background: "var(--surface-2)", borderRadius: 6 }}>
+          <div className="faint" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>
+            Evidence: {evidence.agreement}
+          </div>
+          <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
+            {evidence.positive.length > 0 && (
+              <div>
+                <div style={{ fontSize: 11, color: "var(--positive)", fontWeight: 600 }}>Positive</div>
+                {evidence.positive.map((e, i) => (
+                  <div key={i} style={{ fontSize: 11, color: "var(--text-dim)" }}>• {e}</div>
+                ))}
+              </div>
+            )}
+            {evidence.negative.length > 0 && (
+              <div>
+                <div style={{ fontSize: 11, color: "var(--negative)", fontWeight: 600 }}>Negative</div>
+                {evidence.negative.map((e, i) => (
+                  <div key={i} style={{ fontSize: 11, color: "var(--text-dim)" }}>• {e}</div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="factors">
         {ai.factors.map((f) => (
@@ -91,8 +142,8 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
 
       <div className="ai-summary">{ai.summary}</div>
       <p className="faint" style={{ fontSize: 11, marginBottom: 0, marginTop: 12 }}>
-        Mock AI output ({ai.model}). Analysis computed on <b>closed candles</b>, not every tick — matching the
-        backend architecture. Ready to be populated by the real MarketView/Snapshot contract.
+        AI-generated analytical output ({ai.model}). Confidence is analytical (0-100), NOT a probability of profit.
+        Analysis computed on <b>closed candles</b>, not every tick.
       </p>
     </Panel>
   );

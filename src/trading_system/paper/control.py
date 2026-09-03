@@ -47,6 +47,14 @@ from typing import Any, Iterable, Optional
 from sqlalchemy import create_engine
 
 from ..execution.paper_broker import PaperBroker
+from ..execution.broker import BrokerError
+from ..execution.orders import (
+    Order,
+    OrderIntent,
+    OrderResult,
+    OrderStatus,
+    Side,
+)
 from ..research.evidence import (
     EvidenceStore,
     EvidenceType,
@@ -97,7 +105,7 @@ from .report import (
     PaperTradingReport,
     build_operations_report,
 )
-from .risk import PaperRiskGuard
+from .risk import PaperRiskConfig, PaperRiskGuard, RiskDecision
 from .runner import PaperStrategyRunner, SignalType
 from .session import (
     PaperSession,
@@ -135,6 +143,11 @@ class PaperBrokerRequiredError(ControlCenterError):
 
 class NotPaperModeError(ControlCenterError):
     """Raised when the underlying deployment's execution_mode is not paper."""
+
+
+# Deployment statuses in which the control center accepts external
+# (agent-driven) order intents. Only ACTIVE deployments are tradable.
+STATUS_ACCEPTS_ORDERS: frozenset = frozenset({PaperDeploymentStatus.ACTIVE})
 
 
 # --------------------------------------------------------------------------- #
@@ -823,6 +836,273 @@ class PaperTradingControlCenter:
         if runner is None or runner.circuit_breaker is None:
             raise ControlCenterError("no live runner or circuit breaker attached")
         runner.circuit_breaker.reset()
+
+    # ------------------------------------------------------------------ #
+    # External order-intent (Day-13 autonomous-agent boundary)
+    # ------------------------------------------------------------------ #\n
+    def submit_order_intent(
+        self,
+        session_id: str,
+        intent: OrderIntent,
+    ) -> OrderResult:
+        """Submit a single external order intent through the full safety stack.
+
+        Flow:
+            lifecycle check → circuit breaker → risk guard → short-selling
+            check → idempotency → broker.submit_order → fill → accounting
+            → event log.
+
+        The caller must supply a ``session_id`` that maps to a live, ACTIVE
+        runner attached to this control center. PaperBroker is never
+        instantiated by external callers.
+
+        ``client_order_id`` provides idempotency: when it is set, a retry with
+        the same key returns the previously persisted result instead of
+        creating a duplicate order/fill.
+        """
+        runner = self._runners.get(session_id)
+        if runner is None:
+            raise UnknownDeploymentError(session_id)
+
+        deployment = runner.deployment
+
+        # --- 1. Lifecycle: only ACTIVE deployments accept external orders ---
+        if deployment.status not in STATUS_ACCEPTS_ORDERS:
+            self._emit_external_event(
+                runner, "order_intent_rejected",
+                symbol=intent.symbol, client_order_id=intent.client_order_id,
+                reason=f"deployment_status_{deployment.status.value}",
+            )
+            raise ControlCenterError(
+                f"deployment {deployment.deployment_id} is not active "
+                f"(status={deployment.status.value}); orders are not accepted"
+            )
+
+        # --- 2. Circuit breaker: OPEN means halt ---
+        cb = runner.circuit_breaker
+        if cb is not None and cb.is_open:
+            self._emit_external_event(
+                runner, "order_intent_rejected",
+                symbol=intent.symbol, client_order_id=intent.client_order_id,
+                reason=f"circuit_breaker_open:{cb.reason}",
+            )
+            raise ControlCenterError(
+                f"circuit breaker is open for deployment {deployment.deployment_id}; "
+                f"reason={cb.reason}"
+            )
+
+        # --- 3. Risk guard ---
+        risk = runner._risk_guard
+        if risk is not None:
+            account = runner.broker.account()
+            position = runner.broker.get_position(intent.symbol)
+            decision, reason = risk.check(
+                max_drawdown=runner._max_drawdown,
+                equity=account.equity,
+                position=position,
+                rejected_orders=runner._rejected_orders,
+                consecutive_errors=runner._consecutive_errors,
+            )
+            if decision == RiskDecision.HALT:
+                self._emit_external_event(
+                    runner, "order_intent_rejected",
+                    symbol=intent.symbol, client_order_id=intent.client_order_id,
+                    reason=f"risk_halt:{reason}",
+                )
+                raise ControlCenterError(
+                    f"risk guard halted; reason={reason}"
+                )
+
+        # --- 4. Short-selling policy ---
+        if intent.side == Side.SELL and not deployment.config.allow_short:
+            pos = runner.broker.get_position(intent.symbol)
+            pos_qty = pos.qty if pos is not None else 0.0
+            # A SELL that would create a short position is rejected.
+            if intent.quantity > pos_qty:
+                self._emit_external_event(
+                    runner, "order_intent_rejected",
+                    symbol=intent.symbol, client_order_id=intent.client_order_id,
+                    side=intent.side.value, quantity=intent.quantity,
+                    position_qty=pos_qty, reason="shorting_disabled",
+                )
+                raise ControlCenterError(
+                    f"short selling is disabled for deployment {deployment.deployment_id}; "
+                    f"SELL {intent.quantity} exceeds long position {pos_qty}"
+                )
+
+        # --- 5. Idempotency: client_order_id → persisted result ---
+        if intent.client_order_id is not None:
+            persisted = self.session_store.get_order(
+                session_id=session_id,
+                client_order_id=intent.client_order_id,
+            )
+            # If we previously recorded a result, return it (retry-safe).
+            # We re-read from the broker to surface current state, but the
+            # order/fill was already executed — we must NOT re-execute.
+            if persisted is not None and persisted.result_json:
+                import json
+                cached = json.loads(persisted.result_json)
+                return OrderResult(
+                    order_id=cached["order_id"],
+                    client_order_id=cached.get("client_order_id"),
+                    symbol=cached["symbol"],
+                    side=cached["side"],
+                    quantity=cached["quantity"],
+                    order_type=cached["order_type"],
+                    limit_price=cached.get("limit_price"),
+                    status=cached["status"],
+                    filled_quantity=cached["filled_quantity"],
+                    avg_fill_price=cached["avg_fill_price"],
+                    fills=cached["fills"],
+                    cash_after=cached.get("cash_after"),
+                    equity_after=cached.get("equity_after"),
+                    realized_pnl_after=cached.get("realized_pnl_after"),
+                    unrealized_pnl_after=cached.get("unrealized_pnl_after"),
+                    position_qty_after=cached.get("position_qty_after"),
+                    reject_reason=cached.get("reject_reason", ""),
+                    is_idempotent_replay=True,
+                )
+
+        # --- 6. Validate inputs against broker rules ---
+        broker = runner.broker
+        # Pre-validate: broker.submit_order raises BrokerError on bad input.
+        try:
+            order = broker.submit_order(
+                symbol=intent.symbol,
+                side=intent.side,
+                quantity=intent.quantity,
+                order_type=intent.order_type,
+                limit_price=intent.limit_price,
+                current_price=intent.current_price,
+            )
+        except BrokerError as exc:
+            result = OrderResult(
+                order_id="",
+                client_order_id=intent.client_order_id,
+                symbol=intent.symbol,
+                side=intent.side.value,
+                quantity=intent.quantity,
+                order_type=intent.order_type.value,
+                limit_price=intent.limit_price,
+                status=OrderStatus.REJECTED.value,
+                filled_quantity=0.0,
+                avg_fill_price=0.0,
+                fills=[],
+                cash_after=None,
+                equity_after=None,
+                realized_pnl_after=None,
+                unrealized_pnl_after=None,
+                position_qty_after=None,
+                reject_reason=str(exc),
+            )
+            self._emit_external_event(
+                runner, "order_intent_rejected",
+                symbol=intent.symbol, client_order_id=intent.client_order_id,
+                reason=str(exc),
+            )
+            self._persist_order(
+                session_id=session_id, intent=intent,
+                order=order, result=result,
+            )
+            return result
+
+        # --- 7. Build result from the fill ---
+        account = broker.account()
+        pos = broker.get_position(intent.symbol)
+        fills_json = [
+            {
+                "fill_id": f.fill_id,
+                "symbol": f.symbol,
+                "side": f.side.value,
+                "quantity": float(f.quantity),
+                "price": float(f.price),
+                "fee": float(f.fee),
+            }
+            for f in order.fills
+        ]
+        result = OrderResult(
+            order_id=order.order_id,
+            client_order_id=intent.client_order_id,
+            symbol=intent.symbol,
+            side=intent.side.value,
+            quantity=order.quantity,
+            order_type=order.order_type.value,
+            limit_price=order.limit_price,
+            status=order.status.value,
+            filled_quantity=order.filled_quantity,
+            avg_fill_price=order.avg_fill_price,
+            fills=fills_json,
+            cash_after=float(account.cash),
+            equity_after=float(account.equity),
+            realized_pnl_after=float(account.realized_pnl),
+            unrealized_pnl_after=float(account.unrealized_pnl),
+            position_qty_after=(pos.qty if pos is not None else 0.0),
+        )
+
+        # --- 8. Event log ---
+        self._emit_external_event(
+            runner, "order_intent_executed",
+            symbol=intent.symbol, client_order_id=intent.client_order_id,
+            order_id=order.order_id, side=intent.side.value,
+            quantity=intent.quantity, status=order.status.value,
+            fill_count=len(order.fills),
+        )
+
+        # --- 9. Persist idempotency record ---
+        self._persist_order(session_id=session_id, intent=intent,
+                            order=order, result=result)
+        return result
+
+    def _persist_order(self, session_id: str, intent: OrderIntent, order: Order, result: OrderResult) -> None:
+        """Persist the idempotency mapping for this order intent."""
+        if intent.client_order_id is None:
+            return
+        result_dict = {
+            "order_id": result.order_id,
+            "client_order_id": result.client_order_id,
+            "symbol": result.symbol,
+            "side": result.side,
+            "quantity": result.quantity,
+            "order_type": result.order_type,
+            "limit_price": result.limit_price,
+            "status": result.status,
+            "filled_quantity": result.filled_quantity,
+            "avg_fill_price": result.avg_fill_price,
+            "fills": result.fills,
+            "cash_after": result.cash_after,
+            "equity_after": result.equity_after,
+            "realized_pnl_after": result.realized_pnl_after,
+            "unrealized_pnl_after": result.unrealized_pnl_after,
+            "position_qty_after": result.position_qty_after,
+            "reject_reason": result.reject_reason,
+        }
+        self.session_store.record_order(
+            session_id=session_id,
+            client_order_id=intent.client_order_id,
+            order_id=result.order_id or order.order_id,
+            status=result.status,
+            result_json=result_dict,
+        )
+
+    def _emit_external_event(self, runner, event_type: str, **payload) -> None:
+        """Record an external-order-event into the runner's event log if present."""
+        if runner.event_log is None:
+            return
+        from .events import PaperOperationEventType
+        # Map our descriptive event type to the closest existing event type.
+        type_map = {
+            "order_intent_rejected": PaperOperationEventType.ORDER_REJECTED,
+            "order_intent_executed": PaperOperationEventType.ORDER_FILLED,
+        }
+        op_type = type_map.get(event_type)
+        if op_type is None:
+            return
+        runner.event_log.record(
+            op_type,
+            _now_iso(),
+            event_type,
+            payload,
+        )
 
     # ------------------------------------------------------------------ #
     # Internals

@@ -15,6 +15,8 @@ from __future__ import annotations
 from .orders import (
     Fill,
     Order,
+    OrderIntent,
+    OrderResult,
     OrderStatus,
     OrderType,
     Side,
@@ -32,6 +34,8 @@ from .paper_broker import (
 __all__ = [
     "Fill",
     "Order",
+    "OrderIntent",
+    "OrderResult",
     "OrderStatus",
     "OrderType",
     "Side",

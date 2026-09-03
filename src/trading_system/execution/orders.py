@@ -158,3 +158,53 @@ class OrderStateMachine:
     @staticmethod
     def terminal_states() -> set[OrderStatus]:
         return {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED}
+
+
+# --------------------------------------------------------------------------- #
+# External order-intent types (Day-13 autonomous-agent boundary)
+# --------------------------------------------------------------------------- #
+@dataclass
+class OrderIntent:
+    """A single, explicit order request from an autonomous agent.
+
+    This is the ONLY type the external order-intent API accepts. It is
+    intentionally explicit: every field is documented and validated by the
+    control center before reaching the broker. No arbitrary kwargs.
+    """
+
+    symbol: str
+    side: Side
+    quantity: float
+    order_type: OrderType = OrderType.MARKET
+    limit_price: Optional[float] = None
+    client_order_id: Optional[str] = None   # idempotency key
+    current_price: Optional[float] = None   # reference price for MARKET fills
+
+
+@dataclass
+class OrderResult:
+    """Structured result returned to the caller after order-intent execution.
+
+    Mirrors the broker's Order + fills but is JSON-safe (no datetime, no
+    broker internals). The ``client_order_id`` echoes the request's idempotency
+    key so the agent can correlate retries.
+    """
+
+    order_id: str
+    client_order_id: Optional[str]
+    symbol: str
+    side: str
+    quantity: float
+    order_type: str
+    limit_price: Optional[float]
+    status: str
+    filled_quantity: float
+    avg_fill_price: float
+    fills: list[dict]
+    cash_after: Optional[float]
+    equity_after: Optional[float]
+    realized_pnl_after: Optional[float]
+    unrealized_pnl_after: Optional[float]
+    position_qty_after: Optional[float]
+    reject_reason: str = ""
+    is_idempotent_replay: bool = False

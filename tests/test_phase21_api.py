@@ -940,12 +940,20 @@ class TestStaticSafety:
                     assert (node.module or "") not in ("pickle", "marshal", "shelve")
 
     def test_no_credential_related_dispatch_methods(self, router):
-        # No endpoint should be named /orders, /buy, /sell, /execute.
+        # No endpoint should be named /buy, /sell, /execute, or
+        # /positions/close — these look like live-broker order paths.
+        # /orders is allowed only under /deployments/{id}/orders (paper
+        # order-intent path that goes through the control center, not a
+        # direct broker call).
         for pattern, _methods in router.routes():
-            for forbidden in ("/orders", "/buy", "/sell", "/execute",
+            for forbidden in ("/buy", "/sell", "/execute",
                               "/positions/close"):
                 assert forbidden not in pattern, \
                     f"forbidden order path: {pattern}"
+            # /orders is OK only as a sub-path of /deployments.
+            if "/orders" in pattern:
+                assert "/deployments/" in pattern, \
+                    f"/orders must be under /deployments: {pattern}"
 
 
 # --------------------------------------------------------------------------- #

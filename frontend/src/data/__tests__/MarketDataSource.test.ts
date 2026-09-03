@@ -116,6 +116,30 @@ describe("ApiMarketDataSource", () => {
     expect(result.connected).toBe(true);
   });
 
+  it("getMarketStatus calls /api/market/status", async () => {
+    mockGetSession.mockResolvedValue({
+      data: { session: { access_token: "test-token" } },
+      error: null,
+    });
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({
+        market: "NSE",
+        phase: "regular",
+        serverTime: 1700000000000,
+        nextOpen: null,
+        nextClose: null,
+      }),
+    });
+    await source.getMarketStatus();
+    expect(fetch).toHaveBeenCalledWith(
+      "/api/market/status",
+      expect.any(Object),
+    );
+  });
+
   it("throws on non-ok response", async () => {
     mockGetSession.mockResolvedValue({
       data: { session: { access_token: "test-token" } },

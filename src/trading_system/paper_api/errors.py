@@ -42,6 +42,11 @@ class APIErrorCode(str, Enum):
     SCHEMA_MISMATCH = "schema_mismatch"
     CORRUPTED_PERSISTED_STATE = "corrupted_persisted_state"
     PAPER_BROKER_REQUIRED = "paper_broker_required"
+    # Day-13: external order-intent path
+    LIFECYCLE_LOCKED = "lifecycle_locked"
+    RISK_HALTED = "risk_halted"
+    SHORTING_DISABLED = "shorting_disabled"
+    ORDER_REJECTED = "order_rejected"
 
 
 # Map domain exceptions to API error codes / HTTP status codes.

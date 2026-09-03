@@ -11,6 +11,8 @@ import type {
   ExportResponse,
   HealthEndpointResponse,
   HealthResponse,
+  OrderIntentResponse,
+  PaperOrderIntent,
   PerformanceResponse,
   PositionsResponse,
   RiskResponse,
@@ -218,5 +220,11 @@ export const paperApi = {
   stop: (deploymentId: string) =>
     post<DeploymentResponse>(
       `/deployments/${encodeURIComponent(deploymentId)}/stop`,
+    ),
+
+  submitOrder: (deploymentId: string, order: PaperOrderIntent) =>
+    post<OrderIntentResponse>(
+      `/deployments/${encodeURIComponent(deploymentId)}/orders`,
+      order,
     ),
 };

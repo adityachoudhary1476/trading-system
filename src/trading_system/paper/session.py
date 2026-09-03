@@ -450,6 +450,28 @@ class PaperSessionRecord(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class PaperOrderRecord(Base):
+    """Phase 20 — persisted external order-intent idempotency record.
+
+    Maps a caller-supplied ``client_order_id`` (scoped to a session) to the
+    internal ``order_id`` that was created (or would have been created).
+    This is the durable idempotency key for the order-intent path: a retry
+    with the same ``client_order_id`` within the same deployment returns the
+    original order instead of creating a duplicate.
+
+    Only paper-only data is stored — no credentials, no live broker state.
+    """
+
+    __tablename__ = "paper_orders"
+
+    session_id = Column(String(64), primary_key=True)
+    client_order_id = Column(String(128), primary_key=True)
+    order_id = Column(String(64), nullable=False, unique=True)
+    status = Column(String(16), nullable=False)
+    result_json = Column(Text, nullable=False, default="{}")
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class SessionSchemaError(RuntimeError):
     """Raised when a persisted session is incompatible with the current schema.
 
@@ -523,6 +545,44 @@ class PaperSessionStore:
                 q = q.where(PaperSessionRecord.session_status == status)
             recs = s.execute(q.order_by(PaperSessionRecord.updated_at.asc())).scalars().all()
             return [self._from_record(r) for r in recs]
+
+    # -- order-intent idempotency (durable) ------------------------------------
+    def record_order(
+        self, *, session_id: str, client_order_id: str,
+        order_id: str, status: str, result_json: dict,
+    ) -> PaperOrderRecord:
+        """Persist an idempotency mapping for an external order intent.
+
+        Idempotent: re-recording the same (session_id, client_order_id) with
+        the SAME order_id is a no-op. A different order_id for the same
+        (session_id, client_order_id) raises ``SessionIdentityError``
+        (fail-closed: a client_order_id must always map to the same order).
+        """
+        with self._Session() as s:
+            existing = s.get(PaperOrderRecord, (session_id, client_order_id))
+            if existing is not None:
+                if existing.order_id != order_id:
+                    raise SessionIdentityError(
+                        f"client_order_id {client_order_id!r} already mapped to "
+                        f"order {existing.order_id!r} (retry collision)"
+                    )
+                return existing
+            rec = PaperOrderRecord(
+                session_id=session_id,
+                client_order_id=client_order_id,
+                order_id=order_id,
+                status=status,
+                result_json=json.dumps(result_json, default=str, sort_keys=True),
+                created_at=_parse_dt(_now_iso()),
+            )
+            s.add(rec)
+            s.commit()
+            return rec
+
+    def get_order(self, session_id: str, client_order_id: str) -> Optional[PaperOrderRecord]:
+        """Return the persisted order-intent record for a given idempotency key."""
+        with self._Session() as s:
+            return s.get(PaperOrderRecord, (session_id, client_order_id))
 
     # -- validation ----------------------------------------------------------
     def validate_for_restore(

@@ -325,6 +325,47 @@ export interface ExportResponse {
   report?: Record<string, unknown>;
 }
 
+export interface PaperOrderIntent {
+  symbol: string;
+  side: "BUY" | "SELL";
+  quantity: number;
+  order_type?: "MARKET" | "LIMIT";
+  limit_price?: number;
+  client_order_id?: string;
+  current_price?: number;
+}
+
+export interface OrderIntentFill {
+  fill_id: string;
+  symbol: string;
+  side: string;
+  quantity: number;
+  price: number;
+  fee: number;
+}
+
+export interface OrderIntentResponse {
+  order_id: string;
+  client_order_id: string | null;
+  symbol: string;
+  side: string;
+  quantity: number;
+  order_type: string;
+  limit_price: number | null;
+  status: string;
+  filled_quantity: number;
+  avg_fill_price: number;
+  fills: OrderIntentFill[];
+  cash_after: number | null;
+  equity_after: number | null;
+  realized_pnl_after: number | null;
+  unrealized_pnl_after: number | null;
+  position_qty_after: number | null;
+  reject_reason: string;
+  idempotent: boolean;
+  schema_version: number;
+}
+
 export interface ApiError {
   code: string;
   message: string;
