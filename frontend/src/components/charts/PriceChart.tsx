@@ -73,7 +73,25 @@ export function PriceChart({
       layout: { background: { color: "white" }, textColor: "#9aa7b8", fontFamily: "Inter, system-ui, sans-serif", fontSize: 11 },
       grid: { vertLines: { color: "rgba(31,38,51,0.45)" }, horzLines: { color: "rgba(31,38,51,0.45)" } },
       rightPriceScale: { borderColor: "#1f2633" },
-      timeScale: { borderColor: "#1f2633", timeVisible: true, secondsVisible: false },
+      // lightweight-charts v4 has no built-in `timezone` prop, so we
+      // leave the time axis in UTC epoch seconds and override the
+      // tick label formatter to render in Asia/Kolkata.  This keeps a
+      // 09:15 IST open from appearing at 03:45 (UTC-5) or 22:45
+      // (UTC+7) for users in other timezones.
+      timeScale: {
+        borderColor: "#1f2633",
+        timeVisible: true,
+        secondsVisible: false,
+        tickMarkFormatter: (time: number) => {
+          const d = new Date(time * 1000);
+          return new Intl.DateTimeFormat("en-GB", {
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+            timeZone: "Asia/Kolkata",
+          }).format(d);
+        },
+      },
       crosshair: { mode: 1, vertLine: { color: "#3a4658", width: 1, style: 3, labelBackgroundColor: "#222b3a" }, horzLine: { color: "#3a4658", width: 1, style: 3, labelBackgroundColor: "#222b3a" } },
     });
     const candle = chart.addSeries(CandlestickSeries, {

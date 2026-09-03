@@ -74,6 +74,21 @@ export interface AIAnalysis {
   }[];
   generatedAt: number; // epoch ms
   model: string;
+  // New intelligence fields
+  horizon?: "intraday" | "short_term" | "swing";
+  expectedMove?: {
+    lowerPct: number;
+    upperPct: number;
+    basis: "atr" | "volatility";
+  };
+  evidence?: {
+    positive: string[];
+    negative: string[];
+    neutral: string[];
+    agreement: "strong" | "moderate" | "mixed" | "neutral";
+  };
+  invalidation?: string;
+  instrumentClass?: "equity" | "index" | "future" | "option_ce" | "option_pe";
 }
 
 /** A trading signal (analytical only — NEVER execution).
@@ -128,9 +143,10 @@ export interface PipelineStage {
 /** Market status summary. */
 export interface MarketStatus {
   market: string; // "NSE"
-  session: "PRE_MARKET" | "REGULAR" | "POST_MARKET" | "CLOSED";
-  hours: string; // "09:15 — 15:30 IST"
-  open: boolean;
+  phase: "pre_market" | "regular" | "post_market" | "closed" | "holiday";
+  serverTime: number; // epoch ms (UTC)
+  nextOpen: number | null; // epoch ms (UTC)
+  nextClose: number | null; // epoch ms (UTC)
 }
 
 /** App-wide runtime environment (exposed to UI; never secrets). */

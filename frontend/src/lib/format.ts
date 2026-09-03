@@ -1,4 +1,12 @@
 // Formatting helpers (Indian number formatting, signed values, time).
+//
+// All time formatters render in Asia/Kolkata (IST) by default.  The
+// previous version used `toLocaleString` without a `timeZone` option,
+// which silently rendered in the *host browser's* local timezone —
+// a US user would see a 13:30 IST quote as "00:00" and conclude the
+// data was 13 h stale when in fact it was live.
+
+const IST = "Asia/Kolkata";
 
 /**
  * Returns true when `v` is a finite number suitable for numeric formatting.
@@ -42,14 +50,22 @@ export function fmtVolume(v: number | null | undefined): string {
   return fmtNum(Math.round(v));
 }
 
-/** epoch ms -> HH:MM:SS */
+/** epoch ms -> HH:MM:SS in IST (Asia/Kolkata). */
 export function fmtTime(ms: number | null): string {
   if (ms == null) return "—";
   const d = new Date(ms);
-  return d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return d.toLocaleTimeString("en-IN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: IST,
+  });
 }
 
-/** epoch ms -> "12s ago" / "5m ago" / "2h ago" */
+/** alias of fmtTime — explicit "render in IST" naming. */
+export const fmtTimeIST = fmtTime;
+
+/** epoch ms -> "12s ago" / "5m ago" / "2h ago" in IST-aware now. */
 export function fmtAgo(ms: number | null): string {
   if (ms == null) return "—";
   const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
@@ -61,14 +77,18 @@ export function fmtAgo(ms: number | null): string {
   return `${Math.round(h / 24)}d ago`;
 }
 
-/** epoch ms -> HH:MM */
+/** epoch ms -> HH:MM in IST. */
 export function fmtHM(ms: number | null): string {
   if (ms == null) return "—";
   const d = new Date(ms);
-  return d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleTimeString("en-IN", {
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: IST,
+  });
 }
 
-/** epoch ms -> DD MMM HH:MM */
+/** epoch ms -> "DD MMM HH:MM" in IST. */
 export function fmtDateTime(ms: number | null): string {
   if (ms == null) return "—";
   const d = new Date(ms);
@@ -77,5 +97,6 @@ export function fmtDateTime(ms: number | null): string {
     month: "short",
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: IST,
   });
 }

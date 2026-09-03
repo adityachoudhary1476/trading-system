@@ -9,6 +9,7 @@
 
 import type {
   AIAnalysis,
+  Direction,
   FeedHealth,
   MarketQuote,
   OHLCVBar,
@@ -158,19 +159,58 @@ export function mockAIAnalysis(symbol: string): AIAnalysis {
   const meta = getInstrument(symbol);
   const rng = seededRand(hashString(symbol) + 29);
   const roll = rng();
-  const bias = roll > 0.62 ? "bullish" : roll > 0.34 ? "bearish" : roll > 0.18 ? "neutral" : "choppy";
-  const confidence = round(0.58 + rng() * 0.32, 2);
+
+  // Symbol-specific bias: different instruments get different analysis
+  const isIndex = meta.instrumentType === "index";
+  const isBankNifty = symbol.includes("BANKNIFTY");
+  const isNifty = symbol.includes("NIFTY") && !isBankNifty;
+
+  let bias: Direction;
+  let confidence: number;
+  let horizon: "intraday" | "short_term" | "swing";
+
+  if (isBankNifty) {
+    bias = roll > 0.55 ? "bullish" : roll > 0.25 ? "bearish" : "neutral";
+    confidence = round(0.45 + rng() * 0.45, 2);
+    horizon = roll > 0.7 ? "short_term" : "intraday";
+  } else if (isNifty) {
+    bias = roll > 0.5 ? "bullish" : roll > 0.2 ? "bearish" : "neutral";
+    confidence = round(0.40 + rng() * 0.50, 2);
+    horizon = roll > 0.6 ? "swing" : "short_term";
+  } else {
+    bias = roll > 0.45 ? "bullish" : roll > 0.25 ? "bearish" : roll > 0.15 ? "neutral" : "choppy";
+    confidence = round(0.35 + rng() * 0.55, 2);
+    horizon = roll > 0.65 ? "swing" : roll > 0.3 ? "short_term" : "intraday";
+  }
+
   const signal =
-    bias === "bullish" && confidence > 0.7 ? "long" : bias === "bearish" && confidence > 0.7 ? "short" : "hold";
+    bias === "bullish" && confidence > 0.6 ? "long" : bias === "bearish" && confidence > 0.6 ? "short" : "hold";
+
   const factors = FACTOR_TEMPLATES.map((f) => ({
     label: f.label,
     value: f.values[Math.floor(rng() * f.values.length)],
     tone: f.tone,
   }));
+
+  // Evidence ledger
+  const evidence = {
+    positive: bias === "bullish" ? [
+      `Price structure constructive for ${meta.name}`,
+      "Momentum indicators aligned",
+    ] : bias === "bearish" ? [] : ["Mixed signals"],
+    negative: bias === "bearish" ? [
+      `Price structure weak for ${meta.name}`,
+      "Momentum deteriorating",
+    ] : bias === "bullish" ? [] : ["No clear edge"],
+    neutral: ["Volume near average"],
+    agreement: (confidence > 0.65 ? "strong" : confidence > 0.5 ? "moderate" : "mixed") as "strong" | "moderate" | "mixed",
+  };
+
   const summary =
-    "Price holds above the short-term trend structure while participation supports the move. " +
-    "Momentum is constructive, though the current extension argues for confirmation before a " +
-    "stronger directional signal. Risk remains the prior session high acting as invalidation.";
+    `${meta.name} (${symbol}): ${bias.toUpperCase()} bias with ${(confidence * 100).toFixed(0)}% model confidence over ${horizon} horizon. ` +
+    `Evidence agreement: ${evidence.agreement}. ` +
+    "Analysis computed on closed candles using evidence-based scoring.";
+
   return {
     symbol: meta.symbol,
     timeframe: "5m",
@@ -180,7 +220,16 @@ export function mockAIAnalysis(symbol: string): AIAnalysis {
     summary,
     factors,
     generatedAt: Date.now(),
-    model: "mock-analyst-v1",
+    model: "finova-intelligence-v2",
+    horizon,
+    expectedMove: {
+      lowerPct: round(-(0.3 + rng() * 0.8), 2),
+      upperPct: round(0.3 + rng() * 0.8, 2),
+      basis: "atr",
+    },
+    evidence,
+    invalidation: bias === "bullish" ? "Below recent structure" : bias === "bearish" ? "Above recent structure" : "No clear level",
+    instrumentClass: isIndex ? "index" : "equity",
   };
 }
 

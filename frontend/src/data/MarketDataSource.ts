@@ -6,6 +6,7 @@ import type {
   AIAnalysis,
   FeedHealth,
   MarketQuote,
+  MarketStatus,
   OHLCVBar,
   PipelineStage,
   Signal,
@@ -22,6 +23,13 @@ export interface MarketDataSource {
   getSignals(limit?: number): Promise<Signal[]>;
   getFeedHealth(): Promise<FeedHealth>;
   getPipeline(): Promise<PipelineStage[]>;
+  /**
+   * Authoritative Indian market session status.
+   * Returns the server-computed phase (pre_market / regular /
+   * post_market / closed / holiday) plus server clock and next
+   * session boundaries.  May throw on network failure.
+   */
+  getMarketStatus(): Promise<MarketStatus>;
 }
 
 /**
@@ -46,6 +54,28 @@ export class MockMarketDataSource implements MarketDataSource {
   }
   async getPipeline() {
     return mock.mockPipeline();
+  }
+  async getMarketStatus() {
+    // Mock data source: derive a phase from the local browser clock.
+    const now = new Date();
+    const ist = new Date(now.getTime() + (5.5 - -now.getTimezoneOffset() / 60) * 3600_000);
+    const day = ist.getUTCDay();
+    const mins = ist.getUTCHours() * 60 + ist.getUTCMinutes();
+    let phase: "pre_market" | "regular" | "post_market" | "closed" | "holiday" = "closed";
+    if (day >= 1 && day <= 5) {
+      if (mins < 9 * 60) phase = "closed";
+      else if (mins < 9 * 60 + 15) phase = "pre_market";
+      else if (mins <= 15 * 60 + 30) phase = "regular";
+      else if (mins < 16 * 60) phase = "post_market";
+      else phase = "closed";
+    }
+    return {
+      market: "NSE",
+      phase,
+      serverTime: Date.now(),
+      nextOpen: null,
+      nextClose: null,
+    } as MarketStatus;
   }
 }
 
@@ -204,6 +234,10 @@ export class ApiMarketDataSource implements MarketDataSource {
 
   async getPipeline(): Promise<PipelineStage[]> {
     return this.fetchJson<PipelineStage[]>("/api/market/pipeline");
+  }
+
+  async getMarketStatus(): Promise<MarketStatus> {
+    return this.fetchJson<MarketStatus>("/api/market/status");
   }
 }
 

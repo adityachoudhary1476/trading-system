@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { render, screen, waitFor, cleanup } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 // --- Mock the data source ---
@@ -12,6 +12,7 @@ vi.mock("@/data/MarketDataSource", () => ({
     getSignals: vi.fn(),
     getFeedHealth: vi.fn(),
     getPipeline: vi.fn(),
+    getMarketStatus: vi.fn(),
   },
 }));
 
@@ -34,13 +35,37 @@ vi.mock("@/store/AppContext", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { dataSource } = await import("@/data/MarketDataSource");
+const { marketDataStore } = await import("@/data/marketDataStore");
 const ds = dataSource as unknown as {
   getQuote: ReturnType<typeof vi.fn>;
   getFeedHealth: ReturnType<typeof vi.fn>;
   getOHLCV: ReturnType<typeof vi.fn>;
   getAIAnalysis: ReturnType<typeof vi.fn>;
   getSignals: ReturnType<typeof vi.fn>;
+  getMarketStatus: ReturnType<typeof vi.fn>;
 };
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // The marketDataStore is a module-level singleton; tests that mount
+  // components that subscribe to it would otherwise leak state across
+  // tests.  Reset before each test.
+  marketDataStore.__resetForTests();
+  // Default getMarketStatus to a regular session so subscriptions
+  // never throw.
+  ds.getMarketStatus.mockResolvedValue({
+    market: "NSE",
+    phase: "regular",
+    serverTime: Date.now(),
+    nextOpen: null,
+    nextClose: null,
+  });
+});
+
+afterEach(() => {
+  cleanup();
+  marketDataStore.stop();
+});
 
 describe("DataHealthPanel — defensive rendering", () => {
   let DataHealthPanel: any;

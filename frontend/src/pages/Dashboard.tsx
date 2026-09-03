@@ -9,6 +9,69 @@ import { DataHealthPanel } from "@/components/system/DataHealthPanel";
 import { MarketStatusPanel } from "@/components/layout/MarketStatusPanel";
 import { TickerStrip } from "@/components/market/TickerStrip";
 import { Panel, Loading } from "@/components/ui";
+import { useQuote } from "@/data/useQuote";
+import { useMarketStatus } from "@/data/useQuote";
+import { fmtTimeIST } from "@/lib/format";
+
+// Bar size (ms) by timeframe, used to merge the live tick into the
+// in-progress candle.  Values are aligned with the historical candle
+// window the backend uses.
+const TF_BAR_MS: Record<string, number> = {
+  "1m": 60_000,
+  "1D": 24 * 60 * 60_000,
+  "1W": 7 * 24 * 60 * 60_000,
+  "1M": 30 * 24 * 60 * 60_000,
+};
+
+// India Standard Time is UTC+5:30. Upstox timestamps NSE candles at
+// 00:00 local (IST), which in epoch-ms UTC is 18:30 of the *previous*
+// calendar day. A naive Math.floor(ts / barMs) therefore maps a daily
+// candle and a live tick on the same trading day onto different UTC
+// calendar days, causing a phantom bar to be appended every second
+// instead of updating the in-progress candle. We shift by the IST offset
+// before flooring and shift back so boundaries align to local-midnight.
+export const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+/**
+ * Merge a live tick into the in-progress bar.  If the tick is for a
+ * bar in the future or a bar older than the last historical one, the
+ * array is left untouched.  This is what makes the chart look "live"
+ * without an extra fetch per second.
+ */
+export function mergeLiveTick(bars: OHLCVBar[] | null, price: number, ts: number, barMs: number): OHLCVBar[] | null {
+  if (!bars || !Number.isFinite(price) || price <= 0 || !Number.isFinite(ts) || ts <= 0 || !barMs) {
+    return bars;
+  }
+  const last = bars[bars.length - 1];
+  if (!last) return bars;
+  const lastStart = floorToBar(last.time, barMs);
+  const tickStart = floorToBar(ts, barMs);
+  if (tickStart < lastStart) return bars;
+  if (tickStart === lastStart) {
+    const updated: OHLCVBar = {
+      ...last,
+      close: price,
+      high: Math.max(last.high, price),
+      low: Math.min(last.low, price),
+    };
+    return [...bars.slice(0, -1), updated];
+  }
+  // Tick is for a brand new (in-progress) bar beyond the historicals.
+  // Append it so the chart can show the open of the next bar.
+  const next: OHLCVBar = {
+    time: tickStart,
+    open: price,
+    high: price,
+    low: price,
+    close: price,
+    volume: 0,
+  };
+  return [...bars, next];
+}
+
+export function floorToBar(ts: number, barMs: number): number {
+  return Math.floor((ts + IST_OFFSET_MS) / barMs) * barMs - IST_OFFSET_MS;
+}
 
 // Timeframes exposed to the operator. Each entry is a key that the
 // Upstox-backed Vercel OHLCV handler accepts verbatim (see
@@ -62,7 +125,26 @@ export function DashboardPage() {
     };
   }, [selectedSymbol, tf]);
 
-  const lastClose = bars && bars.length ? bars[bars.length - 1].close : 0;
+  const { data: liveQuote, lastSuccessTs: liveTickTs } = useQuote(selectedSymbol);
+  const session = useMarketStatus();
+  const [mergedBars, setMergedBars] = useState<OHLCVBar[] | null>(null);
+  // Merge the live tick into the historicals so the chart shows a
+  // smoothly-updating rightmost bar without polling the OHLCV endpoint
+  // every second.  When a new OHLCV fetch lands, we snap back to it.
+  useEffect(() => {
+    if (!bars) {
+      setMergedBars(null);
+      return;
+    }
+    const barMs = TF_BAR_MS[tf] ?? 0;
+    if (!liveQuote || !liveTickTs) {
+      setMergedBars(bars);
+      return;
+    }
+    setMergedBars(mergeLiveTick(bars, liveQuote.price, liveTickTs, barMs));
+  }, [bars, liveQuote?.price, liveTickTs, tf]);
+
+  const lastClose = mergedBars && mergedBars.length ? mergedBars[mergedBars.length - 1].close : 0;
   const toggleInd = (k: keyof IndicatorConfig) =>
     setIndicators((prev) => ({ ...prev, [k]: !prev[k] }));
   const addLevel = () => { if (lastClose) setLevels((p) => [...p, lastClose]); };
@@ -78,6 +160,19 @@ export function DashboardPage() {
   return (
     <>
       {loading && <div className="topbar-loading" role="progressbar" aria-label="Loading market data" />}
+      {session && (session.phase === "closed" || session.phase === "holiday") ? (
+        <div className="panel" data-testid="market-closed-banner" style={{ marginBottom: 12 }}>
+          <div className="panel-head">
+            <span className="panel-title">Market {session.phase === "holiday" ? "Holiday" : "Closed"}</span>
+            <span className="faint" style={{ fontSize: 11 }}>
+              {session.nextOpen ? `Next open ${fmtTimeIST(session.nextOpen)}` : "Awaiting next session"}
+            </span>
+          </div>
+          <p className="faint" style={{ fontSize: 12, margin: 0 }}>
+            Showing last known prices; live ticks are paused until the next NSE session.
+          </p>
+        </div>
+      ) : null}
       <TickerStrip />
       <QuoteHeader symbol={selectedSymbol} />
       <MetricsStrip symbol={selectedSymbol} />
@@ -141,7 +236,7 @@ export function DashboardPage() {
           >
             {bars ? (
               <PriceChart
-                data={bars}
+                data={mergedBars ?? bars}
                 indicators={indicators}
                 levels={levels}
                 drawTool={drawTool}

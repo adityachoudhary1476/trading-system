@@ -12,6 +12,7 @@ vi.mock("@/data/MarketDataSource", () => ({
     getSignals: vi.fn(),
     getFeedHealth: vi.fn(),
     getPipeline: vi.fn(),
+    getMarketStatus: vi.fn(),
   },
 }));
 
@@ -23,6 +24,7 @@ vi.mock("@/lib/supabase", () => ({
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { dataSource } = await import("@/data/MarketDataSource");
+const { marketDataStore } = await import("@/data/marketDataStore");
 const ds = dataSource as unknown as {
   getQuote: ReturnType<typeof vi.fn>;
   getOHLCV: ReturnType<typeof vi.fn>;
@@ -30,6 +32,7 @@ const ds = dataSource as unknown as {
   getSignals: ReturnType<typeof vi.fn>;
   getFeedHealth: ReturnType<typeof vi.fn>;
   getPipeline: ReturnType<typeof vi.fn>;
+  getMarketStatus: ReturnType<typeof vi.fn>;
 };
 
 // Mock fetchConnectionStatus (used by SystemPage)
@@ -61,6 +64,7 @@ describe("Dashboard — all market APIs fail", () => {
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    marketDataStore.__resetForTests();
     // All APIs reject — simulate 401/500 network failures
     ds.getQuote.mockRejectedValue(new Error("Authentication required: please sign in"));
     ds.getOHLCV.mockRejectedValue(new Error("Backend server error: 500"));
@@ -68,6 +72,7 @@ describe("Dashboard — all market APIs fail", () => {
     ds.getSignals.mockRejectedValue(new Error("Authentication required: please sign in"));
     ds.getFeedHealth.mockRejectedValue(new Error("Backend server error: 500"));
     ds.getPipeline.mockRejectedValue(new Error("Backend server error: 500"));
+    ds.getMarketStatus.mockRejectedValue(new Error("Authentication required: please sign in"));
 
     const mod = await import("@/pages/Dashboard");
     DashboardPage = mod.DashboardPage;
@@ -140,6 +145,7 @@ describe("Dashboard — partial API responses (200 with missing fields)", () => 
 
   beforeEach(async () => {
     vi.clearAllMocks();
+    marketDataStore.__resetForTests();
     // Quote returns 200 with missing price — MarketDataSource should throw
     ds.getQuote.mockResolvedValue({
       symbol: "NSE:NIFTY50",
@@ -166,6 +172,13 @@ describe("Dashboard — partial API responses (200 with missing fields)", () => 
     ds.getSignals.mockRejectedValue(new Error("Authentication required"));
     ds.getFeedHealth.mockRejectedValue(new Error("Backend server error: 500"));
     ds.getPipeline.mockResolvedValue([]);
+    ds.getMarketStatus.mockResolvedValue({
+      market: "NSE",
+      phase: "closed",
+      serverTime: Date.now(),
+      nextOpen: null,
+      nextClose: null,
+    });
 
     const mod = await import("@/pages/Dashboard");
     DashboardPage = mod.DashboardPage;

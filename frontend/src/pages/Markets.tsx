@@ -1,21 +1,63 @@
 import { useMemo, useState, useEffect } from "react";
 import { useNavigate } from "react-router-dom";
-import { INSTRUMENTS, mockQuote, mockAIAnalysis, WATCHLIST_SYMBOLS, mockOHLCV } from "@/data/mock";
+import { INSTRUMENTS, WATCHLIST_SYMBOLS } from "@/data/mock";
 import { useApp } from "@/store/AppContext";
-import { Badge, EmptyState } from "@/components/ui";
+import { EmptyState } from "@/components/ui";
 import { Sparkline } from "@/components/charts/Sparkline";
 import { fmtPrice, fmtSigned, fmtPct, fmtVolume } from "@/lib/format";
-import type { OHLCVBar } from "@/types";
+import { useQuote } from "@/data/useQuote";
 
-type Row = ReturnType<typeof mockQuote> & { trend: string; signal: string; spark: number[] };
-
-function buildRows(): Row[] {
-  return INSTRUMENTS.map((m) => {
-    const q = mockQuote(m.symbol);
-    const ai = mockAIAnalysis(m.symbol);
-    const bars: OHLCVBar[] = mockOHLCV(m.symbol, "1D", 30);
-    return { ...q, trend: ai.bias, signal: ai.signal, spark: bars.map((b) => b.close) };
-  });
+function MarketRow({
+  symbol,
+  name,
+  onOpen,
+}: {
+  symbol: string;
+  name: string;
+  onOpen: () => void;
+}) {
+  const { data: q } = useQuote(symbol);
+  const [spark, setSpark] = useState<number[]>([]);
+  // Synthesize a small sparkline from the last few price updates so
+  // we never fabricate unrelated data.  We only append real values
+  // that came from the live quote endpoint.
+  useEffect(() => {
+    if (!q) return;
+    setSpark((prev) => {
+      const last = prev[prev.length - 1];
+      if (last === q.price) return prev;
+      const next = [...prev, q.price];
+      return next.length > 24 ? next.slice(-24) : next;
+    });
+  }, [q?.price, q]);
+  const up = q?.change !== undefined ? q.change >= 0 : true;
+  return (
+    <tr onClick={onOpen} tabIndex={0}
+        onKeyDown={(e) => e.key === "Enter" && onOpen()}
+        style={{ cursor: "pointer" }}>
+      <td>
+        <div style={{ fontWeight: 600 }}>{symbol.replace("NSE:", "")}</div>
+        <div className="faint" style={{ fontSize: 11 }}>{name}</div>
+      </td>
+      <td className="num mono">{q ? `₹${fmtPrice(q.price)}` : "—"}</td>
+      <td className={`num mono ${up ? "pos" : "neg"}`}>{q ? fmtSigned(q.change) : "—"}</td>
+      <td className={`num mono ${up ? "pos" : "neg"}`}>{q ? fmtPct(q.changePct) : "—"}</td>
+      <td className="num mono">{q ? fmtVolume(q.volume) : "—"}</td>
+      <td className="spark-col">
+        {spark.length > 1 ? (
+          <Sparkline data={spark} positive={up} width={84} height={24} />
+        ) : (
+          <span className="faint" style={{ fontSize: 11 }}>—</span>
+        )}
+      </td>
+      <td>
+        <span className="faint" style={{ fontSize: 11 }}>—</span>
+      </td>
+      <td>
+        <span className="faint" style={{ fontSize: 11 }}>—</span>
+      </td>
+    </tr>
+  );
 }
 
 export function MarketsPage() {
@@ -23,9 +65,22 @@ export function MarketsPage() {
   const { setSelectedSymbol } = useApp();
   const [q, setQ] = useState("");
   const [typeFilter, setTypeFilter] = useState<"all" | "index" | "equity">("all");
-  const [rows, setRows] = useState<Row[]>([]);
+  const [, force] = useState(0);
+  // Tick once a minute to re-render so any changes to the watchlist
+  // (very rare) propagate.  Live prices are driven by the store.
+  useEffect(() => {
+    const t = setInterval(() => force((n) => n + 1), 60_000);
+    return () => clearInterval(t);
+  }, []);
 
-  useEffect(() => { setRows(buildRows()); }, []);
+  const rows = useMemo(
+    () => INSTRUMENTS.map((m) => ({
+      symbol: m.symbol,
+      name: m.name,
+      instrumentType: m.instrumentType,
+    })),
+    [],
+  );
 
   const filtered = useMemo(
     () =>
@@ -37,15 +92,12 @@ export function MarketsPage() {
     [rows, q, typeFilter],
   );
 
-  const adv = filtered.filter((r) => r.change !== undefined ? r.change >= 0 : true).length;
-  const dec = filtered.length - adv;
-
   const open = (sym: string) => {
     setSelectedSymbol(sym);
     navigate("/");
   };
 
-  const Table = ({ title, data }: { title: string; data: Row[] }) => (
+  const Table = ({ title, data }: { title: string; data: typeof filtered }) => (
     <div className="panel" style={{ marginTop: 16 }}>
       <div className="panel-head">
         <span className="panel-title">{title}</span>
@@ -63,32 +115,19 @@ export function MarketsPage() {
               <th className="num">Chg %</th>
               <th className="num">Volume</th>
               <th className="spark-col">Trend</th>
-              <th>Trend</th>
+              <th>Bias</th>
               <th>Signal</th>
             </tr>
           </thead>
           <tbody>
-            {data.map((r) => {
-              const up = r.change !== undefined ? r.change >= 0 : true;
-              return (
-                <tr key={r.symbol} onClick={() => open(r.symbol)} tabIndex={0}
-                    onKeyDown={(e) => e.key === "Enter" && open(r.symbol)}>
-                  <td>
-                    <div style={{ fontWeight: 600 }}>{r.symbol.replace("NSE:", "")}</div>
-                    <div className="faint" style={{ fontSize: 11 }}>{r.name}</div>
-                  </td>
-                  <td className="num mono">₹{fmtPrice(r.price)}</td>
-                  <td className={`num mono ${up ? "pos" : "neg"}`}>{fmtSigned(r.change)}</td>
-                  <td className={`num mono ${up ? "pos" : "neg"}`}>{fmtPct(r.changePct)}</td>
-                  <td className="num mono">{fmtVolume(r.volume)}</td>
-                  <td className="spark-col">
-                    <Sparkline data={r.spark} positive={up} width={84} height={24} />
-                  </td>
-                  <td><Badge kind={r.trend}>{r.trend}</Badge></td>
-                  <td><Badge kind={r.signal}>{r.signal.replace("_", " ")}</Badge></td>
-                </tr>
-              );
-            })}
+            {data.map((r) => (
+              <MarketRow
+                key={r.symbol}
+                symbol={r.symbol}
+                name={r.name}
+                onOpen={() => open(r.symbol)}
+              />
+            ))}
           </tbody>
         </table>
       )}
@@ -128,18 +167,17 @@ export function MarketsPage() {
           <span className="value">{filtered.length}</span>
         </div>
         <div className="stat-card">
-          <span className="label">Advancing</span>
-          <span className="value pos">{adv}</span>
+          <span className="label">Source</span>
+          <span className="value">Live</span>
         </div>
         <div className="stat-card">
-          <span className="label">Declining</span>
-          <span className="value neg">{dec}</span>
+          <span className="label">Updated</span>
+          <span className="value">1s</span>
         </div>
       </div>
 
       <Table title="Indices" data={filtered.filter((r) => r.instrumentType === "index")} />
       <Table title="Equities" data={filtered.filter((r) => r.instrumentType === "equity")} />
-      <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>Mock market data.</p>
     </>
   );
 }

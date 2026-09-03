@@ -408,8 +408,30 @@ def _extract_error_detail(response) -> str:
     return ""
 
 
-async def fetch_latest_price(symbol: str, access_token: str) -> Optional[float]:
-    """Fetch the latest price for a symbol."""
+async def fetch_quote(symbol: str, access_token: str) -> Optional[dict]:
+    """Fetch the full live quote for a symbol from Upstox V2.
+
+    Returns a normalized dict with the following keys (all present, but
+    numeric values may be ``None`` when the upstream omits them — we
+    never fabricate values):
+
+    * ``last_price``         — float (required for a usable quote)
+    * ``open_price``         — float | None
+    * ``high_price``         — float | None
+    * ``low_price``          — float | None
+    * ``prev_close``         — float | None
+    * ``volume``             — int | None
+    * ``average_price``      — float | None (VWAP, when available)
+    * ``ohlc``               — dict with same names (Upstox nested field)
+    * ``depth``              — dict | None
+    * ``timestamp``          — int | None (epoch seconds, Upstox field)
+    * ``instrument_token``   — int | None
+    * ``symbol``             — Upstox-formatted instrument key
+    * ``raw``                — the underlying quote dict (for diagnostics)
+
+    Returns ``None`` if Upstox did not return a success body or the
+    quote did not contain ``last_price``.
+    """
     try:
         upstox_symbol = to_upstox_symbol(symbol)
         url = f"{UPSTOX_BASE}/market-quote/quotes"
@@ -419,17 +441,110 @@ async def fetch_latest_price(symbol: str, access_token: str) -> Optional[float]:
             "Accept": "application/json",
         }
 
-        response = requests.get(url, headers=headers, params=params, timeout=30)
+        response = requests.get(url, headers=headers, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
+    except requests.RequestException as exc:
+        logger.error(
+            "Upstox network error fetching quote for %s: %s",
+            symbol, exc.__class__.__name__,
+        )
+        raise UpstoxNetworkError(f"Upstox unreachable: {exc}") from exc
+    except ValueError as exc:
+        logger.error("Upstox non-JSON quote for %s", symbol)
+        raise UpstoxMalformedError(f"Upstox returned non-JSON quote for {symbol}") from exc
 
-        if data.get("status") == "success" and "data" in data:
-            quote = data["data"].get(upstox_symbol, {})
-            return quote.get("last_price")
+    if not isinstance(data, dict) or data.get("status") != "success":
+        detail = data.get("error_message") if isinstance(data, dict) else None
+        logger.error("Upstox non-success quote body for %s detail=%r", symbol, detail)
+        raise UpstoxBadResponseError(
+            f"Upstox non-success quote body for {symbol}: {detail}"
+        )
+
+    quote = (data.get("data") or {}).get(upstox_symbol) if isinstance(data, dict) else None
+    if not isinstance(quote, dict):
+        logger.warning("Upstox quote body missing data[%s] for %s", upstox_symbol, symbol)
         return None
-    except Exception as e:
-        logger.error("Failed to fetch latest price for %s: %s", symbol, str(e))
+
+    last_price = quote.get("last_price")
+    if not isinstance(last_price, (int, float)) or not float(last_price) == float(last_price):
+        # NaN, Inf, or missing -> unusable
+        logger.warning("Upstox quote for %s missing finite last_price: %r", symbol, last_price)
         return None
+
+    def _num(key: str) -> Optional[float]:
+        v = quote.get(key)
+        if not isinstance(v, (int, float)):
+            return None
+        fv = float(v)
+        if fv != fv or fv in (float("inf"), float("-inf")):
+            return None
+        return fv
+
+    ohlc = quote.get("ohlc") if isinstance(quote.get("ohlc"), dict) else {}
+
+    def _ohlc(key: str) -> Optional[float]:
+        v = ohlc.get(key)
+        if not isinstance(v, (int, float)):
+            return None
+        fv = float(v)
+        if fv != fv or fv in (float("inf"), float("-inf")):
+            return None
+        return fv
+
+    ts_raw = quote.get("timestamp")
+    if isinstance(ts_raw, str) and ts_raw:
+        # Upstox sometimes returns ISO timestamp string
+        try:
+            from datetime import datetime, timezone
+            ts_s = int(
+                datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+                .astimezone(timezone.utc)
+                .timestamp()
+            )
+        except (ValueError, TypeError):
+            ts_s = None
+    elif isinstance(ts_raw, (int, float)):
+        # Upstox sends seconds
+        ts_s = int(float(ts_raw))
+    else:
+        ts_s = None
+
+    instrument_token = quote.get("instrument_token")
+    if not isinstance(instrument_token, (int, float)):
+        instrument_token = None
+
+    return {
+        "last_price": float(last_price),
+        "open_price": _ohlc("open") or _num("open_price"),
+        "high_price": _ohlc("high") or _num("high_price"),
+        "low_price": _ohlc("low") or _num("low_price"),
+        "prev_close": _ohlc("close") or _num("cp"),
+        "volume": int(_num("volume")) if _num("volume") is not None else None,
+        "average_price": _num("average_price"),
+        "ohlc": {
+            "open": _ohlc("open"),
+            "high": _ohlc("high"),
+            "low": _ohlc("low"),
+            "close": _ohlc("close"),
+        },
+        "depth": quote.get("depth") if isinstance(quote.get("depth"), dict) else None,
+        "timestamp": ts_s,
+        "instrument_token": int(instrument_token) if instrument_token is not None else None,
+        "symbol": upstox_symbol,
+        "raw": quote,
+    }
+
+
+async def fetch_latest_price(symbol: str, access_token: str) -> Optional[float]:
+    """Fetch only the latest price for a symbol (legacy convenience helper)."""
+    try:
+        quote = await fetch_quote(symbol, access_token)
+    except UpstoxMarketDataError:
+        return None
+    if quote is None:
+        return None
+    return quote.get("last_price")
 
 
 __all__ = [
@@ -444,6 +559,7 @@ __all__ = [
     "UpstoxNetworkError",
     "to_upstox_symbol",
     "fetch_ohlcv",
+    "fetch_quote",
     "fetch_latest_price",
     "_build_url",
     "_date_range_for",

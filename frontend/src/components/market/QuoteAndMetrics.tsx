@@ -1,27 +1,40 @@
 import { useEffect, useState } from "react";
-import { dataSource } from "@/data/MarketDataSource";
-import type { MarketQuote } from "@/types";
-import { fmtPrice, fmtSigned, fmtPct, fmtVolume, fmtTime } from "@/lib/format";
+import { fmtPrice, fmtSigned, fmtPct, fmtVolume, fmtTimeIST } from "@/lib/format";
 import { Stat } from "@/components/ui";
+import { useQuote, useMarketStatus } from "@/data/useQuote";
+import type { Freshness } from "@/data/marketDataStore";
+
+function freshnessLabel(f: Freshness, ageSec: number | null): string {
+  if (f === "never") return "Loading…";
+  if (f === "error") return "Data stale";
+  if (f === "closed") return "Market closed";
+  if (f === "stale") return "Data stale";
+  if (ageSec === null) return "Updated";
+  if (ageSec < 2) return "Updated just now";
+  return `Updated ${ageSec}s ago`;
+}
+
+function freshnessClass(f: Freshness): string {
+  if (f === "fresh") return "fresh";
+  if (f === "closed") return "closed";
+  return "stale";
+}
 
 export function QuoteHeader({ symbol }: { symbol: string }) {
-  const [q, setQ] = useState<MarketQuote | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { data: q, freshness, error, lastSuccessTs } = useQuote(symbol);
+  const status = useMarketStatus();
+  const [, force] = useState(0);
+  // Re-render every second so the "Updated Xs ago" badge ticks
   useEffect(() => {
-    let alive = true;
-    setError(null);
-    dataSource
-      .getQuote(symbol)
-      .then((r) => {
-        if (alive) setQ(r);
-      })
-      .catch((err: unknown) => {
-        if (alive) setError(err instanceof Error ? err.message : "Failed to load quote");
-      });
-    return () => {
-      alive = false;
-    };
-  }, [symbol]);
+    const t = setInterval(() => force((n) => n + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  const ageSec =
+    lastSuccessTs && freshness === "fresh"
+      ? Math.max(0, Math.floor((Date.now() - lastSuccessTs) / 1000))
+      : null;
+
   if (!q && error) {
     return (
       <div className="page-head instrument-head">
@@ -32,7 +45,16 @@ export function QuoteHeader({ symbol }: { symbol: string }) {
       </div>
     );
   }
-  if (!q) return null;
+  if (!q) {
+    return (
+      <div className="page-head instrument-head">
+        <div className="instrument-id">
+          <h1 className="page-title">{symbol.replace("NSE:", "")}</h1>
+          <div className="subtitle">Loading…</div>
+        </div>
+      </div>
+    );
+  }
   const up = q.change !== undefined ? q.change >= 0 : true;
   return (
     <div className="page-head instrument-head">
@@ -49,8 +71,14 @@ export function QuoteHeader({ symbol }: { symbol: string }) {
         <span className={`chg-pill ${up ? "pos" : "neg"}`}>
           {up ? "▲" : "▼"} {fmtSigned(q.change)} ({fmtPct(q.changePct)})
         </span>
-        <div className="iq-meta faint">
-          Prev Close <span className="mono">₹{fmtPrice(q.previousClose)}</span> · {fmtTime(q.lastUpdate)}
+        <div className={`iq-meta faint freshness ${freshnessClass(freshness)}`}>
+          Prev Close <span className="mono">₹{fmtPrice(q.previousClose)}</span>
+          {" · "}
+          {status && (status.phase === "closed" || status.phase === "holiday")
+            ? "Market closed"
+            : `As of ${fmtTimeIST(q.lastUpdate)}`}
+          {" · "}
+          <span data-testid="freshness">{freshnessLabel(freshness, ageSec)}</span>
         </div>
       </div>
     </div>
@@ -59,21 +87,7 @@ export function QuoteHeader({ symbol }: { symbol: string }) {
 
 /** Compact terminal-style strip of key session metrics (open/high/low/vol/prev/VWAP). */
 export function MetricsStrip({ symbol }: { symbol: string }) {
-  const [q, setQ] = useState<MarketQuote | null>(null);
-  useEffect(() => {
-    let alive = true;
-    dataSource
-      .getQuote(symbol)
-      .then((r) => {
-        if (alive) setQ(r);
-      })
-      .catch(() => {
-        if (alive) setQ(null);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [symbol]);
+  const { data: q } = useQuote(symbol);
   if (!q) return null;
   const cells: { k: string; v: string; tone?: "pos" | "neg" }[] = [
     { k: "Open", v: `₹${fmtPrice(q.dayOpen)}` },
@@ -96,21 +110,7 @@ export function MetricsStrip({ symbol }: { symbol: string }) {
 }
 
 export function MetricsPanel({ symbol }: { symbol: string }) {
-  const [q, setQ] = useState<MarketQuote | null>(null);
-  useEffect(() => {
-    let alive = true;
-    dataSource
-      .getQuote(symbol)
-      .then((r) => {
-        if (alive) setQ(r);
-      })
-      .catch(() => {
-        if (alive) setQ(null);
-      });
-    return () => {
-      alive = false;
-    };
-  }, [symbol]);
+  const { data: q } = useQuote(symbol);
   if (!q) return null;
   const rows: [string, string][] = [
     ["Open", fmtPrice(q.dayOpen)],

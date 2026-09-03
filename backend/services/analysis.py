@@ -78,6 +78,29 @@ def _extract_factors(analysis: dict) -> list[FactorDTO]:
             tone="warning" if features.hist_vol > 0.3 else "neutral",
         ))
 
+    # Add evidence confidence breakdown
+    candidate = analysis.get("signal_candidate")
+    if candidate and hasattr(candidate, "evidence") and candidate.evidence:
+        ledger = candidate.evidence
+        if ledger.positive:
+            factors.append(FactorDTO(
+                label="Positive Evidence",
+                value=f"{len(ledger.positive)} factors",
+                tone="positive",
+            ))
+        if ledger.negative:
+            factors.append(FactorDTO(
+                label="Negative Evidence",
+                value=f"{len(ledger.negative)} factors",
+                tone="negative",
+            ))
+        factors.append(FactorDTO(
+            label="Evidence Agreement",
+            value=ledger.agreement,
+            tone="positive" if ledger.agreement == "strong" else
+                  "negative" if ledger.agreement == "mixed" else "neutral",
+        ))
+
     return factors
 
 
@@ -160,15 +183,13 @@ async def analyze_market(
         if hasattr(candidate, "confidence"):
             confidence = float(candidate.confidence)
 
-    # Extract regime/bias
+    # Extract regime/bias - use candidate confidence (evidence-based)
     regime = analysis.get("regime")
     bias = "neutral"
     if regime and hasattr(regime, "regime"):
         bias = _map_regime_to_bias(
             regime.regime.value if hasattr(regime.regime, "value") else str(regime.regime)
         )
-        if hasattr(regime, "confidence"):
-            confidence = float(regime.confidence)
 
     factors = _extract_factors(analysis)
     summary = _build_summary(analysis)
