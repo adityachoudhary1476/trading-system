@@ -229,7 +229,26 @@ export class ApiMarketDataSource implements MarketDataSource {
   }
 
   async getFeedHealth(): Promise<FeedHealth> {
-    return this.fetchJson<FeedHealth>("/api/upstox/status");
+    const raw = await this.fetchJson<Record<string, unknown>>("/api/upstox/status");
+    // Map the Vercel /api/upstox/status response to the FeedHealth shape.
+    // The endpoint returns {connected, provider, obtained_at, market, phase,
+    // serverTime, nextOpen, nextClose}. We synthesise the fields the
+    // DataHealthPanel expects from available data without fabricating
+    // metrics we can't compute client-side.
+    const connected = raw.connected === true;
+    const obtained = typeof raw.obtained_at === "string" ? Date.parse(raw.obtained_at) : null;
+    const isFiniteNum = (v: unknown): v is number => typeof v === "number" && Number.isFinite(v);
+    const serverTime = isFiniteNum(raw.serverTime) ? raw.serverTime : (obtained ?? null);
+    return {
+      feed: typeof raw.provider === "string" ? raw.provider : "Upstox",
+      status: connected ? "healthy" : "disconnected",
+      lastTick: serverTime,
+      eventsReceived: 0,
+      eventsRejected: 0,
+      candlesGenerated: 0,
+      lastClosedCandle: serverTime,
+      connected,
+    };
   }
 
   async getPipeline(): Promise<PipelineStage[]> {
@@ -237,7 +256,7 @@ export class ApiMarketDataSource implements MarketDataSource {
   }
 
   async getMarketStatus(): Promise<MarketStatus> {
-    return this.fetchJson<MarketStatus>("/api/market/status");
+    return this.fetchJson<MarketStatus>("/api/upstox/status");
   }
 }
 

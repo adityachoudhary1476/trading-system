@@ -127,6 +127,28 @@ export function DashboardPage() {
 
   const { data: liveQuote, lastSuccessTs: liveTickTs } = useQuote(selectedSymbol);
   const session = useMarketStatus();
+
+  // Periodically refresh OHLCV during market hours so the historical
+  // series does not go stale.  The live tick merge (below) smooths the
+  // in-progress bar, but the last closed candle never updates until
+  // the next fetch.  We poll only while the market is open to avoid
+  // unnecessary calls on weekends/holidays.
+  useEffect(() => {
+    const phase = session?.phase ?? "closed";
+    const isOpen = phase === "regular" || phase === "pre_market" || phase === "post_market";
+    if (!session || !isOpen) return;
+    // Refresh every 60 s during market hours.
+    const id = setInterval(() => {
+      dataSource
+        .getOHLCV(selectedSymbol, tf, 160)
+        .then((r) => setBars(r))
+        .catch((err: unknown) => {
+          setError(err instanceof Error ? err.message : "Failed to load chart data");
+          setLoading(false);
+        });
+    }, 60_000);
+    return () => clearInterval(id);
+  }, [selectedSymbol, tf, session?.phase]);
   const [mergedBars, setMergedBars] = useState<OHLCVBar[] | null>(null);
   // Merge the live tick into the historicals so the chart shows a
   // smoothly-updating rightmost bar without polling the OHLCV endpoint

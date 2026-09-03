@@ -171,6 +171,36 @@ describe("OHLCV handler — no fabrication", () => {
     expect((res.body as unknown[]).length).toBe(1); // we got 1, the handler returned 1
   });
 
+  it("trims the response to the requested bar count", async () => {
+    await setupAuthed();
+    // Simulate Upstox returning 500 candles but we only want 5.
+    // Build 500 daily candles (newest-first, as Upstox returns them).
+    const candles: unknown[] = [];
+    for (let i = 0; i < 500; i++) {
+      const ts = new Date(Date.UTC(2024, 11, 1) + i * 86400000)
+        .toISOString()
+        .replace("Z", "+05:30");
+      candles.push([ts, 100 + i, 105 + i, 95 + i, 102 + i, 1000, 0]);
+    }
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: new Map(),
+      json: async () => ({
+        status: "success",
+        data: { candles },
+      }),
+    });
+    const req = makeReq(
+      { authorization: "Bearer jwt" },
+      { symbol: "NSE:SBIN", timeframe: "1D", bars: "5" },
+    );
+    const res = makeRes();
+    await handler(req, res);
+    expect(res.statusCode).toBe(200);
+    expect((res.body as unknown[]).length).toBe(5); // trimmed to bars=5
+  });
+
   it("filters out malformed candles rather than fabricating fields", async () => {
     await setupAuthed();
     fetchMock.mockResolvedValue({

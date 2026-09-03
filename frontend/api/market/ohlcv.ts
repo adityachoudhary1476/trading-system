@@ -16,8 +16,12 @@ const UPSTOX_BASE = "https://api.upstox.com/v2";
  * for those timeframes get a clear 400 "unsupported_timeframe" response
  * rather than being silently coerced to a different interval.
  */
+// daysPerBar mirrors the backend's _date_range_for so the Vercel
+// function requests the same date window as the FastAPI backend.
+// 1 minute ≈ 1/375 of a trading day (NSE: 375 1-min bars, 75 min per half).
+// 1 trading day has ~375 1-minute bars or ~12 30-minute bars on NSE.
 const INTERVAL_MAP: Record<string, { interval: string; daysPerBar: number }> = {
-  "1m": { interval: "1minute", daysPerBar: 0 },
+  "1m": { interval: "1minute", daysPerBar: 1.0 / 375.0 },
   "1D": { interval: "day", daysPerBar: 1 },
   "1d": { interval: "day", daysPerBar: 1 },
   "1W": { interval: "week", daysPerBar: 7 },
@@ -196,9 +200,12 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const interval = mapping.interval;
     const maxRangeDays = UPSTOX_RANGE_DAYS[interval] ?? 366;
+    // Mirror the backend's _date_range_for: use daysPerBar directly
+    // (fractional allowed for intraday), floor at 2 trading-days to
+    // avoid weekend/holiday gaps shrinking the deliverable candle count.
     const days = Math.min(
       maxRangeDays,
-      Math.max(bars, 1) * Math.max(mapping.daysPerBar, 1) + 1,
+      Math.max(2, Math.max(bars, 1) * mapping.daysPerBar + 1),
     );
     const endDate = new Date();
     const startDate = new Date(endDate);
@@ -268,6 +275,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // chart's time axis is monotonic — but never invent candles, never
     // pad, never duplicate.
     ohlcv.sort((a, b) => a.time - b.time);
+    // Trim to the most-recent `bars` candles so we don't ship 8k+ rows
+    // for 1-minute charts when the caller only asked for 160.
+    if (ohlcv.length > bars) {
+      ohlcv.splice(0, ohlcv.length - bars);
+    }
     res.status(200).json(ohlcv);
   } catch (err) {
     const message = err instanceof Error ? err.message : "Unknown error";

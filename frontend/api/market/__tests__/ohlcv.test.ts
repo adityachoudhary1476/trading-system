@@ -25,6 +25,15 @@ describe("OHLCV timeframe mapping (Upstox V2)", () => {
     expect(INTERVAL_MAP["1m"]?.interval).toBe("1minute");
   });
 
+  it("uses fractional daysPerBar for 1m (≈1/375 of a trading day)", () => {
+    // NSE 1-minute session has ~375 bars; daysPerBar must be fractional
+    // so that 160 bars → ~2 calendar days, not 31.
+    const dpb = INTERVAL_MAP["1m"]?.daysPerBar ?? 0;
+    expect(dpb).toBeGreaterThan(0);
+    expect(dpb).toBeLessThan(1);
+    expect(dpb).toBeCloseTo(1 / 375, 5);
+  });
+
   it("does NOT map 5m / 15m / 1h (Upstox V2 does not expose them)", () => {
     expect(INTERVAL_MAP["5m"]).toBeUndefined();
     expect(INTERVAL_MAP["15m"]).toBeUndefined();
