@@ -60,7 +60,7 @@ class TradingCalendar:
         t = k.time()
         if self.pre_open[0] <= t < self.pre_open[1]:
             return SessionPhase.PRE_MARKET
-        if self.regular[0] <= t <= self.regular[1]:
+        if self.regular[0] <= t < self.regular[1]:
             return SessionPhase.REGULAR
         if self.post_close[0] <= t < self.post_close[1]:
             return SessionPhase.POST_MARKET

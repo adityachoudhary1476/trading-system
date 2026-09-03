@@ -275,6 +275,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // chart's time axis is monotonic — but never invent candles, never
     // pad, never duplicate.
     ohlcv.sort((a, b) => a.time - b.time);
+    const unique = new Map<number, (typeof ohlcv)[number]>();
+    for (const candle of ohlcv) unique.set(candle.time, candle);
+    ohlcv.splice(0, ohlcv.length, ...unique.values());
     // Trim to the most-recent `bars` candles so we don't ship 8k+ rows
     // for 1-minute charts when the caller only asked for 160.
     if (ohlcv.length > bars) {

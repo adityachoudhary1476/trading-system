@@ -34,6 +34,8 @@ class InternalMarketEvent:
     # For CANDLE events, whether the bar has closed (vs provisional).
     is_closed: bool = False
     raw: Optional[dict] = None
+    fetched_at: Optional[datetime] = None
+    source_sequence: Optional[str] = None
 
     def as_ohlcv_row(self) -> dict:
         return {

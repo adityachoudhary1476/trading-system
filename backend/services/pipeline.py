@@ -162,7 +162,7 @@ async def get_pipeline_status(
                 label="Upstox Connection",
                 status=_map_feed_status(snapshot.get("status", "disconnected")),
                 last_activity=(
-                    int(snapshot["latest_event_ts"] * 1000)
+                    int(snapshot["latest_event_ts"])
                     if snapshot.get("latest_event_ts")
                     else None
                 ),
@@ -173,7 +173,7 @@ async def get_pipeline_status(
                 label="Data Feed",
                 status=_map_feed_status(snapshot.get("status", "disconnected")),
                 last_activity=(
-                    int(snapshot["latest_event_ts"] * 1000)
+                    int(snapshot["latest_event_ts"])
                     if snapshot.get("events_received", 0) > 0
                     else None
                 ),
@@ -184,7 +184,7 @@ async def get_pipeline_status(
                 label="Candle Aggregation",
                 status="ready" if snapshot.get("connected") else "disconnected",
                 last_activity=(
-                    int(snapshot["latest_closed_candle"] * 1000)
+                    int(snapshot["latest_closed_candle"])
                     if snapshot.get("candles_generated", 0) > 0
                     else None
                 ),

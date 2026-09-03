@@ -127,6 +127,43 @@ def test_late_tick_rejection():
     assert again == []
 
 
+def test_out_of_order_tick_cannot_move_active_bar_backwards():
+    from trading_system.india.candle_aggregator import CandleAggregator
+
+    agg = CandleAggregator("5m")
+    base = datetime(2024, 3, 6, 9, 15, tzinfo=KOL)
+    agg.update(base, 100.0)
+    agg.update(base + timedelta(minutes=10), 120.0)
+    assert agg.provisional is not None
+    assert agg.provisional.start == base + timedelta(minutes=10)
+    assert agg.update(base + timedelta(minutes=5), 110.0) == []
+    assert agg.provisional.start == base + timedelta(minutes=10)
+
+
+def test_closed_history_reads_are_non_destructive():
+    pipe = ClosedCandlePipeline("5m")
+    base = datetime(2024, 3, 6, 9, 15, tzinfo=KOL)
+    pipe.feed_event(_event(ts=base, ltp=100.0))
+    pipe.feed_event(_event(ts=base + timedelta(minutes=5), ltp=110.0))
+    first = pipe.build_closed_history_df("NSE:SBIN")
+    second = pipe.build_closed_history_df("NSE:SBIN")
+    assert len(first) == 1
+    assert second.equals(first)
+
+
+def test_post_market_boundary_closes_regular_bar_without_creating_post_bar():
+    pipe = ClosedCandlePipeline("5m")
+    closed = []
+    pipe.on_closed(closed.append)
+    regular = datetime(2024, 3, 6, 15, 25, tzinfo=KOL)
+    boundary = datetime(2024, 3, 6, 15, 30, tzinfo=KOL)
+    pipe.feed_event(_event(ts=regular, ltp=100.0))
+    result = pipe.feed_event(_event(ts=boundary, ltp=110.0))
+    assert len(result) == 1
+    assert result[0].start == regular
+    assert pipe._agg("NSE:SBIN").provisional is None
+
+
 # --- 6. unhealthy feed suppresses signals -----------------------------------
 def test_unhealthy_feed_suppresses_signals():
     pipe = LiveMarketPipeline(symbols=["NSE:SBIN"], timeframe="5m", analysis_interval_bars=1)

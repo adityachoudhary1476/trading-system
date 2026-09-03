@@ -52,6 +52,11 @@ from .intelligence import (
     generate_options_candidates,
     generate_signal_candidate,
     instrument_class_of,
+    # Phase 21 - Data Completeness + Relative Strength
+    DataCompleteness,
+    RelativeStrength,
+    compute_data_completeness,
+    compute_relative_strength,
 )
 from .forecast_ledger import (
     ForecastRecord,
@@ -99,6 +104,7 @@ from .evidence import (
     classify_quality,
     is_evidence_stale,
 )
+from .forecast_ledger import ForecastRecord, ForecastStore, MIN_RESOLVED_FOR_CALIBRATION
 from .strategy_registry import (
     StrategyRegistry,
     strategy_identity,
@@ -241,6 +247,10 @@ __all__ = [
     "MIN_RESOLVED_FOR_CALIBRATION",
     "generate_signal_candidate",
     "instrument_class_of",
+    "DataCompleteness",
+    "RelativeStrength",
+    "compute_data_completeness",
+    "compute_relative_strength",
     "Factor",
     "FactorMeta",
     "FactorEngine",

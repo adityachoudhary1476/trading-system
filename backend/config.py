@@ -41,6 +41,7 @@ class Settings(BaseSettings):
 
     # Live pipeline configuration
     live_pipeline_enabled: bool = False
+    market_data_db_url: str = "sqlite:///./data/market_data.db"
 
     # Signal universe - comma-separated list of symbols to analyze
     # These are the symbols for which signals are generated

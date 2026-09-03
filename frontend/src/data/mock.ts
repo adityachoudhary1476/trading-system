@@ -108,6 +108,8 @@ export function mockQuote(symbol: string): MarketQuote {
     volatility: round(0.18 + rng() * 0.22, 3),
     sessionState,
     lastUpdate: Date.now(),
+    marketTimestamp: Date.now(),
+    fetchedAt: Date.now(),
   };
 }
 
@@ -211,6 +213,14 @@ export function mockAIAnalysis(symbol: string): AIAnalysis {
     `Evidence agreement: ${evidence.agreement}. ` +
     "Analysis computed on closed candles using evidence-based scoring.";
 
+  const now = Date.now();
+  const decisionTs = now;
+  const marketTs = now - 300_000; // 5 min ago (last closed candle on 5m)
+  // Simulate live price movement since the AI decision was made.
+  const currentPrice = round(meta.refPrice * (1 + (rng() - 0.5) * 0.02), 2);
+  const decisionPrice = round(meta.refPrice * (1 + (rng() - 0.5) * 0.02), 2);
+  const priceDelta = round(currentPrice - decisionPrice, 2);
+  const priceDeltaPercent = decisionPrice > 0 ? round((priceDelta / decisionPrice) * 100, 2) : 0;
   return {
     symbol: meta.symbol,
     timeframe: "5m",
@@ -219,7 +229,7 @@ export function mockAIAnalysis(symbol: string): AIAnalysis {
     signal,
     summary,
     factors,
-    generatedAt: Date.now(),
+    generatedAt: now,
     model: "finova-intelligence-v2",
     horizon,
     expectedMove: {
@@ -230,6 +240,12 @@ export function mockAIAnalysis(symbol: string): AIAnalysis {
     evidence,
     invalidation: bias === "bullish" ? "Below recent structure" : bias === "bearish" ? "Above recent structure" : "No clear level",
     instrumentClass: isIndex ? "index" : "equity",
+    decisionPrice,
+    decisionTimestamp: decisionTs,
+    marketTimestamp: marketTs,
+    dataFreshnessMs: 300_000,
+    priceDelta,
+    priceDeltaPercent,
   };
 }
 

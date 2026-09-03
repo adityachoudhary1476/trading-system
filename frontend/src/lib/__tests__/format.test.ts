@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fmtNum, fmtPrice, fmtSigned, fmtPct, fmtVolume, isFiniteNumber } from "../format";
+import { fmtNum, fmtPrice, fmtSigned, fmtPct, fmtVolume, fmtDuration, isFiniteNumber } from "../format";
 
 describe("isFiniteNumber", () => {
   it("returns true for valid finite numbers including zero", () => {
@@ -72,4 +72,18 @@ describe("fmtVolume", () => {
   it("formats small volume", () => expect(fmtVolume(1500000)).toBe("15.00 L"));
   it("formats lakh volume", () => expect(fmtVolume(8400000)).toBe("84.00 L"));
   it("formats crore volume", () => expect(fmtVolume(120000000)).toBe("12.00 Cr"));
+});
+
+describe("fmtDuration", () => {
+  it("returns '—' for undefined", () => expect(fmtDuration(undefined)).toBe("—"));
+  it("returns '—' for null", () => expect(fmtDuration(null)).toBe("—"));
+  it("returns '—' for NaN", () => expect(fmtDuration(NaN)).toBe("—"));
+  it("returns '—' for Infinity", () => expect(fmtDuration(Infinity)).toBe("—"));
+  it("returns '—' for -Infinity", () => expect(fmtDuration(-Infinity)).toBe("—"));
+  it("returns '—' for negative durations", () => expect(fmtDuration(-5000)).toBe("—"));
+  it("formats zero as '0.0s'", () => expect(fmtDuration(0)).toBe("0.0s"));
+  it("formats sub-minute durations in seconds", () => expect(fmtDuration(5_000)).toBe("5.0s"));
+  it("formats exactly 60s as minutes", () => expect(fmtDuration(60_000)).toBe("1.0m"));
+  it("formats sub-hour durations in minutes", () => expect(fmtDuration(300_000)).toBe("5.0m"));
+  it("formats hour-and-above durations in hours", () => expect(fmtDuration(86_400_000)).toBe("24.0h"));
 });

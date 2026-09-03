@@ -238,4 +238,38 @@ describe("ApiMarketDataSource.getQuote — runtime validation", () => {
     expect(q.volatility).toBe(0);
     expect(q.dayRange).toBe("0 — 0");
   });
+
+  it("timestamp fallback chain: marketTimestamp → lastUpdate → fetchedAt", async () => {
+    const fetchedAt = 1_700_000_000_000;
+    // Neither marketTimestamp nor lastUpdate supplied — falls back to fetchedAt.
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...baseSuccess,
+      json: async () => ({
+        symbol: "NSE:SBIN",
+        price: 100,
+        fetchedAt,
+      }),
+    });
+    const q = await source.getQuote("NSE:SBIN");
+    // Price-only response: optional fields undefined, timestamps fall back to fetchedAt.
+    expect(q.marketTimestamp).toBe(fetchedAt);
+    expect(q.lastUpdate).toBe(fetchedAt);
+    expect(q.previousClose).toBeUndefined();
+    expect(q.change).toBeUndefined();
+    expect(q.changePct).toBeUndefined();
+  });
+
+  it("falls back to lastUpdate when marketTimestamp is missing", async () => {
+    (fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      ...baseSuccess,
+      json: async () => ({
+        symbol: "NSE:SBIN",
+        price: 100,
+        lastUpdate: 1704067200000,
+      }),
+    });
+    const q = await source.getQuote("NSE:SBIN");
+    expect(q.marketTimestamp).toBe(1704067200000);
+    expect(q.lastUpdate).toBe(1704067200000);
+  });
 });

@@ -79,6 +79,7 @@ class TestTradingRuntime:
         # Mock settings to provide client_id
         mock_settings = MagicMock()
         mock_settings.upstox_client_id = "test_client_id"
+        mock_settings.market_data_db_url = "sqlite:///:memory:"
         mock_get_settings.return_value = mock_settings
 
         mock_pipeline = MagicMock()
@@ -93,7 +94,8 @@ class TestTradingRuntime:
         runtime = get_trading_runtime()
 
         # Mock the WebSocket thread to avoid actual connection
-        with patch.object(runtime, "_start_websocket_thread"):
+        with patch.object(runtime, "_start_websocket_thread"), \
+             patch.object(runtime, "_run_recovery", return_value=True):
             runtime.start("test_token", ["NSE:SBIN"], "1d")
 
         assert runtime.state.state == RuntimeStateEnum.STARTING
@@ -109,6 +111,7 @@ class TestTradingRuntime:
         # Mock settings to provide client_id
         mock_settings = MagicMock()
         mock_settings.upstox_client_id = "test_client_id"
+        mock_settings.market_data_db_url = "sqlite:///:memory:"
         mock_get_settings.return_value = mock_settings
 
         mock_pipeline = MagicMock()
@@ -123,7 +126,8 @@ class TestTradingRuntime:
         runtime = get_trading_runtime()
 
         # Start then stop
-        with patch.object(runtime, "_start_websocket_thread"):
+        with patch.object(runtime, "_start_websocket_thread"), \
+             patch.object(runtime, "_run_recovery", return_value=True):
             runtime.start("test_token", ["NSE:SBIN"], "1d")
 
         runtime.stop()

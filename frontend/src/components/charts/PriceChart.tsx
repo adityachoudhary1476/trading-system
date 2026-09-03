@@ -57,7 +57,9 @@ export function PriceChart({
   const volRef = useRef<ISeriesApi<"Histogram"> | null>(null);
   const overlayRefs = useRef<ISeriesApi<"Line">[]>([]);
   const rsiRef = useRef<ISeriesApi<"Line"> | null>(null);
-  const priceLineRefs = useRef<IPriceLine[]>([]);
+  const closeLineRef = useRef<IPriceLine | null>(null);
+  const levelLineRefs = useRef<IPriceLine[]>([]);
+  const fittedRangeRef = useRef<string | null>(null);
 
   const [legend, setLegend] = useState<{ o: number; h: number; l: number; c: number; chg: number } | null>(null);
   const [pending, setPending] = useState<Anchor | null>(null);
@@ -119,8 +121,10 @@ export function PriceChart({
         overlayRefs.current.forEach((s) => { try { chart.removeSeries(s); } catch {} });
         overlayRefs.current = [];
         if (rsiRef.current) { try { chart.removeSeries(rsiRef.current); } catch {} rsiRef.current = null; }
-        priceLineRefs.current.forEach((pl) => { try { candle.removePriceLine(pl); } catch {} });
-        priceLineRefs.current = [];
+        if (closeLineRef.current) { try { candle.removePriceLine(closeLineRef.current); } catch {} }
+        levelLineRefs.current.forEach((pl) => { try { candle.removePriceLine(pl); } catch {} });
+        closeLineRef.current = null;
+        levelLineRefs.current = [];
       } finally {
         ro.disconnect();
         chart.remove();
@@ -135,6 +139,7 @@ export function PriceChart({
     if (!chart || !candle || !vol) return;
     overlayRefs.current.forEach((s) => chart.removeSeries(s)); overlayRefs.current = [];
     if (rsiRef.current) { chart.removeSeries(rsiRef.current); rsiRef.current = null; }
+    if (closeLineRef.current) { try { candle.removePriceLine(closeLineRef.current); } catch {} closeLineRef.current = null; }
 
     const candles = data.map((d) => ({ time: (d.time / 1000) as UTCTimestamp, open: d.open, high: d.high, low: d.low, close: d.close })) as CandlestickData[];
     const volData = data.map((d) => ({ time: (d.time / 1000) as UTCTimestamp, value: d.volume, color: d.close >= d.open ? "rgba(46,194,126,0.38)" : "rgba(255,92,108,0.38)" })) as HistogramData[];
@@ -164,16 +169,20 @@ export function PriceChart({
     const last = data[data.length - 1];
     if (last) {
       const pl = candle.createPriceLine({ price: last.close, color: last.close >= last.open ? "#2ec27e" : "#ff5c6c", lineWidth: LW_THIN, lineStyle: 2, axisLabelVisible: true, title: "" });
-      priceLineRefs.current.push(pl);
+      closeLineRef.current = pl;
     }
-    chart.timeScale().fitContent();
+    const rangeKey = data.length ? `${data[0].time}:${last?.time}:${data.length}` : "empty";
+    if (fittedRangeRef.current !== rangeKey) {
+      chart.timeScale().fitContent();
+      fittedRangeRef.current = rangeKey;
+    }
   }, [data, indicators]);
 
   // Sync horizontal user levels
   useEffect(() => {
     const candle = candleRef.current; if (!candle) return;
-    priceLineRefs.current.forEach((pl) => candle.removePriceLine(pl)); priceLineRefs.current = [];
-    levels.forEach((lvl) => priceLineRefs.current.push(candle.createPriceLine({ price: lvl, color: "#7d8aa0", lineWidth: LW_THIN, lineStyle: 0, axisLabelVisible: true, title: `L ${lvl.toFixed(2)}` })));
+    levelLineRefs.current.forEach((pl) => candle.removePriceLine(pl)); levelLineRefs.current = [];
+    levels.forEach((lvl) => levelLineRefs.current.push(candle.createPriceLine({ price: lvl, color: "#7d8aa0", lineWidth: LW_THIN, lineStyle: 0, axisLabelVisible: true, title: `L ${lvl.toFixed(2)}` })));
   }, [levels]);
 
   // Reset pending point when tool changes

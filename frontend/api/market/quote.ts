@@ -67,6 +67,9 @@ function pickFinite(...candidates: unknown[]): number | null {
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
   if (req.method !== "GET") {
     res.setHeader("Allow", "GET");
     res.status(405).json({ error: "method_not_allowed" });
@@ -207,6 +210,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const dayLow = pickFinite(quote.low, quote.ohlc?.low);
     const volume = pickFinite(quote.volume);
 
+    // --- Canonical timestamp semantics (Phase 2 correction) ---
+    // marketTimestamp: when the EXCHANGE says the price occurred (authoritative
+    // freshness source).  Upstox V2 quote object may carry a ``timestamp``
+    // field (epoch seconds).  If absent or invalid we fall back to the server
+    // fetch time so the UI never claims a precise market time it doesn't have.
+    const fetchedAt = Date.now();
+    const rawMarketTs = pickFinite(quote.timestamp);
+    const marketTimestamp =
+      rawMarketTs !== null ? Math.round(rawMarketTs * 1000) : fetchedAt;
+
     // Derive change/changePct ONLY when prevClose is a genuine number. When
     // it is unavailable, the fields are emitted as null so the existing
     // defensive renderer can show "—".
@@ -217,7 +230,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const response: Record<string, unknown> = {
       symbol,
       price,
-      lastUpdate: Date.now(),
+      marketTimestamp,
+      fetchedAt,
+      sessionState: "REGULAR",
+      lastUpdate: marketTimestamp,
     };
     if (prevClose !== null) {
       response.previousClose = prevClose;

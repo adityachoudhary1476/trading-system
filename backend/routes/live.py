@@ -14,7 +14,8 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from auth import AuthenticatedUser, get_current_user
-from schemas.market import ErrorResponse, MarketStatusDTO, QuoteDTO
+from schemas.market import ErrorResponse, MarketStatusDTO, QuoteDTO, CandleReadModelDTO
+from runtime import get_trading_runtime, RuntimeStateEnum
 from services import broker, market_data
 from src.trading_system.india.market_calendar import (
     DEFAULT_CALENDAR,
@@ -23,6 +24,34 @@ from src.trading_system.india.market_calendar import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/market", tags=["market"])
+
+
+@router.get(
+    "/candles",
+    response_model=CandleReadModelDTO,
+    response_model_by_alias=True,
+    responses={
+        401: {"model": ErrorResponse, "description": "Authentication required"},
+        404: {"model": ErrorResponse, "description": "No authoritative candle state"},
+        503: {"model": ErrorResponse, "description": "Live candle runtime unavailable"},
+    },
+)
+async def get_authoritative_candles(
+    symbol: str = Query(..., description='Trading symbol, e.g. "NSE:SBIN"'),
+    timeframe: str = Query(default="1d"),
+    limit: int = Query(default=160, ge=1, le=500),
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> CandleReadModelDTO:
+    """Return the shared runtime's closed and provisional candle state."""
+    runtime = get_trading_runtime()
+    if runtime.state.state not in (RuntimeStateEnum.CONNECTED, RuntimeStateEnum.CONNECTING):
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Live candle runtime unavailable")
+    model = runtime.candle_read_model
+    canonical_timeframe = {"1D": "1d", "1W": "1w", "1M": "1M"}.get(timeframe, timeframe)
+    result = model.read(symbol, canonical_timeframe, runtime.pipeline, limit) if model else None
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No authoritative candle state")
+    return CandleReadModelDTO.model_validate(result)
 
 
 def _session_phase_for(utc_now: datetime) -> SessionPhase:

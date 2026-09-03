@@ -113,6 +113,29 @@ describe("OHLCV handler — happy path", () => {
     expect(body[0].close).toBe(800);
   });
 
+  it("keeps the last provider candle for duplicate timestamps", async () => {
+    await setupAuthed();
+    fetchMock.mockResolvedValue({
+      status: 200,
+      ok: true,
+      headers: new Map(),
+      json: async () => ({
+        status: "success",
+        data: {
+          candles: [
+            ["2024-12-12T00:00:00+05:30", 800, 810, 798, 808, 900, 0],
+            ["2024-12-12T00:00:00+05:30", 801, 811, 799, 809, 901, 0],
+          ],
+        },
+      }),
+    });
+    const res = makeRes();
+    await handler(makeReq({ authorization: "Bearer jwt" }, { symbol: "NSE:SBIN", timeframe: "1D", bars: "3" }), res);
+    const body = res.body as Array<{ time: number; close: number }>;
+    expect(body).toHaveLength(1);
+    expect(body[0].close).toBe(809);
+  });
+
   it("issues the Upstox V2 historical-candle URL with to_date BEFORE from_date", async () => {
     await setupAuthed();
     fetchMock.mockResolvedValue({

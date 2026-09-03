@@ -86,6 +86,10 @@ class CandleAggregator:
             b.volume += volume
             b.ticks += 1
             return []
+        if bar_start < self._current.start:
+            # A delayed event must not move the active candle backwards or
+            # close a newer candle with older market data.
+            return []
         # New bar -> close the old one.
         finished = self._current
         self._completed.append(finished)
@@ -99,6 +103,11 @@ class CandleAggregator:
     def provisional(self) -> AggregatedBar | None:
         """The currently-forming (provisional) bar. Never treat as closed."""
         return self._current
+
+    @property
+    def completed(self) -> tuple[AggregatedBar, ...]:
+        """Read-only view of completed bars; callers must not consume history."""
+        return tuple(self._completed)
 
     def seed_bar(
         self,
@@ -117,6 +126,10 @@ class CandleAggregator:
         """
         if start.tzinfo is None:
             start = start.replace(tzinfo=__import__("datetime").timezone.utc)
+        if self._current is not None and self._current.start == start:
+            return
+        if any(bar.start == start for bar in self._completed):
+            return
         self._completed.append(
             AggregatedBar(
                 start=start, open=open, high=high, low=low, close=close,
@@ -128,6 +141,15 @@ class CandleAggregator:
         out = list(self._completed)
         self._completed.clear()
         return out
+
+    def close_current(self) -> AggregatedBar | None:
+        """Close the active bar explicitly, such as at a session boundary."""
+        if self._current is None:
+            return None
+        finished = self._current
+        self._completed.append(finished)
+        self._current = None
+        return finished
 
     def to_dataframe(self, include_provisional: bool = False) -> pd.DataFrame:
         bars = list(self._completed)

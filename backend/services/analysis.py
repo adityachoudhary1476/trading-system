@@ -5,7 +5,13 @@ import logging
 import time
 from typing import Optional
 
-from schemas.market import AIAnalysisDTO, FactorDTO
+from schemas.market import (
+    AIAnalysisDTO,
+    FactorDTO,
+    ExpectedMoveDTO,
+    EvidenceDTO,
+    OptionsCandidateDTO,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +175,7 @@ async def analyze_market(
             factors=[],
             generated_at=int(time.time() * 1000),
             model="blocked",
+            decisionTimestamp=int(time.time() * 1000),
         )
 
     # Extract signal from candidate
@@ -194,6 +201,80 @@ async def analyze_market(
     factors = _extract_factors(analysis)
     summary = _build_summary(analysis)
 
+    # --- Phase 3-13 intelligence fields (evidence-based, never hardcoded) ---
+    candidate = analysis.get("signal_candidate")
+    horizon_val: Optional[str] = None
+    expected_move_val = None
+    evidence_val = None
+    invalidation_val: Optional[str] = None
+    instrument_class_val: Optional[str] = None
+
+    context = analysis.get("instrument_context")
+    if context is not None:
+        instrument_class_val = getattr(context, "instrument_class", None)
+        if hasattr(instrument_class_val, "value"):
+            instrument_class_val = instrument_class_val.value
+
+    if candidate:
+        if getattr(candidate, "horizon", None) is not None:
+            horizon_val = candidate.horizon.value
+        em = getattr(candidate, "expected_move", None)
+        if em is not None and getattr(em, "lower_pct", None) is not None:
+            expected_move_val = ExpectedMoveDTO(
+                lowerPct=em.lower_pct, upperPct=em.upper_pct, basis=em.basis
+            )
+        if getattr(candidate, "invalidation", None):
+            invalidation_val = candidate.invalidation
+        ledger = getattr(candidate, "evidence_ledger", None)
+        if ledger is not None:
+            evidence_val = EvidenceDTO(
+                positive=list(ledger.positive),
+                negative=list(ledger.negative),
+                neutral=list(ledger.neutral),
+                agreement=ledger.agreement,
+            )
+
+    options_candidates_val = [
+        OptionsCandidateDTO(
+            strike=c.strike,
+            option_type=c.option_type,
+            expiry=getattr(c, "expiry", None),
+            delta=getattr(c, "delta", None),
+            gamma=getattr(c, "gamma", None),
+            theta=getattr(c, "theta", None),
+            vega=getattr(c, "vega", None),
+            implied_vol=getattr(c, "implied_vol", None),
+            open_interest=getattr(c, "open_interest", None),
+            volume=getattr(c, "volume", None),
+            bid_ask_spread=getattr(c, "bid_ask_spread", None),
+            score=getattr(c, "score", 0.0),
+            rationale=list(getattr(c, "rationale", []) or []),
+            risks=list(getattr(c, "risks", []) or []),
+        )
+        for c in (analysis.get("options_candidates") or [])
+    ]
+    options_status_val = analysis.get("options_status")
+
+    last_close = None
+    if df is not None and hasattr(df, "shape") and df.shape[0] > 0:
+        try:
+            last_close = float(df["close"].iloc[-1])
+        except (TypeError, ValueError, KeyError):
+            last_close = None
+
+    # Snapshot context: a single decision time anchors generated_at,
+    # decisionTimestamp and dataFreshnessMs so they are mutually consistent
+    # rather than re-sampling time.time() (which would race across fields).
+    now_ms = int(time.time() * 1000)
+    market_ts = (
+        _bar_ts_ms(df)
+        if df is not None and hasattr(df, "index") and len(df.index) > 0
+        else None
+    )
+    # Freshness = age of the source candle at decision time. Clamped to >= 0
+    # to absorb minor exchange/clock skew; null when no market timestamp.
+    data_freshness_ms = max(0, now_ms - market_ts) if market_ts is not None else None
+
     return AIAnalysisDTO(
         symbol=symbol,
         timeframe=timeframe,
@@ -202,6 +283,39 @@ async def analyze_market(
         signal=signal_direction,
         summary=summary,
         factors=factors,
-        generated_at=int(time.time() * 1000),
+        generated_at=now_ms,
         model="deterministic",
+        horizon=horizon_val,
+        expectedMove=expected_move_val,
+        evidence=evidence_val,
+        invalidation=invalidation_val,
+        instrumentClass=instrument_class_val,
+        optionsCandidates=options_candidates_val,
+        optionsStatus=options_status_val,
+        decisionPrice=_safe_float(last_close),
+        decisionTimestamp=now_ms,
+        marketTimestamp=market_ts,
+        dataFreshnessMs=data_freshness_ms,
     )
+
+
+def _safe_float(v):
+    import math
+    if v is None:
+        return None
+    try:
+        fv = float(v)
+        return fv if math.isfinite(fv) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _bar_ts_ms(df) -> int | None:
+    from datetime import timezone
+    idx = df.index[-1]
+    ts = idx
+    if getattr(ts, "tzinfo", None) is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.astimezone(timezone.utc)
+    return int(ts.timestamp() * 1000)

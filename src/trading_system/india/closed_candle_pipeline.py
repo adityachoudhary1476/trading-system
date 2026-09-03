@@ -56,12 +56,16 @@ class ClosedCandlePipeline:
         self.minutes = timeframe_minutes(timeframe)
         self.aggregators: dict[str, CandleAggregator] = {}
         self.closed_consumers: list[ClosedCandleConsumer] = []
+        self._closed_persistence: Callable[[ClosedCandle], bool] | None = None
         # Track seen (symbol, bar_start) to drop duplicate/late ticks deterministically.
         self._seen: dict[str, set[datetime]] = {}
         self._analysis_interval = analysis_interval_bars or settings.market.analysis_interval_bars
 
     def on_closed(self, consumer: ClosedCandleConsumer) -> None:
         self.closed_consumers.append(consumer)
+
+    def set_closed_persistence(self, consumer: Callable[[ClosedCandle], bool]) -> None:
+        self._closed_persistence = consumer
 
     def _agg(self, symbol: str) -> CandleAggregator:
         return self.aggregators.setdefault(symbol, CandleAggregator(self.timeframe))
@@ -78,6 +82,11 @@ class ClosedCandlePipeline:
             return []
         # Use the event's timestamp (provider-normalized UTC).
         ts = event.timestamp
+        phase = DEFAULT_CALENDAR.phase(ts).value
+        if phase != "regular":
+            if phase == "post_market":
+                return self._close_active(event.symbol)
+            return []
         bar_start = self._bar_start(ts)
         seen = self._seen_for(event.symbol)
         # Session boundary: if the event is outside a trading session, still record
@@ -98,10 +107,35 @@ class ClosedCandlePipeline:
                 start=b.start, open=b.open, high=b.high, low=b.low,
                 close=b.close, volume=b.volume, state=CandleState.CLOSED,
             )
+            if self._closed_persistence is not None and not self._closed_persistence(cc):
+                continue
             out.append(cc)
             for c in self.closed_consumers:
                 c(cc)
         return out
+
+    def _close_active(self, symbol: str) -> list[ClosedCandle]:
+        """Close a regular-session bar at the first post-market boundary."""
+        agg = self.aggregators.get(symbol)
+        if agg is None:
+            return []
+        bar = agg.close_current()
+        if bar is None:
+            return []
+        seen = self._seen_for(symbol)
+        if bar.start in seen:
+            return []
+        seen.add(bar.start)
+        candle = ClosedCandle(
+            symbol=symbol, timeframe=self.timeframe, start=bar.start,
+            open=bar.open, high=bar.high, low=bar.low, close=bar.close,
+            volume=bar.volume, state=CandleState.CLOSED,
+        )
+        if self._closed_persistence is not None and not self._closed_persistence(candle):
+            return []
+        for consumer in self.closed_consumers:
+            consumer(candle)
+        return [candle]
 
     def _bar_start(self, ts: datetime) -> datetime:
         from ..india.candle_aggregator import _bar_start as _bs
@@ -112,6 +146,17 @@ class ClosedCandlePipeline:
         """The pipeline NEVER builds analysis snapshots from provisional candles."""
         return False
 
+    def provisional_candle(self, symbol: str) -> AggregatedBar | None:
+        """Return a copy of the active candle for read-model consumers."""
+        provisional = self.aggregators.get(symbol)
+        bar = provisional.provisional if provisional is not None else None
+        if bar is None:
+            return None
+        return AggregatedBar(
+            start=bar.start, open=bar.open, high=bar.high, low=bar.low,
+            close=bar.close, volume=bar.volume, ticks=bar.ticks,
+        )
+
     def build_closed_history_df(self, symbol: str) -> "object":
         """Collect closed bars for a symbol into a DataFrame for snapshot building."""
         import pandas as pd
@@ -119,7 +164,7 @@ class ClosedCandlePipeline:
         agg = self.aggregators.get(symbol)
         if agg is None:
             return pd.DataFrame()
-        bars = agg.flush_completed()  # only completed bars
+        bars = list(agg.completed)  # only completed bars; preserve history for later snapshots
         if not bars:
             return pd.DataFrame()
         df = pd.DataFrame(

@@ -18,6 +18,7 @@ not know whether the source was FYERS, Binance, or a replay fixture.
 from __future__ import annotations
 
 from datetime import datetime
+from threading import RLock
 from typing import Callable, Optional
 
 from ..config import settings, log
@@ -26,6 +27,8 @@ from .closed_candle_pipeline import ClosedCandle, ClosedCandlePipeline
 from .data_health import DataHealthMonitor, FeedStatus
 from .event_bus import EventBus
 from .events import EventType, InternalMarketEvent
+from .live_market_state import LiveMarketSnapshot, MarketStatePublisher
+from .market_calendar import DEFAULT_CALENDAR
 
 
 # Consumer invoked when a MarketSnapshot is ready (e.g. AI analyst + signal).
@@ -67,7 +70,11 @@ class LiveMarketPipeline:
         # Closed-candle consumers: store to DB + feed health + maybe snapshot.
         self._bars_since_snapshot: dict[str, int] = {s: 0 for s in symbols}
         self._snapshot_consumer: Optional[SnapshotConsumer] = None
+        self.market_state = MarketStatePublisher()
         self._running = False
+        self._recovery_lock = RLock()
+        self._recovering = False
+        self._recovery_buffer: list[InternalMarketEvent] = []
 
         # Wire closed-candle consumer: record health + maybe build snapshot.
         self.candle_pipeline.on_closed(self._on_closed_candle)
@@ -77,6 +84,13 @@ class LiveMarketPipeline:
         """Register the AI/snapshot consumer. Called only per ANALYSIS_INTERVAL_BARS
         (never per tick)."""
         self._snapshot_consumer = consumer
+
+    def subscribe_market_state(self, consumer: Callable[[LiveMarketSnapshot], None]) -> None:
+        """Subscribe to normalized live snapshots before consumer migration."""
+        self.market_state.subscribe(consumer)
+
+    def unsubscribe_market_state(self, consumer: Callable[[LiveMarketSnapshot], None]) -> None:
+        self.market_state.unsubscribe(consumer)
 
     def attach_socket(self, socket) -> None:
         """Wire the provider socket's health callbacks into the monitor."""
@@ -93,16 +107,49 @@ class LiveMarketPipeline:
     # -- ingestion (provider -> normalized -> bus -> pipeline) ---------------
     def ingest(self, event: InternalMarketEvent) -> None:
         """Entry point for a normalized event from any provider socket."""
-        if not self._running:
-            return
-        if event is None or event.event_type not in (EventType.QUOTE, EventType.TRADE):
-            return
+        with self._recovery_lock:
+            if not self._running:
+                return
+            if event is None or event.event_type not in (EventType.QUOTE, EventType.TRADE):
+                return
+            if self._recovering:
+                self._recovery_buffer.append(event)
+                return
+            self._ingest(event)
+
+    def _ingest(self, event: InternalMarketEvent) -> None:
+        fetched_at = event.fetched_at or datetime.now(event.timestamp.tzinfo)
+        self.market_state.publish(
+            symbol=event.symbol,
+            instrument_key=event.provider_symbol,
+            price=event.ltp if event.ltp is not None else (event.close or 0.0),
+            market_timestamp=event.timestamp,
+            fetched_at=fetched_at,
+            session=DEFAULT_CALENDAR.phase(event.timestamp).value.upper(),
+            source_sequence=event.source_sequence,
+        )
         # Feed the bus (other consumers may subscribe_all); then the candle pipe.
         self.bus.publish(event)
         self.health.tick(ts=event.timestamp)
         closed = self.candle_pipeline.feed_event(event)
         # closed candles already recorded by _on_closed_candle; nothing else here.
         _ = closed  # (kept explicit; snapshot logic lives in _on_closed_candle)
+
+    def begin_recovery(self) -> None:
+        """Buffer incoming events while a bounded historical recovery runs."""
+        with self._recovery_lock:
+            self._recovering = True
+            self._recovery_buffer.clear()
+
+    def end_recovery(self) -> int:
+        """Replay buffered events after recovery, oldest first."""
+        with self._recovery_lock:
+            buffered = sorted(self._recovery_buffer, key=lambda event: event.timestamp)
+            self._recovery_buffer.clear()
+            self._recovering = False
+            for event in buffered:
+                self._ingest(event)
+            return len(buffered)
 
     # -- closed-candle handler ----------------------------------------------
     def _on_closed_candle(self, cc: ClosedCandle) -> None:

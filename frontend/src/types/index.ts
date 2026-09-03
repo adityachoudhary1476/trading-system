@@ -23,6 +23,18 @@ export interface OHLCVBar {
   volume: number;
 }
 
+export interface CandleReadModel {
+  symbol: string;
+  timeframe: string;
+  candles: Array<OHLCVBar & { isClosed: boolean; source: string }>;
+  currentCandle: (OHLCVBar & { isClosed: boolean; source: string }) | null;
+  marketTimestamp: number | null;
+  fetchedAt: number | null;
+  freshnessMs: number | null;
+  session: string;
+  version: number;
+}
+
 /** Top-of-book quote for an instrument.
  * `price` is the canonical sentinel — it is always present (validated at the API boundary).
  * All other numeric fields are optional; they may be `undefined` when the
@@ -47,7 +59,11 @@ export interface MarketQuote {
   dayRange: string; // human, e.g. "1020.10 — 1061.80", or "—" when unavailable
   volatility: number | undefined; // annualized-ish metric
   sessionState: "PRE_MARKET" | "REGULAR" | "POST_MARKET" | "CLOSED";
-  lastUpdate: number; // epoch ms
+  lastUpdate: number; // epoch ms — alias of marketTimestamp for backward compat
+  /** Epoch ms of the exchange trade tick (UTC).  Authoritative freshness source. */
+  marketTimestamp: number;
+  /** Epoch ms when our system fetched this quote (server wall-clock). */
+  fetchedAt: number;
 }
 
 /** Compact watchlist row. */
@@ -89,6 +105,45 @@ export interface AIAnalysis {
   };
   invalidation?: string;
   instrumentClass?: "equity" | "index" | "future" | "option_ce" | "option_pe";
+  /** Phase 2/4: decision snapshot context — the exact market state the AI used. */
+  decisionPrice?: number;
+  decisionTimestamp?: number;
+  marketTimestamp?: number;
+  dataFreshnessMs?: number;
+  /** Phase 5: live price delta since the AI decision (not a prediction metric). */
+  priceDelta?: number;
+  priceDeltaPercent?: number;
+}
+
+/**
+ * Canonical live-market state — single source of truth consumed by all
+ * Dashboard, Signals, and AI Intelligence components.
+ *
+ * Produced by `marketDataStore.getLiveMarketState()`.  No component should
+ * maintain its own independent quote cache.
+ */
+export interface LiveMarketState {
+  symbol: string;
+  price: number;
+  previousClose?: number;
+  change?: number;
+  changePct?: number;
+  dayOpen?: number;
+  dayHigh?: number;
+  dayLow?: number;
+  volume?: number;
+  vwap?: number;
+  /** When the exchange said the price occurred (epoch ms, UTC). */
+  marketTimestamp: number;
+  /** When our system retrieved the data (epoch ms, UTC). */
+  fetchedAt: number;
+  source: "upstox" | "mock";
+  /** Open / closed determined by the authoritative market status endpoint. */
+  marketStatus: "OPEN" | "CLOSED" | "PRE_OPEN" | "POST_MARKET" | "UNKNOWN";
+  /** ms since marketTimestamp (authoritative). Falls back to fetchedAt. */
+  freshnessMs: number;
+  isStale: boolean;
+  isLive: boolean;
 }
 
 /** A trading signal (analytical only — NEVER execution).

@@ -47,7 +47,7 @@
 // component.
 
 import { dataSource } from "./MarketDataSource";
-import type { MarketQuote } from "@/types";
+import type { MarketQuote, LiveMarketState } from "@/types";
 
 export type Freshness = "fresh" | "stale" | "error" | "closed" | "never";
 
@@ -60,7 +60,13 @@ export interface QuoteState {
   lastAttemptTs: number | null;
   /** Human-readable error message when freshness === "error". */
   error: string | null;
+  /** Epoch ms of the exchange trade tick (authoritative freshness source). */
+  marketTimestamp: number | null;
+  /** Epoch ms when our system fetched the data (server wall-clock fallback). */
+  fetchedAt: number | null;
 }
+
+export type { LiveMarketState };
 
 export interface SessionState {
   market: string;
@@ -75,6 +81,7 @@ export const DEFAULT_STALE_AFTER_MS = 5_000;
 
 type Listener = (state: QuoteState) => void;
 type SessionListener = (state: SessionState | null) => void;
+type LiveListener = (state: LiveMarketState | null) => void;
 
 interface SymbolEntry {
   state: QuoteState;
@@ -85,6 +92,12 @@ interface SymbolEntry {
   active: boolean;
 }
 
+type LiveCacheEntry = {
+  state: QuoteState;
+  session: SessionState | null;
+  value: LiveMarketState;
+};
+
 function emptyState(): QuoteState {
   return {
     data: null,
@@ -92,6 +105,8 @@ function emptyState(): QuoteState {
     lastSuccessTs: null,
     lastAttemptTs: null,
     error: null,
+    marketTimestamp: null,
+    fetchedAt: null,
   };
 }
 
@@ -105,6 +120,7 @@ class MarketDataStore {
   private staleAfterMs: number = DEFAULT_STALE_AFTER_MS;
   private clockTimer: ReturnType<typeof setInterval> | null = null;
   private clockListeners = new Set<() => void>();
+  private liveCache = new Map<string, LiveCacheEntry>();
   private stopped = false;
 
   configure(opts: { pollIntervalMs?: number; staleAfterMs?: number }): void {
@@ -127,8 +143,14 @@ class MarketDataStore {
    * the default (empty) state if no fetch has been triggered yet.
    */
   getState(symbol: string): QuoteState {
-    const entry = this.entries.get(symbol);
-    if (!entry) return emptyState();
+    let entry = this.entries.get(symbol);
+    if (!entry) {
+      entry = {
+        state: emptyState(), listeners: new Set(), inflight: null,
+        timer: null, active: false,
+      };
+      this.entries.set(symbol, entry);
+    }
     return this.computeFreshness(entry);
   }
 
@@ -204,6 +226,26 @@ class MarketDataStore {
   }
 
   /**
+   * Subscribe to the canonical LiveMarketState for `symbol`.
+   * Pushes a new LiveMarketState whenever the quote or session
+   * changes.  Returns an unsubscribe function.
+   */
+  subscribeLive(symbol: string, listener: LiveListener): () => void {
+    const unsub = this.subscribe(symbol, () => {
+      listener(this.getLiveMarketState(symbol));
+    });
+    // Also re-emit on session changes.
+    const unsubSession = this.subscribeSession(() => {
+      listener(this.getLiveMarketState(symbol));
+    });
+    listener(this.getLiveMarketState(symbol));
+    return () => {
+      unsub();
+      unsubSession();
+    };
+  }
+
+  /**
    * Mark the current time so any ``"fresh"`` entry whose last
    * successful fetch is older than ``staleAfterMs`` is demoted to
    * ``"stale"``.  Components can subscribe to clock ticks (60 s) to
@@ -272,6 +314,7 @@ class MarketDataStore {
       entry.active = false;
     }
     this.entries.clear();
+    this.liveCache.clear();
     if (this.sessionTimer) clearInterval(this.sessionTimer);
     this.sessionTimer = null;
     if (this.clockTimer) clearInterval(this.clockTimer);
@@ -333,12 +376,16 @@ class MarketDataStore {
         const isClosed = session
           ? session.phase === "closed" || session.phase === "holiday"
           : quote.sessionState === "CLOSED";
+        const fetchedAt = quote.fetchedAt ?? Date.now();
+        const marketTimestamp = quote.marketTimestamp ?? fetchedAt;
         entry.state = {
           data: quote,
           freshness: isClosed ? "closed" : "fresh",
-          lastSuccessTs: Date.now(),
-          lastAttemptTs: Date.now(),
+          lastSuccessTs: fetchedAt,
+          lastAttemptTs: fetchedAt,
           error: null,
+          marketTimestamp,
+          fetchedAt,
         };
         for (const l of entry.listeners) l(entry.state);
       } catch (err) {
@@ -352,6 +399,8 @@ class MarketDataStore {
           lastSuccessTs: entry.state.lastSuccessTs,
           lastAttemptTs: now,
           error: had ? `${message} (showing last known value)` : message,
+          marketTimestamp: entry.state.marketTimestamp,
+          fetchedAt: entry.state.fetchedAt,
         };
         for (const l of entry.listeners) l(entry.state);
       } finally {
@@ -402,21 +451,85 @@ class MarketDataStore {
     if (entry.state.data === null) return entry.state;
     if (entry.state.freshness === "error") return entry.state;
     if (entry.state.freshness === "closed") return entry.state;
-    const age = entry.state.lastSuccessTs
-      ? Date.now() - entry.state.lastSuccessTs
-      : Infinity;
+    // Freshness is computed from the AUTHORITATIVE market timestamp
+    // (exchange tick time).  If that is unavailable we fall back to the
+    // fetch time — but we never claim a quote is fresh based on a
+    // client-side clock we don't control.
+    const ref = entry.state.marketTimestamp ?? entry.state.lastSuccessTs;
+    const age = ref ? Date.now() - ref : Infinity;
     if (age > this.staleAfterMs) {
       // CRITICAL: only allocate a new object when freshness actually
       // transitions.  Returning a fresh object on every call would
       // make useSyncExternalStore loop forever because each render
       // produces a new identity.
       if (entry.state.freshness === "stale") return entry.state;
-      return { ...entry.state, freshness: "stale" };
+      entry.state = { ...entry.state, freshness: "stale" };
+      return entry.state;
     }
     if (entry.state.freshness === "stale") {
-      return { ...entry.state, freshness: "fresh" };
+      entry.state = { ...entry.state, freshness: "fresh" };
+      return entry.state;
     }
     return entry.state;
+  }
+
+  /**
+   * Produce the canonical LiveMarketState for ``symbol``.
+   *
+   * This is the single authoritative representation of the current live
+   * market state.  All consumers (Dashboard, Signals, AI Intelligence,
+   * Sidebar) should read from this method rather than maintaining their
+   * own quote caches.
+   */
+  getLiveMarketState(symbol: string): LiveMarketState | null {
+    const entry = this.entries.get(symbol);
+    if (!entry || !entry.state.data) return null;
+    const state = this.computeFreshness(entry);
+    if (!state.data) return null;
+    const cached = this.liveCache.get(symbol);
+    if (cached && cached.state === state && cached.session === this.sessionState) {
+      return cached.value;
+    }
+    const now = Date.now();
+    const ref = state.marketTimestamp ?? state.lastSuccessTs ?? now;
+    const freshnessMs = Math.max(0, now - ref);
+    const session = this.sessionState;
+    const marketStatus = !session
+      ? "UNKNOWN"
+      : session.phase === "regular"
+        ? "OPEN"
+        : session.phase === "pre_market"
+          ? "PRE_OPEN"
+          : session.phase === "post_market"
+            ? "POST_MARKET"
+            : session.phase === "closed" || session.phase === "holiday"
+              ? "CLOSED"
+              : "UNKNOWN";
+    const value: LiveMarketState = {
+      symbol: state.data.symbol,
+      price: state.data.price,
+      previousClose: state.data.previousClose,
+      change: state.data.change,
+      changePct: state.data.changePct,
+      dayOpen: state.data.dayOpen,
+      dayHigh: state.data.dayHigh,
+      dayLow: state.data.dayLow,
+      volume: state.data.volume,
+      vwap: state.data.vwap,
+      marketTimestamp: state.marketTimestamp ?? state.lastSuccessTs ?? now,
+      fetchedAt: state.fetchedAt ?? state.lastSuccessTs ?? now,
+      source: dataSource.mode === "live" ? "upstox" : "mock",
+      marketStatus,
+      freshnessMs,
+      isStale: freshnessMs > this.staleAfterMs || state.freshness === "stale",
+      isLive:
+        (marketStatus === "OPEN" || marketStatus === "PRE_OPEN" || marketStatus === "POST_MARKET") &&
+        freshnessMs <= this.staleAfterMs &&
+        state.freshness !== "error" &&
+        state.freshness !== "closed",
+    };
+    this.liveCache.set(symbol, { state, session: this.sessionState, value });
+    return value;
   }
 }
 

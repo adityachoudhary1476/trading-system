@@ -317,6 +317,90 @@ def test_ai_valid_response():
     assert 0.0 <= ai.confidence <= 1.0
 
 
+def test_analysis_context_has_decision_fields():
+    """AnalysisContext accepts and serializes decision_timestamp / decision_price."""
+    from datetime import datetime, timezone
+
+    ts = datetime(2024, 6, 15, 9, 30, tzinfo=timezone.utc)
+    ctx = AnalysisContext(
+        instrument={"symbol": "NSE:SBIN"},
+        timeframe="1d",
+        market_regime={},
+        features={"close": 100.0, "data_points": 200},
+        signal_candidate={},
+        decision_timestamp=ts,
+        decision_price=100.0,
+    )
+    assert ctx.decision_timestamp == ts
+    assert ctx.decision_price == 100.0
+    j = ctx.to_json()
+    assert j["decision_timestamp"] == "2024-06-15T09:30:00+00:00"
+    assert j["decision_price"] == 100.0
+
+
+def test_reason_uses_decision_timestamp_not_now():
+    """reason() stamps the MarketSnapshot with decision_timestamp, not wall-clock."""
+    from datetime import datetime, timezone
+
+    df = _ohlc(260, drift=0.3, vol=0.15)
+    eng = MarketIntelligenceEngine(lookback=60)
+    res = eng.analyze("NSE:SBIN", "1d", df)
+    fixed_ts = datetime(2024, 6, 15, 9, 30, tzinfo=timezone.utc)
+
+    class _CheckProvider:
+        name = "check"
+        is_available = True
+
+        def __init__(self):
+            self.received_ts = None
+
+        def analyze(self, snapshot):
+            self.received_ts = snapshot.timestamp
+            from trading_system.models.market_view import MarketView, MarketViewEnum
+
+            return MarketView(
+                symbol=snapshot.symbol,
+                timeframe=snapshot.timeframe,
+                market_view=MarketViewEnum.BULLISH,
+                confidence=0.5,
+                reasoning_summary="test",
+                bullish_factors=["test bullish factor"],
+                bearish_factors=[],
+                risks=[],
+                invalidating_conditions=[],
+                model=self.name,
+            )
+
+    prov = _CheckProvider()
+    ctx = AnalysisContext(
+        instrument={"symbol": "NSE:SBIN"},
+        timeframe="1d",
+        market_regime={"regime": res["regime"].regime.value, "confidence": res["regime"].confidence},
+        features=res["features"].__dict__,
+        signal_candidate=res["signal_candidate"].__dict__,
+        decision_timestamp=fixed_ts,
+        decision_price=res["features"].close,
+    )
+    MarketReasoningProvider(prov).reason(ctx)
+    # The snapshot timestamp must equal the decision timestamp, NOT datetime.now()
+    assert prov.received_ts == fixed_ts
+
+
+def test_analyze_returns_decision_timestamp_and_price():
+    """analyze() exposes decision_timestamp (last closed bar) and decision_price."""
+    df = _ohlc(260, drift=0.3, vol=0.15)
+    eng = MarketIntelligenceEngine(lookback=60)
+    res = eng.analyze("NSE:SBIN", "1d", df)
+    assert "decision_timestamp" in res
+    assert "decision_price" in res
+    assert res["decision_price"] == res["features"].close
+    expected_ts = df.index[-1]
+    actual_ts = res["decision_timestamp"]
+    if getattr(actual_ts, "tzinfo", None) is None:
+        actual_ts = actual_ts.tz_localize("UTC")
+    assert actual_ts == expected_ts
+
+
 def test_ai_malformed_rejected():
     from pydantic import ValidationError
 

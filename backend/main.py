@@ -38,17 +38,14 @@ async def lifespan(app: FastAPI):
     if settings.live_pipeline_enabled:
         try:
             from runtime import get_trading_runtime
-            from services.broker import get_upstox_access_token
 
             runtime = get_trading_runtime()
-
-            # Note: Starting the live pipeline requires an access token.
-            # In a multi-user system, this would need to be handled differently.
-            # For now, we log that the pipeline should be started with user credentials.
-            logger.info(
-                "Live pipeline is enabled but requires user credentials. "
-                "Pipeline will be started on first authenticated request."
+            symbols = [s.strip() for s in settings.signal_universe.split(",") if s.strip()]
+            runtime.start(
+                access_token=settings.upstox_service_account_token,
+                symbols=symbols,
             )
+            logger.info("Live pipeline started for %d configured symbols", len(symbols))
 
         except Exception as e:
             logger.error("Failed to initialize trading runtime: %s", str(e))
@@ -61,7 +58,7 @@ async def lifespan(app: FastAPI):
     try:
         from runtime import get_trading_runtime
         runtime = get_trading_runtime()
-        if runtime.state.running:
+        if runtime.state.state.value not in ("stopped", "disabled"):
             runtime.stop()
             logger.info("Trading runtime stopped")
     except Exception as e:

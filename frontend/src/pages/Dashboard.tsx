@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useRef, useState } from "react";
 import { useApp } from "@/store/AppContext";
 import { dataSource } from "@/data/MarketDataSource";
 import type { OHLCVBar } from "@/types";
@@ -9,19 +9,8 @@ import { DataHealthPanel } from "@/components/system/DataHealthPanel";
 import { MarketStatusPanel } from "@/components/layout/MarketStatusPanel";
 import { TickerStrip } from "@/components/market/TickerStrip";
 import { Panel, Loading } from "@/components/ui";
-import { useQuote } from "@/data/useQuote";
 import { useMarketStatus } from "@/data/useQuote";
 import { fmtTimeIST } from "@/lib/format";
-
-// Bar size (ms) by timeframe, used to merge the live tick into the
-// in-progress candle.  Values are aligned with the historical candle
-// window the backend uses.
-const TF_BAR_MS: Record<string, number> = {
-  "1m": 60_000,
-  "1D": 24 * 60 * 60_000,
-  "1W": 7 * 24 * 60 * 60_000,
-  "1M": 30 * 24 * 60 * 60_000,
-};
 
 // India Standard Time is UTC+5:30. Upstox timestamps NSE candles at
 // 00:00 local (IST), which in epoch-ms UTC is 18:30 of the *previous*
@@ -76,7 +65,7 @@ export function floorToBar(ts: number, barMs: number): number {
 // Timeframes exposed to the operator. Each entry is a key that the
 // Upstox-backed Vercel OHLCV handler accepts verbatim (see
 // `frontend/api/market/ohlcv.ts` INTERVAL_MAP). Do NOT add entries that the
-// handler will reject with 400 — unsupported timeframes produce empty charts
+// handler will reject with 400 â€” unsupported timeframes produce empty charts
 // and force the user to guess the supported set.
 const TIMEFRAMES = ["1m", "1D", "1W", "1M"] as const;
 const INDICATOR_KEYS: { key: keyof IndicatorConfig; label: string }[] = [
@@ -102,17 +91,23 @@ export function DashboardPage() {
   const [indicators, setIndicators] = useState<IndicatorConfig>(DEFAULT_INDICATORS);
   const [levels, setLevels] = useState<number[]>([]);
   const [drawTool, setDrawTool] = useState<DrawTool>("none");
+  const readModelVersion = useRef(-1);
 
   useEffect(() => {
     let alive = true;
     setBars(null);
     setLoading(true);
     setError(null);
-    dataSource
-      .getOHLCV(selectedSymbol, tf, 160)
-      .then((r) => {
+    readModelVersion.current = -1;
+    const load = dataSource.getCandleReadModel
+      ? dataSource.getCandleReadModel(selectedSymbol, tf, 160)
+      : dataSource.getOHLCV(selectedSymbol, tf, 160).then((candles) => ({ candles, version: 0 }));
+    load
+      .then((model) => {
         if (!alive) return;
-        setBars(r);
+        if (model.version < readModelVersion.current) return;
+        readModelVersion.current = model.version;
+        setBars(model.candles);
         setLoading(false);
       })
       .catch((err: unknown) => {
@@ -125,7 +120,6 @@ export function DashboardPage() {
     };
   }, [selectedSymbol, tf]);
 
-  const { data: liveQuote, lastSuccessTs: liveTickTs } = useQuote(selectedSymbol);
   const session = useMarketStatus();
 
   // Periodically refresh OHLCV during market hours so the historical
@@ -137,36 +131,28 @@ export function DashboardPage() {
     const phase = session?.phase ?? "closed";
     const isOpen = phase === "regular" || phase === "pre_market" || phase === "post_market";
     if (!session || !isOpen) return;
-    // Refresh every 60 s during market hours.
+    let alive = true;
+    // Refresh the authoritative read model during market hours.
     const id = setInterval(() => {
-      dataSource
-        .getOHLCV(selectedSymbol, tf, 160)
-        .then((r) => setBars(r))
+      const load = dataSource.getCandleReadModel
+        ? dataSource.getCandleReadModel(selectedSymbol, tf, 160)
+        : dataSource.getOHLCV(selectedSymbol, tf, 160).then((candles) => ({ candles, version: 0 }));
+      load
+        .then((model) => {
+          if (!alive || model.version < readModelVersion.current) return;
+          readModelVersion.current = model.version;
+          setBars(model.candles);
+        })
         .catch((err: unknown) => {
+          if (!alive) return;
           setError(err instanceof Error ? err.message : "Failed to load chart data");
           setLoading(false);
         });
-    }, 60_000);
-    return () => clearInterval(id);
+    }, 1_000);
+    return () => { alive = false; clearInterval(id); };
   }, [selectedSymbol, tf, session?.phase]);
-  const [mergedBars, setMergedBars] = useState<OHLCVBar[] | null>(null);
-  // Merge the live tick into the historicals so the chart shows a
-  // smoothly-updating rightmost bar without polling the OHLCV endpoint
-  // every second.  When a new OHLCV fetch lands, we snap back to it.
-  useEffect(() => {
-    if (!bars) {
-      setMergedBars(null);
-      return;
-    }
-    const barMs = TF_BAR_MS[tf] ?? 0;
-    if (!liveQuote || !liveTickTs) {
-      setMergedBars(bars);
-      return;
-    }
-    setMergedBars(mergeLiveTick(bars, liveQuote.price, liveTickTs, barMs));
-  }, [bars, liveQuote?.price, liveTickTs, tf]);
 
-  const lastClose = mergedBars && mergedBars.length ? mergedBars[mergedBars.length - 1].close : 0;
+  const lastClose = bars && bars.length ? bars[bars.length - 1].close : 0;
   const toggleInd = (k: keyof IndicatorConfig) =>
     setIndicators((prev) => ({ ...prev, [k]: !prev[k] }));
   const addLevel = () => { if (lastClose) setLevels((p) => [...p, lastClose]); };
@@ -258,19 +244,19 @@ export function DashboardPage() {
           >
             {bars ? (
               <PriceChart
-                data={mergedBars ?? bars}
+                data={bars}
                 indicators={indicators}
                 levels={levels}
                 drawTool={drawTool}
               />
             ) : error ? (
               <div className="empty">
-                <div className="empty-icon" aria-hidden="true">⚠</div>
+                <div className="empty-icon" aria-hidden="true">âš </div>
                 <div style={{ fontWeight: 600, color: "var(--text-dim)" }}>Unable to load chart</div>
                 <div style={{ fontSize: 12, color: "var(--text-faint)" }}>{error}</div>
               </div>
             ) : (
-              <Loading label="Loading chart…" />
+              <Loading label="Loading chartâ€¦" />
             )}
           </Panel>
           <Panel title="Market Metrics">
@@ -285,9 +271,11 @@ export function DashboardPage() {
         </div>
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>
-        Demo data. The chart consumes OHLCV from <code>MarketDataSource</code> — swap to a real API/WS source tomorrow without UI changes.
+        Demo data. The chart consumes OHLCV from <code>MarketDataSource</code> â€” swap to a real API/WS source tomorrow without UI changes.
       </p>
     </>
   );
 }
+
+
 

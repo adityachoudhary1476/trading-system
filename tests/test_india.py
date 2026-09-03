@@ -87,6 +87,18 @@ def test_outside_hours_closed():
     assert market_state(night) == "closed"
 
 
+def test_regular_session_excludes_pre_and_post_market_boundaries():
+    pre_open = datetime(2024, 3, 6, 9, 0, tzinfo=KOL)
+    close = datetime(2024, 3, 6, 15, 30, tzinfo=KOL)
+    assert not is_within_session(pre_open)
+    assert not is_within_session(close)
+
+
+def test_regular_session_boundary_is_not_inclusive_at_close():
+    close = datetime(2024, 3, 6, 15, 30, tzinfo=KOL)
+    assert market_state(close) == "closed"
+
+
 def test_session_boundaries_weekend_rolls_to_monday():
     sat = datetime(2024, 3, 2, 12, 0, tzinfo=KOL)
     open_dt, close_dt = session_boundaries(sat)

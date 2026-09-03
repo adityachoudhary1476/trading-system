@@ -94,6 +94,7 @@ describe("Quote handler — happy path", () => {
     const res = makeRes();
     await handler(req, res);
     expect(res.statusCode).toBe(200);
+    expect((res.headers as Record<string, string>)["Cache-Control"]).toContain("no-store");
     const body = res.body as Record<string, unknown>;
     expect(body.symbol).toBe("NSE:SBIN");
     expect(body.price).toBe(800.5);

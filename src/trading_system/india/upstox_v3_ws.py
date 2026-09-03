@@ -23,6 +23,7 @@ from typing import Callable, Optional
 import requests
 
 from .events import InternalMarketEvent, EventType
+from .live_market_state import normalize_timestamp_ms, TimestampValidationError
 from .upstox_v3_pb import (
     FeedResponse,
     FeedType,
@@ -75,6 +76,7 @@ class UpstoxV3WebSocket:
         access_token: str,
         instrument_keys: list[str],
         on_event: Callable,
+        symbol_map: Optional[dict[str, str]] = None,
         mode: RequestMode = RequestMode.LTPC,
         max_retries: int = 6,
     ) -> None:
@@ -91,6 +93,7 @@ class UpstoxV3WebSocket:
         self.access_token = access_token
         self.instrument_keys = instrument_keys
         self.on_event = on_event
+        self.symbol_map = symbol_map or {}
         self.mode = mode
         self.max_retries = max_retries
 
@@ -101,6 +104,7 @@ class UpstoxV3WebSocket:
         self._on_disconnect_cb: Optional[Callable] = None
         self._on_auth_error_cb: Optional[Callable] = None
         self._on_error_cb: Optional[Callable] = None
+        self._on_invalid_cb: Optional[Callable] = None
         self._ws_thread: Optional[threading.Thread] = None
 
     def _authorize(self) -> str:
@@ -292,6 +296,8 @@ class UpstoxV3WebSocket:
 
         except Exception as e:
             log.error("Failed to decode V3 message: %s", e)
+            if self._on_invalid_cb:
+                self._on_invalid_cb(e)
 
     def _normalize(
         self,
@@ -318,14 +324,16 @@ class UpstoxV3WebSocket:
         if not ltpc or not ltpc.ltp:
             return None
 
-        # Convert timestamp from milliseconds to datetime
-        # V3 timestamps are in milliseconds
-        if ltpc.ltt:
-            ts = datetime.fromtimestamp(ltpc.ltt / 1000, tz=timezone.utc)
-        elif current_ts:
-            ts = datetime.fromtimestamp(current_ts / 1000, tz=timezone.utc)
-        else:
-            ts = datetime.now(timezone.utc)
+        # V3 timestamps are milliseconds. Missing market time is not replaced
+        # with server time because that would create a false market event.
+        try:
+            timestamp_ms = normalize_timestamp_ms(ltpc.ltt or current_ts)
+        except TimestampValidationError:
+            log.warning("Dropping Upstox event with invalid market timestamp")
+            return None
+        if timestamp_ms is None:
+            return None
+        ts = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
 
         # Extract OHLC if available
         open_price = None
@@ -345,7 +353,7 @@ class UpstoxV3WebSocket:
 
         return InternalMarketEvent(
             event_type=EventType.QUOTE,
-            symbol=instrument_key,
+            symbol=self.symbol_map.get(instrument_key, instrument_key),
             exchange=instrument_key.split("|")[0] if "|" in instrument_key else "",
             provider_symbol=instrument_key,
             timestamp=ts,
@@ -355,6 +363,7 @@ class UpstoxV3WebSocket:
             low=low_price,
             close=close_price,
             volume=volume,
+            fetched_at=datetime.now(timezone.utc),
             raw={"instrument_key": instrument_key, "ltpc": ltpc},
         )
 
@@ -373,6 +382,10 @@ class UpstoxV3WebSocket:
     def on_error_cb(self, cb: Callable) -> None:
         """Set error callback."""
         self._on_error_cb = cb
+
+    def on_invalid_cb(self, cb: Callable) -> None:
+        """Set malformed-message callback."""
+        self._on_invalid_cb = cb
 
     def close(self) -> None:
         """Close the WebSocket connection."""

@@ -36,6 +36,8 @@ class FeedMetrics:
     last_update_ts: float = 0.0
     connected: bool = False
     auth_ok: bool = True
+    recovery_complete: bool = True
+    recovery_error: Optional[str] = None
 
 
 @dataclass
@@ -59,6 +61,17 @@ class DataHealthMonitor:
     def on_disconnect(self) -> None:
         self.metrics.connected = False
         self.status = FeedStatus.DISCONNECTED
+
+    def on_recovery_start(self) -> None:
+        self.metrics.recovery_complete = False
+        self.metrics.recovery_error = None
+        self.status = FeedStatus.STALE
+
+    def on_recovery_complete(self, success: bool, error: Optional[str] = None) -> None:
+        self.metrics.recovery_complete = success
+        self.metrics.recovery_error = error
+        if not success:
+            self.status = FeedStatus.STALE
 
     def on_auth_error(self) -> None:
         self.metrics.auth_ok = False
@@ -117,6 +130,9 @@ class DataHealthMonitor:
         if not self.metrics.auth_ok:
             self.status = FeedStatus.AUTH_ERROR
             return self.status
+        if not self.metrics.recovery_complete:
+            self.status = FeedStatus.STALE
+            return self.status
         if self._last_msg_wall and (now - self._last_msg_wall) > self.stale_seconds:
             self.status = FeedStatus.STALE
         else:
@@ -135,7 +151,9 @@ class DataHealthMonitor:
             "duplicate_events": m.duplicate_events,
             "candles_generated": m.candles_generated,
             "candles_rejected": m.candles_rejected,
-            "latest_event_ts": m.latest_event_ts.isoformat() if m.latest_event_ts else None,
-            "latest_closed_candle": m.latest_closed_candle.isoformat() if m.latest_closed_candle else None,
+            "latest_event_ts": int(m.latest_event_ts.timestamp() * 1000) if m.latest_event_ts else None,
+            "latest_closed_candle": int(m.latest_closed_candle.timestamp() * 1000) if m.latest_closed_candle else None,
             "connected": m.connected,
+            "recovery_complete": m.recovery_complete,
+            "recovery_error": m.recovery_error,
         }

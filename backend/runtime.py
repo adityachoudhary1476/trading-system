@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from config import get_settings
+from services.market_recovery import MarketRecovery, RecoveryState
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +107,10 @@ class TradingRuntime:
         self._lock = threading.Lock()
         self._shutdown_event = threading.Event()
         self._websocket_thread: Optional[threading.Thread] = None
+        self._candle_read_model: Optional[object] = None
+        self._market_store: Optional[object] = None
+        self._recovery: Optional[MarketRecovery] = None
+        self._websocket_disconnected = threading.Event()
         self._reconnect_delay = self.INITIAL_RECONNECT_DELAY
 
     @property
@@ -122,6 +127,11 @@ class TradingRuntime:
     def pipeline(self) -> Optional[object]:
         """Get the LiveMarketPipeline instance."""
         return self._pipeline
+
+    @property
+    def candle_read_model(self) -> Optional[object]:
+        """Get the authoritative candle read model."""
+        return self._candle_read_model
 
     @property
     def is_connected(self) -> bool:
@@ -146,6 +156,10 @@ class TradingRuntime:
             belong to a dedicated account used solely for market data.
         """
         with self._lock:
+            if not access_token or not access_token.strip():
+                raise ValueError("UPSTOX_SERVICE_ACCOUNT_TOKEN is not configured")
+            if not symbols:
+                raise ValueError("live runtime requires at least one configured symbol")
             if self._state.state in (RuntimeStateEnum.STARTING, RuntimeStateEnum.CONNECTED, RuntimeStateEnum.CONNECTING):
                 logger.warning("Trading runtime already running or starting")
                 return
@@ -162,6 +176,8 @@ class TradingRuntime:
                 from src.trading_system.india.upstox import UpstoxMarketDataProvider
                 from src.trading_system.india.data_health import DataHealthMonitor
                 from src.trading_system.config import settings as ts_settings
+                from services.live_candle_read_model import LiveCandleReadModel
+                from src.trading_system.storage.database import MarketStore
 
                 # Get client_id from settings (dedicated market data account)
                 settings = get_settings()
@@ -184,15 +200,31 @@ class TradingRuntime:
                     timeframe=timeframe,
                     health=self._health_monitor,
                 )
+                self._candle_read_model = LiveCandleReadModel(timeframe)
+                self._pipeline.subscribe_market_state(self._candle_read_model.on_snapshot)
+                self._pipeline.candle_pipeline.on_closed(self._candle_read_model.on_closed_candle)
+                self._market_store = MarketStore(settings.market_data_db_url)
+                self._pipeline.candle_pipeline.set_closed_persistence(self._persist_closed_candle)
+                for symbol in symbols:
+                    stored = self._market_store.load(symbol, timeframe)
+                    if not stored.empty:
+                        self._pipeline.seed_historical_df(symbol, stored)
+                        self._candle_read_model.seed_historical_df(symbol, timeframe, stored)
 
                 # Create Upstox provider for WebSocket
                 self._upstox_provider = UpstoxMarketDataProvider(
                     client_id=client_id,
                     access_token=access_token,
                 )
+                self._recovery = MarketRecovery(
+                    self._upstox_provider, self._pipeline, self._candle_read_model,
+                    self._market_store,
+                )
 
                 # Start the pipeline
                 self._pipeline.start()
+                self._health_monitor.on_disconnect()
+                self._run_recovery(symbols, initial=True)
                 self._state.started_at = time.time()
 
                 # Connect WebSocket in a background thread
@@ -222,6 +254,8 @@ class TradingRuntime:
         This method handles reconnection with bounded exponential backoff.
         """
         def run_websocket():
+            from src.trading_system.india.upstox_v3_ws import UpstoxV3AuthorizationError
+
             self._reconnect_delay = self.INITIAL_RECONNECT_DELAY
             reconnect_attempts = 0
 
@@ -245,10 +279,13 @@ class TradingRuntime:
                         access_token=access_token,
                     )
                     instrument_keys: list[str] = []
+                    symbol_map: dict[str, str] = {}
                     unresolved: list[str] = []
                     for s in symbols:
                         try:
-                            instrument_keys.append(resolver.resolve(s))
+                            resolved = resolver.resolve(s)
+                            instrument_keys.append(resolved)
+                            symbol_map[resolved] = s
                         except UnresolvedInstrumentError as e:
                             logger.error(
                                 "Skipping unresolved Upstox V3 instrument for %s: %s",
@@ -271,6 +308,7 @@ class TradingRuntime:
                         access_token=access_token,
                         instrument_keys=instrument_keys,
                         on_event=self._pipeline.ingest,
+                        symbol_map=symbol_map,
                         max_retries=self.MAX_RECONNECT_ATTEMPTS,
                     )
 
@@ -281,6 +319,7 @@ class TradingRuntime:
                     self._websocket.on_error_cb(lambda e: self._health_monitor.on_invalid())
 
                     # Connect (this calls authorize endpoint first)
+                    self._websocket_disconnected.clear()
                     self._websocket.connect()
 
                     # Reset reconnect state on successful connection
@@ -288,8 +327,22 @@ class TradingRuntime:
                     self._reconnect_delay = self.INITIAL_RECONNECT_DELAY
 
                     # Wait for shutdown or disconnect
-                    while not self._shutdown_event.is_set():
-                        time.sleep(0.1)
+                    disconnected = self._websocket_disconnected.wait(timeout=None)
+                    if self._shutdown_event.is_set():
+                        break
+                    if disconnected:
+                        if self._websocket:
+                            self._websocket.close()
+                        self._set_state(RuntimeStateEnum.CONNECTING)
+                        self._run_recovery(symbols)
+                        raise RuntimeError("Upstox WebSocket disconnected")
+
+                except UpstoxV3AuthorizationError as e:
+                    self._set_state(RuntimeStateEnum.AUTH_ERROR, error=str(e))
+                    if self._health_monitor:
+                        self._health_monitor.on_auth_error()
+                    logger.error("WebSocket authentication failed; recovery stopped")
+                    break
 
                 except Exception as e:
                     if self._shutdown_event.is_set():
@@ -308,6 +361,8 @@ class TradingRuntime:
                         reconnect_attempts, self.MAX_RECONNECT_ATTEMPTS, str(e)
                     )
                     self._set_state(RuntimeStateEnum.DISCONNECTED, error=str(e))
+                    if self._health_monitor:
+                        self._health_monitor.on_disconnect()
 
                     # Bounded exponential backoff
                     delay = min(
@@ -326,19 +381,75 @@ class TradingRuntime:
     def _on_websocket_connect(self) -> None:
         """Handle WebSocket connection."""
         self._set_state(RuntimeStateEnum.CONNECTED)
+        if self._health_monitor:
+            self._health_monitor.on_connect()
+            if self._recovery and self._recovery.state == RecoveryState.DEGRADED:
+                self._health_monitor.on_recovery_start()
         logger.info("WebSocket connected")
 
     def _on_websocket_disconnect(self) -> None:
         """Handle WebSocket disconnection."""
         if not self._shutdown_event.is_set():
             self._set_state(RuntimeStateEnum.DISCONNECTED)
+            self._websocket_disconnected.set()
+            if self._health_monitor:
+                self._health_monitor.on_disconnect()
             logger.info("WebSocket disconnected, will attempt reconnect")
 
     def _on_websocket_auth_error(self) -> None:
         """Handle WebSocket authentication error."""
         self._set_state(RuntimeStateEnum.AUTH_ERROR)
+        self._websocket_disconnected.set()
+        if self._health_monitor:
+            self._health_monitor.on_auth_error()
         logger.error("WebSocket authentication failed")
         # Don't reconnect on auth errors - requires manual intervention
+
+    def _on_websocket_transport_error(self, error: object) -> None:
+        """Mark transport failure for reconnect; it is not invalid market data."""
+        if not self._shutdown_event.is_set():
+            self._websocket_disconnected.set()
+            self._set_state(RuntimeStateEnum.DISCONNECTED, error=str(error))
+            if self._health_monitor:
+                self._health_monitor.on_disconnect()
+
+    def _run_recovery(self, symbols: list[str], *, initial: bool = False) -> bool:
+        if not self._recovery or not self._health_monitor:
+            return True
+        self._health_monitor.on_recovery_start()
+        success = self._recovery.recover(symbols)
+        if success:
+            self._health_monitor.on_recovery_complete(True)
+        else:
+            self._health_monitor.on_recovery_complete(False, self._recovery.last_error)
+            logger.error("Market recovery incomplete%s: %s", " at startup" if initial else "", self._recovery.last_error)
+        return success
+
+    def _persist_closed_candle(self, candle) -> bool:
+        if not self._market_store:
+            return True
+        try:
+            self._market_store.commit_recovery(
+                candle.symbol,
+                candle.timeframe,
+                [{
+                    "timestamp": candle.start,
+                    "open": candle.open,
+                    "high": candle.high,
+                    "low": candle.low,
+                    "close": candle.close,
+                    "volume": candle.volume,
+                    "exchange": candle.symbol.split(":", 1)[0] if ":" in candle.symbol else None,
+                    "provider": "upstox",
+                }],
+                candle.start,
+            )
+            return True
+        except Exception as exc:
+            if self._health_monitor:
+                self._health_monitor.on_recovery_complete(False, str(exc))
+            logger.error("Failed to persist closed candle: %s", exc)
+            return False
 
     def _set_state(self, new_state: RuntimeStateEnum, error: Optional[str] = None) -> None:
         """Set the runtime state."""
@@ -365,6 +476,7 @@ class TradingRuntime:
 
             self._set_state(RuntimeStateEnum.STOPPING)
             self._shutdown_event.set()
+            self._websocket_disconnected.set()
 
             try:
                 # Stop pipeline

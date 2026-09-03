@@ -10,6 +10,7 @@ Design goals:
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
 from typing import Iterable
 
 import pandas as pd
@@ -79,6 +80,25 @@ class OHLCVRecord(Base):
         return f"<OHLCV {self.symbol} {self.timeframe} {self.timestamp}>"
 
 
+class RecoveryPointRecord(Base):
+    __tablename__ = "market_recovery_points"
+    __table_args__ = ({"sqlite_autoincrement": True},)
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    symbol = Column(String(32), nullable=False, index=True)
+    timeframe = Column(String(8), nullable=False, index=True)
+    latest_closed_candle = Column(DateTime(timezone=True), nullable=True)
+    last_recovery_at = Column(DateTime(timezone=True), nullable=True)
+    last_live_timestamp = Column(DateTime(timezone=True), nullable=True)
+    recovery_status = Column(String(32), nullable=False, default="unknown")
+    recovery_error = Column(String(512), nullable=True)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+    __table_args__ = (
+        UniqueConstraint("symbol", "timeframe", name="uq_market_recovery_symbol_tf"),
+        {"sqlite_autoincrement": True},
+    )
+
+
 def init_db(engine) -> None:
     Base.metadata.create_all(engine)
     # SQLite-safe forward migration: add columns introduced after Day 1 without
@@ -100,6 +120,8 @@ class MarketStore:
     """Thin persistence layer over the market_data table."""
 
     def __init__(self, db_url: str, echo: bool = False) -> None:
+        if db_url.startswith("sqlite:///") and not db_url.endswith(":memory:"):
+            Path(db_url[10:]).parent.mkdir(parents=True, exist_ok=True)
         self.engine = create_engine(db_url, echo=echo, future=True)
         self._Session = sessionmaker(bind=self.engine, future=True)
         init_db(self.engine)
@@ -116,7 +138,110 @@ class MarketStore:
             ts = ts.to_pydatetime()
         if isinstance(ts, dt.datetime) and ts.tzinfo is None:
             ts = ts.replace(tzinfo=dt.timezone.utc)
+        if isinstance(ts, dt.datetime):
+            ts = ts.astimezone(dt.timezone.utc)
         return ts
+
+    def get_recovery_point(self, symbol: str, timeframe: str) -> dict | None:
+        with self._Session() as session:
+            row = session.execute(
+                select(RecoveryPointRecord)
+                .where(RecoveryPointRecord.symbol == symbol)
+                .where(RecoveryPointRecord.timeframe == timeframe)
+            ).scalar_one_or_none()
+        if row is None:
+            return None
+        return {
+            "symbol": row.symbol,
+            "timeframe": row.timeframe,
+            "latest_closed_candle": self._to_dt(row.latest_closed_candle),
+            "last_recovery_at": self._to_dt(row.last_recovery_at) if row.last_recovery_at else None,
+            "last_live_timestamp": self._to_dt(row.last_live_timestamp) if row.last_live_timestamp else None,
+            "recovery_status": row.recovery_status,
+            "recovery_error": row.recovery_error,
+            "updated_at": self._to_dt(row.updated_at),
+        }
+
+    def record_recovery_status(
+        self, symbol: str, timeframe: str, status: str, error: str | None = None
+    ) -> None:
+        now = dt.datetime.now(dt.timezone.utc)
+        with self._Session.begin() as session:
+            row = session.execute(
+                select(RecoveryPointRecord)
+                .where(RecoveryPointRecord.symbol == symbol)
+                .where(RecoveryPointRecord.timeframe == timeframe)
+            ).scalar_one_or_none()
+            if row is None:
+                session.add(RecoveryPointRecord(
+                    symbol=symbol, timeframe=timeframe,
+                    recovery_status=status, recovery_error=error, updated_at=now,
+                ))
+            else:
+                row.recovery_status = status
+                row.recovery_error = error
+                row.updated_at = now
+
+    def commit_recovery(
+        self,
+        symbol: str,
+        timeframe: str,
+        rows: list[dict],
+        latest_closed_candle,
+        last_live_timestamp=None,
+    ) -> int:
+        """Atomically persist authoritative candles and advance the cursor."""
+        now = dt.datetime.now(dt.timezone.utc)
+        normalized = []
+        for row in rows:
+            record = dict(row)
+            record["symbol"] = symbol
+            record["timeframe"] = timeframe
+            record["timestamp"] = self._to_dt(record["timestamp"])
+            record["contract_id"] = record.get("contract_id") or symbol
+            normalized.append(record)
+
+        inserted = 0
+        with self._Session.begin() as session:
+            for record in normalized:
+                existing = session.execute(
+                    select(OHLCVRecord)
+                    .where(OHLCVRecord.symbol == symbol)
+                    .where(OHLCVRecord.timeframe == timeframe)
+                    .where(OHLCVRecord.timestamp == record["timestamp"])
+                ).scalars().first()
+                if existing is None:
+                    session.add(OHLCVRecord(**record))
+                    inserted += 1
+                else:
+                    # Historical provider data is authoritative for completed bars.
+                    for key in ("exchange", "contract_id", "open", "high", "low", "close", "volume", "provider"):
+                        setattr(existing, key, record.get(key))
+
+            point = session.execute(
+                select(RecoveryPointRecord)
+                .where(RecoveryPointRecord.symbol == symbol)
+                .where(RecoveryPointRecord.timeframe == timeframe)
+            ).scalar_one_or_none()
+            latest = self._to_dt(latest_closed_candle) if latest_closed_candle else None
+            live_ts = self._to_dt(last_live_timestamp) if last_live_timestamp else None
+            if point is None:
+                session.add(RecoveryPointRecord(
+                    symbol=symbol, timeframe=timeframe,
+                    latest_closed_candle=latest, last_recovery_at=now,
+                    last_live_timestamp=live_ts, recovery_status="complete",
+                    recovery_error=None, updated_at=now,
+                ))
+            else:
+                stored_latest = self._to_dt(point.latest_closed_candle) if point.latest_closed_candle else None
+                if latest is not None and (stored_latest is None or latest > stored_latest):
+                    point.latest_closed_candle = latest
+                point.last_recovery_at = now
+                point.last_live_timestamp = live_ts or point.last_live_timestamp
+                point.recovery_status = "complete"
+                point.recovery_error = None
+                point.updated_at = now
+        return inserted
 
     def upsert_many(self, rows: list[dict]) -> int:
         """Idempotently insert rows. Returns number of NEW rows inserted."""

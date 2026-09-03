@@ -65,6 +65,22 @@ export function fmtTime(ms: number | null): string {
 /** alias of fmtTime — explicit "render in IST" naming. */
 export const fmtTimeIST = fmtTime;
 
+/** epoch ms -> "5s" / "2m" / "3h" — renders a fixed duration, not relative to now. */
+export function fmtDuration(ms: number | null | undefined): string {
+  if (!isFiniteNumber(ms)) return "—";
+  if (ms < 0) return "—";
+  const sec = ms / 1000;
+  if (sec < 60) {
+    return fmtNum(sec, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "s";
+  }
+  const min = sec / 60;
+  if (min < 60) {
+    return fmtNum(min, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "m";
+  }
+  const hr = min / 60;
+  return fmtNum(hr, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + "h";
+}
+
 /** epoch ms -> "12s ago" / "5m ago" / "2h ago" in IST-aware now. */
 export function fmtAgo(ms: number | null): string {
   if (ms == null) return "—";

@@ -836,6 +836,8 @@ def _cmd_analyze_history(args: argparse.Namespace) -> int:
                     features=feats.__dict__,
                     signal_candidate=cand.__dict__,
                     data_quality=result["data_quality"],
+                    decision_timestamp=result["decision_timestamp"],
+                    decision_price=result["decision_price"],
                 )
                 reasoner = MarketReasoningProvider(prov)
                 ai = reasoner.reason(ctx)

@@ -14,8 +14,51 @@ class FactorDTO(BaseModel):
     tone: str  # positive, negative, neutral, warning
 
 
+class ExpectedMoveDTO(BaseModel):
+    """Estimated price range (analytical, NOT a probability forecast)."""
+
+    lowerPct: float
+    upperPct: float
+    basis: str  # "atr" | "volatility"
+
+
+class EvidenceDTO(BaseModel):
+    """Structured evidence ledger from the intelligence engine."""
+
+    positive: list[str] = Field(default_factory=list)
+    negative: list[str] = Field(default_factory=list)
+    neutral: list[str] = Field(default_factory=list)
+    agreement: str  # strong | moderate | mixed | neutral
+
+
+class OptionsCandidateDTO(BaseModel):
+    """A ranked options contract candidate (analytical only, not an order)."""
+
+    strike: float
+    option_type: str  # CE/PE
+    expiry: Optional[str] = None
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega: Optional[float] = None
+    implied_vol: Optional[float] = None
+    open_interest: Optional[float] = None
+    volume: Optional[float] = None
+    bid_ask_spread: Optional[float] = None
+    score: float = 0.0
+    rationale: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+
+
 class AIAnalysisDTO(BaseModel):
-    """AI market analysis response."""
+    """AI market analysis response.
+
+    Confidence is an *analytical* score in ``[0, 1]`` — it is NOT a
+    probability of profit and has not been statistically calibrated
+    against historical outcomes.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     symbol: str
     timeframe: str
@@ -24,8 +67,40 @@ class AIAnalysisDTO(BaseModel):
     signal: str  # long, short, hold, no_signal
     summary: str
     factors: list[FactorDTO] = Field(default_factory=list)
-    generated_at: int  # epoch ms
+    # named snake_case for backward-compatible population (test mocks pass
+    # ``generated_at``); serialized as camelCase ``generatedAt``.
+    generated_at: int = Field(serialization_alias="generatedAt")
     model: str
+    # --- new intelligence fields (Phase 3-13 upgrade) ---
+    horizon: Optional[str] = None
+    expectedMove: Optional[ExpectedMoveDTO] = None
+    evidence: Optional[EvidenceDTO] = None
+    invalidation: Optional[str] = None
+    instrumentClass: Optional[str] = None
+    optionsCandidates: list[OptionsCandidateDTO] = Field(default_factory=list)
+    optionsStatus: Optional[str] = None
+    # --- Phase 2/4: decision snapshot context (auditability) ---
+    # decisionPrice: the price the AI decision was based on (source candle
+    #   close or live quote at decision time).  NOT the current live price.
+    decisionPrice: Optional[float] = Field(
+        default=None, serialization_alias="decisionPrice",
+        description="Price at which the AI decision was generated",
+    )
+    # decisionTimestamp: epoch ms when the AI generated the decision (server time).
+    decisionTimestamp: Optional[int] = Field(
+        default=None, serialization_alias="decisionTimestamp",
+        description="Epoch ms when the AI decision was generated",
+    )
+    # marketTimestamp: epoch ms of the market data the decision was based on.
+    marketTimestamp: Optional[int] = Field(
+        default=None, serialization_alias="marketTimestamp",
+        description="Epoch ms of the source market data for this decision",
+    )
+    # dataFreshnessMs: computed freshness at decision time (now - marketTimestamp).
+    dataFreshnessMs: Optional[int] = Field(
+        default=None, serialization_alias="dataFreshnessMs",
+        description="MS elapsed between marketTimestamp and the fetch/decision time",
+    )
 
 
 class SignalDTO(BaseModel):
@@ -74,6 +149,41 @@ class PipelineStageDTO(BaseModel):
     metric: str
 
 
+class CandleReadDTO(BaseModel):
+    """One canonical candle returned by the live read model."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    time: int = Field(description="Candle start time, epoch milliseconds UTC")
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float = 0.0
+    is_closed: bool = Field(serialization_alias="isClosed")
+    source: str
+
+
+class CandleReadModelDTO(BaseModel):
+    """Authoritative closed plus current provisional candle state."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    symbol: str
+    timeframe: str
+    candles: list[CandleReadDTO]
+    current_candle: Optional[CandleReadDTO] = Field(
+        default=None, serialization_alias="currentCandle"
+    )
+    market_timestamp: Optional[int] = Field(
+        default=None, serialization_alias="marketTimestamp"
+    )
+    fetched_at: Optional[int] = Field(default=None, serialization_alias="fetchedAt")
+    freshness_ms: Optional[int] = Field(default=None, serialization_alias="freshnessMs")
+    session: str
+    version: int = Field(ge=0)
+
+
 class QuoteDTO(BaseModel):
     """A live quote (one tick snapshot).
 
@@ -101,8 +211,22 @@ class QuoteDTO(BaseModel):
     dayLow: Optional[float] = Field(default=None)
     volume: Optional[int] = Field(default=None)
     vwap: Optional[float] = Field(default=None)
+    # --- Canonical timestamp semantics (Phase 2) ---
+    # timestamp: epoch ms of the source tick as reported by the exchange
+    #             (authoritative market time).  Falls back to fetchedAt when
+    #             the provider does not supply a quote-level timestamp.
+    # marketTimestamp: same value, explicit alias for clarity on the wire.
+    # fetchedAt: epoch ms when our system retrieved the data (server wall-clock).
     timestamp: int = Field(
-        description="Epoch ms of the source tick (UTC)",
+        description="Epoch ms of the source tick (UTC); falls back to fetchedAt",
+    )
+    marketTimestamp: Optional[int] = Field(
+        default=None,
+        serialization_alias="marketTimestamp",
+        description="Epoch ms of the exchange trade tick (UTC)",
+    )
+    fetchedAt: int = Field(
+        description="Epoch ms when our server fetched this quote",
     )
     sessionState: str = Field(
         default="REGULAR",
@@ -176,6 +300,8 @@ class QuoteDTO(BaseModel):
             volume=_i(quote.get("volume")),
             vwap=_f(quote.get("average_price")),
             timestamp=ts_ms,
+            marketTimestamp=ts_ms,
+            fetchedAt=fallback_timestamp_ms,
             sessionState=session_state,
             instrumentToken=_i(quote.get("instrument_token")),
         )

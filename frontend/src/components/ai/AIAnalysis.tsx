@@ -1,12 +1,16 @@
 import { useEffect, useState } from "react";
 import { dataSource } from "@/data/MarketDataSource";
+import { usePriceDelta } from "@/data/useQuote";
 import type { AIAnalysis } from "@/types";
 import { Badge, Panel } from "@/components/ui";
-import { fmtPrice, fmtTime } from "@/lib/format";
+import { fmtPrice, fmtTime, fmtPct, fmtDuration } from "@/lib/format";
 
 export function AIAnalysisPanel({ symbol }: { symbol: string }) {
   const [ai, setAi] = useState<AIAnalysis | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Always call usePriceDelta so hook count stays constant regardless of
+  // whether analysis loads, errors, or is still pending.
+  const priceDelta = usePriceDelta(symbol, ai?.decisionPrice ?? null);
   useEffect(() => {
     let alive = true;
     setError(null);
@@ -40,6 +44,9 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
   const signal = ai.signal ?? "no_signal";
   const horizon = ai.horizon ?? "short_term";
   const evidence = ai.evidence;
+  const deltaPct = ai.decisionPrice && ai.decisionPrice !== 0 && priceDelta !== null
+    ? (priceDelta / ai.decisionPrice) * 100
+    : null;
   return (
     <Panel
       title="AI Market Intelligence"
@@ -141,6 +148,41 @@ export function AIAnalysisPanel({ symbol }: { symbol: string }) {
       </div>
 
       <div className="ai-summary">{ai.summary}</div>
+
+      {ai.decisionPrice != null && (
+        <div style={{ marginTop: 12, padding: "8px 12px", background: "var(--surface-2)", borderRadius: 6, border: "1px solid var(--border-color)" }}>
+          <div className="faint" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 6 }}>
+            Decision Snapshot
+          </div>
+          <div className="grid cols-2" style={{ gap: 8 }}>
+            <div className="stat">
+              <span className="label">Decision Price</span>
+              <span className="value mono">₹{fmtPrice(ai.decisionPrice)}</span>
+            </div>
+            <div className="stat">
+              <span className="label">Based On</span>
+              <span className="value mono" style={{ fontSize: 13 }}>{ai.marketTimestamp ? fmtTime(ai.marketTimestamp) : "—"}</span>
+            </div>
+            <div className="stat">
+              <span className="label">Generated</span>
+              <span className="value mono" style={{ fontSize: 13 }}>{ai.decisionTimestamp ? fmtTime(ai.decisionTimestamp) : "—"}</span>
+            </div>
+            <div className="stat">
+              <span className="label">Data Freshness</span>
+              <span className="value mono" style={{ fontSize: 13 }}>{fmtDuration(ai.dataFreshnessMs)}</span>
+            </div>
+            {priceDelta !== null && (
+              <div className="stat">
+                <span className="label">Live Δ</span>
+                <span className={`value mono ${priceDelta > 0 ? "pos" : priceDelta < 0 ? "neg" : "muted"}`}>
+                  {priceDelta > 0 ? "+" : ""}₹{fmtPrice(priceDelta)} ({deltaPct != null ? `${deltaPct > 0 ? "+" : ""}${fmtPct(deltaPct)}` : "—"})
+                </span>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
       <p className="faint" style={{ fontSize: 11, marginBottom: 0, marginTop: 12 }}>
         AI-generated analytical output ({ai.model}). Confidence is analytical (0-100), NOT a probability of profit.
         Analysis computed on <b>closed candles</b>, not every tick.
@@ -153,6 +195,7 @@ export function SignalCard({ symbol }: { symbol: string }) {
   const [ai, setAi] = useState<AIAnalysis | null>(null);
   const [sig, setSig] = useState<{ price: number; generatedAt: number; reason: string } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const priceDelta = usePriceDelta(symbol, ai?.decisionPrice ?? null);
   useEffect(() => {
     let alive = true;
     setError(null);
@@ -217,6 +260,14 @@ export function SignalCard({ symbol }: { symbol: string }) {
           <span className="label">Generated</span>
           <span className="value mono" style={{ fontSize: 13 }}>{sig ? fmtTime(sig.generatedAt) : "—"}</span>
         </div>
+        {priceDelta !== null && ai?.decisionPrice != null && (
+          <div className="stat">
+            <span className="label">Live Δ</span>
+            <span className={`value mono ${priceDelta > 0 ? "pos" : priceDelta < 0 ? "neg" : "muted"}`}>
+              {priceDelta > 0 ? "+" : ""}₹{fmtPrice(priceDelta)}
+            </span>
+          </div>
+        )}
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 12, marginBottom: 0 }}>
         Analytical signal only. No order is placed — execution is disabled in this build.

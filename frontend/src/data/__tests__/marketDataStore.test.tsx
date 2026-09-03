@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, render, screen, cleanup } from "@testing-library/react";
 import { marketDataStore } from "../marketDataStore";
-import { useQuote, useMarketStatus } from "../useQuote";
+import { useQuote, useMarketStatus, usePriceDelta, useLiveMarketState } from "../useQuote";
 import { QuoteHeader } from "@/components/market/QuoteAndMetrics";
 import type { MarketQuote, MarketStatus } from "@/types";
 
@@ -105,6 +105,12 @@ function makeQuote(price: number, symbol = "NSE:SBIN"): MarketQuote {
 }
 
 describe("marketDataStore", () => {
+  it("returns the same empty snapshot reference until state changes", () => {
+    const first = marketDataStore.getState("NSE:SBIN");
+    const second = marketDataStore.getState("NSE:SBIN");
+    expect(second).toBe(first);
+  });
+
   it("subscribing triggers an immediate fetch and demotes to 'fresh'", async () => {
     setQuote(async (s) => makeQuote(850, s));
     const listener = vi.fn();
@@ -276,5 +282,93 @@ describe("QuoteHeader freshness badge", () => {
     // First failed fetch with no prior valid quote falls through to
     // the unavailable branch instead of a freshness badge.
     expect(screen.queryByText(/Data temporarily unavailable/)).not.toBeNull();
+  });
+});
+
+describe("marketTimestamp freshness (Phase 2)", () => {
+  it("uses marketTimestamp (exchange tick time) instead of fetch time for staleness", async () => {
+    const oldTs = Date.now() - 10_000; // 10s ago — older than staleAfterMs (100)
+    setQuote(async (s) => ({ ...makeQuote(100, s), marketTimestamp: oldTs, lastUpdate: oldTs, fetchedAt: Date.now() }));
+    const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+    await wait(60);
+    const state = marketDataStore.getState("NSE:SBIN");
+    expect(state.freshness).toBe("stale");
+    expect(state.marketTimestamp).toBe(oldTs);
+    unsub();
+  });
+
+  it("keeps a quote fresh when marketTimestamp is current", async () => {
+    const now = Date.now();
+    setQuote(async (s) => ({ ...makeQuote(100, s), marketTimestamp: now, lastUpdate: now, fetchedAt: now }));
+    const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+    await wait(30);
+    const state = marketDataStore.getState("NSE:SBIN");
+    expect(state.freshness).toBe("fresh");
+    expect(state.marketTimestamp).toBe(now);
+    unsub();
+  });
+
+  it("getLiveMarketState returns canonical LiveMarketState with isStale=true for old marketTimestamp", async () => {
+    const oldTs = Date.now() - 10_000;
+    setQuote(async (s) => ({ ...makeQuote(100, s), marketTimestamp: oldTs, lastUpdate: oldTs, fetchedAt: Date.now() }));
+    const unsubQ = marketDataStore.subscribe("NSE:SBIN", () => {});
+    const unsubS = marketDataStore.subscribeSession(() => {});
+    await wait(80);
+    const live = marketDataStore.getLiveMarketState("NSE:SBIN");
+    expect(live).not.toBeNull();
+    expect(live?.symbol).toBe("NSE:SBIN");
+    expect(live?.price).toBe(100);
+    expect(live?.marketTimestamp).toBe(oldTs);
+    expect(live?.isStale).toBe(true);
+    expect(live?.marketStatus).toBe("OPEN");
+    unsubQ();
+    unsubS();
+  });
+
+  it("getLiveMarketState returns null when no quote fetched yet", () => {
+    expect(marketDataStore.getLiveMarketState("NSE:NONEXISTENT")).toBeNull();
+  });
+
+  it("subscribeLive emits updated LiveMarketState on quote change", async () => {
+    setQuote(async (s) => makeQuote(100, s));
+    const listener = vi.fn();
+    const unsub = marketDataStore.subscribeLive("NSE:SBIN", listener);
+    await wait(80);
+    const lastCall = listener.mock.calls.at(-1);
+    expect(lastCall?.[0]).not.toBeNull();
+    expect(lastCall?.[0]?.price).toBe(100);
+    unsub();
+  });
+
+  it("keeps the derived live snapshot stable when no state changes", async () => {
+    setQuote(async (s) => makeQuote(100, s));
+    const unsubQ = marketDataStore.subscribe("NSE:SBIN", () => {});
+    const unsubS = marketDataStore.subscribeSession(() => {});
+    await wait(60);
+    const first = marketDataStore.getLiveMarketState("NSE:SBIN");
+    const second = marketDataStore.getLiveMarketState("NSE:SBIN");
+    expect(second).toBe(first);
+    unsubQ();
+    unsubS();
+  });
+});
+
+describe("usePriceDelta hook (Phase 5)", () => {
+  it("returns null when decisionPrice is null", () => {
+    setQuote(async (s) => makeQuote(100, s));
+    const { result } = renderHook(() => usePriceDelta("NSE:SBIN", null));
+    expect(result.current).toBeNull();
+  });
+
+  it("returns the difference between live price and decisionPrice", async () => {
+    setQuote(async (s) => makeQuote(105, s));
+    const { result } = renderHook(() => usePriceDelta("NSE:SBIN", 100));
+    await wait(60);
+    expect(result.current).toBe(5);
+  });
+
+  it("returns null when quote data is not yet available", () => {
+    const { result } = renderHook(() => usePriceDelta("NSE:NONEXISTENT", 100));
+    expect(result.current).toBeNull();
   });
 });

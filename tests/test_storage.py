@@ -73,3 +73,30 @@ def test_naive_timestamp_normalized_to_utc(store):
     store.upsert_many(rows)
     df = store.load("BTCUSDT", "1d")
     assert df.index[0].tzinfo is not None
+
+
+def test_atomic_recovery_commit_persists_candles_and_cursor(store):
+    rows = _rows(2, provider="upstox")
+    latest = rows[-1]["timestamp"]
+    assert store.commit_recovery("BTCUSDT", "1d", rows, latest) == 2
+    point = store.get_recovery_point("BTCUSDT", "1d")
+    assert point is not None
+    assert point["latest_closed_candle"] == latest.to_pydatetime()
+    assert point["recovery_status"] == "complete"
+
+
+def test_recovery_commit_historical_data_wins_existing_candle(store):
+    original = _rows(1, provider="upstox")[0]
+    store.upsert_many([original])
+    corrected = dict(original)
+    corrected["close"] = 999.0
+    assert store.commit_recovery("BTCUSDT", "1d", [corrected], original["timestamp"]) == 0
+    assert float(store.load("BTCUSDT", "1d")["close"].iloc[0]) == 999.0
+
+
+def test_recovery_cursor_does_not_advance_on_status_failure(store):
+    store.record_recovery_status("BTCUSDT", "1d", "degraded", "provider unavailable")
+    point = store.get_recovery_point("BTCUSDT", "1d")
+    assert point is not None
+    assert point["latest_closed_candle"] is None
+    assert point["recovery_status"] == "degraded"

@@ -8,6 +8,7 @@ import type {
   MarketQuote,
   MarketStatus,
   OHLCVBar,
+  CandleReadModel,
   PipelineStage,
   Signal,
 } from "@/types";
@@ -19,6 +20,7 @@ export interface MarketDataSource {
   readonly mode: "mock" | "live";
   getQuote(symbol: string): Promise<MarketQuote>;
   getOHLCV(symbol: string, timeframe: string, bars?: number): Promise<OHLCVBar[]>;
+  getCandleReadModel?(symbol: string, timeframe: string, limit?: number): Promise<CandleReadModel>;
   getAIAnalysis(symbol: string): Promise<AIAnalysis>;
   getSignals(limit?: number): Promise<Signal[]>;
   getFeedHealth(): Promise<FeedHealth>;
@@ -42,6 +44,14 @@ export class MockMarketDataSource implements MarketDataSource {
   }
   async getOHLCV(symbol: string, timeframe: string, bars = 160) {
     return mock.mockOHLCV(symbol, timeframe, bars);
+  }
+  async getCandleReadModel(symbol: string, timeframe: string, limit = 160): Promise<CandleReadModel> {
+    return {
+      symbol, timeframe,
+      candles: mock.mockOHLCV(symbol, timeframe, limit).map((c) => ({ ...c, isClosed: true, source: "mock" })),
+      currentCandle: null, marketTimestamp: Date.now(), fetchedAt: Date.now(),
+      freshnessMs: 0, session: "REGULAR", version: 1,
+    };
   }
   async getAIAnalysis(symbol: string) {
     return mock.mockAIAnalysis(symbol);
@@ -79,7 +89,7 @@ export class MockMarketDataSource implements MarketDataSource {
   }
 }
 
-interface ApiQuoteResponse {
+export interface ApiQuoteResponse {
   symbol: string;
   price: number;
   previousClose: number;
@@ -93,6 +103,8 @@ interface ApiQuoteResponse {
   volatility: number;
   sessionState: "PRE_MARKET" | "REGULAR" | "POST_MARKET" | "CLOSED";
   lastUpdate: number;
+  marketTimestamp: number;
+  fetchedAt: number;
 }
 
 /**
@@ -193,6 +205,16 @@ export class ApiMarketDataSource implements MarketDataSource {
       dayLow !== undefined && dayHigh !== undefined
         ? `${dayLow.toLocaleString("en-IN")} — ${dayHigh.toLocaleString("en-IN")}`
         : "—";
+    // marketTimestamp is authoritative (exchange tick time); fall back to
+    // fetchedAt when the upstream doesn't supply it.  lastUpdate is kept as
+    // an alias of marketTimestamp for backward compatibility with consumers
+    // that still read q.lastUpdate.
+    const marketTimestamp = isFiniteNumber(api.marketTimestamp)
+      ? api.marketTimestamp
+      : isFiniteNumber(api.lastUpdate)
+        ? api.lastUpdate
+        : undefined;
+    const fetchedAt = isFiniteNumber(api.fetchedAt) ? api.fetchedAt : Date.now();
     return {
       symbol: api.symbol,
       providerSymbol: meta.providerSymbol,
@@ -211,13 +233,19 @@ export class ApiMarketDataSource implements MarketDataSource {
       dayRange,
       volatility,
       sessionState: api.sessionState ?? "REGULAR",
-      lastUpdate: isFiniteNumber(api.lastUpdate) ? api.lastUpdate : Date.now(),
+      lastUpdate: marketTimestamp ?? fetchedAt,
+      marketTimestamp: marketTimestamp ?? fetchedAt,
+      fetchedAt,
     };
   }
 
   async getOHLCV(symbol: string, timeframe: string, bars = 160): Promise<OHLCVBar[]> {
     const params = new URLSearchParams({ symbol, timeframe: timeframe, bars: String(bars) });
     return this.fetchJson<OHLCVBar[]>(`/api/market/ohlcv?${params.toString()}`);
+  }
+
+  async getCandleReadModel(symbol: string, timeframe: string, limit = 160): Promise<CandleReadModel> {
+    return this.fetchJson<CandleReadModel>(`/api/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${limit}`);
   }
 
   async getAIAnalysis(symbol: string): Promise<AIAnalysis> {
@@ -260,5 +288,14 @@ export class ApiMarketDataSource implements MarketDataSource {
   }
 }
 
-// Single app-wide data source. Swap this line for the real implementation.
-export const dataSource: MarketDataSource = new ApiMarketDataSource();
+// Single app-wide data source.  Controlled by VITE_DATA_SOURCE:
+//   "mock" (or unset in development)  → MockMarketDataSource  (deterministic, no network)
+//   "api"    → ApiMarketDataSource     (live Vercel proxy to Upstox F&O pipeline)
+// The AppContext derives `mode` / `dataSource` badge from `dataSource.mode`,
+// so no component changes are required when toggling.  See
+// FRONTEND_BACKEND_CONTRACT.md §4 for the swap protocol.
+const _dataSourceMode = (import.meta.env.VITE_DATA_SOURCE ?? "").toLowerCase();
+export const dataSource: MarketDataSource =
+  _dataSourceMode === "mock"
+    ? new MockMarketDataSource()
+    : new ApiMarketDataSource();

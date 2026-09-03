@@ -8,7 +8,7 @@
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { marketDataStore } from "./marketDataStore";
-import type { QuoteState, SessionState } from "./marketDataStore";
+import type { QuoteState, SessionState, LiveMarketState } from "./marketDataStore";
 
 const sessionSubscribe = (cb: () => void) => marketDataStore.subscribeSession(() => cb());
 const sessionGetSnapshot = () => marketDataStore.getSession();
@@ -44,4 +44,27 @@ export function useQuote(symbol: string): QuoteState {
  */
 export function useMarketStatus(): SessionState | null {
   return useSyncExternalStore(sessionSubscribe, sessionGetSnapshot, sessionGetSnapshot);
+}
+
+/**
+ * Subscribe to the consolidated live-market state for `symbol`.
+ * Returns null until the first quote has been fetched.
+ */
+export function useLiveMarketState(symbol: string): LiveMarketState | null {
+  const sub = useMemo(
+    () => (cb: () => void) => marketDataStore.subscribeLive(symbol, () => cb()),
+    [symbol],
+  );
+  const snap = useMemo(() => () => marketDataStore.getLiveMarketState(symbol), [symbol]);
+  return useSyncExternalStore(sub, snap, snap);
+}
+
+/**
+ * Price-delta between the AI decision price (last closed candle close)
+ * and the current live quote.  Returns null if either is unavailable.
+ */
+export function usePriceDelta(symbol: string, decisionPrice: number | null | undefined): number | null {
+  const quote = useQuote(symbol);
+  if (decisionPrice == null || quote.data?.price == null) return null;
+  return quote.data.price - decisionPrice;
 }
