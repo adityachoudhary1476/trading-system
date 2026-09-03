@@ -164,28 +164,36 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  // Decrypt the stored Upstox access token. Any failure here is a
-  // controlled, non-500 response: the user must reconnect Upstox to
-  // re-encrypt the token with the current key.
-  let accessToken: string;
+  // Resolve an Upstox access token. Prefer the per-user encrypted token
+  // from the broker_connections table. If the user has not connected
+  // Upstox, fall back to the shared service-account token configured in
+  // the Vercel environment (UPSTOX_ACCESS_TOKEN) so that read-only
+  // historical data is available out of the box for any supported
+  // symbol (e.g. NIFTY50, BANKNIFTY) without requiring an individual
+  // OAuth flow.
+  let accessToken: string | null = null;
   try {
     const encrypted = await loadEncryptedToken(userId);
-    if (!encrypted) {
-      res.status(403).json({ error: "upstox_not_connected" });
-      return;
+    if (encrypted) {
+      accessToken = decryptToken(encrypted);
     }
-    accessToken = decryptToken(encrypted);
   } catch (e) {
     if (e instanceof TokenDecryptionError) {
-      // Upstox is "connected" in the database but the token cannot be
-      // decrypted. Distinct error code so the frontend can show a
-      // reconnect prompt instead of a generic server error.
-      res.status(502).json({ error: "upstox_token_unreadable" });
-      return;
+      // Token is unreadable with the current key — fall through to the
+      // service-account fallback below rather than blocking the request.
+      console.warn("OHLCV stored token unreadable, falling back to service token:", { symbol });
+    } else {
+      const message = e instanceof Error ? e.message : "Unknown error";
+      console.error("OHLCV token load failed:", { symbol, message });
     }
-    const message = e instanceof Error ? e.message : "Unknown error";
-    console.error("OHLCV token load failed:", { symbol, message });
-    res.status(502).json({ error: "upstox_token_unavailable" });
+  }
+
+  if (!accessToken) {
+    accessToken = process.env.UPSTOX_ACCESS_TOKEN ?? null;
+  }
+
+  if (!accessToken) {
+    res.status(403).json({ error: "upstox_not_connected" });
     return;
   }
 

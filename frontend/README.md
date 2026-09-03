@@ -1,7 +1,7 @@
 # FINOVA MARKETS — Frontend
 
 AI-powered Indian market intelligence terminal (React + TypeScript + Vite).
-Built on Day 5 with **deterministic mock data only** — no live FYERS connection.
+Fetches live market data from Upstox via Vercel serverless functions.
 
 ## Run
 

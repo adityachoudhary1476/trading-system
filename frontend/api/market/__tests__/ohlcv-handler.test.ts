@@ -264,11 +264,78 @@ describe("OHLCV handler — no fabrication", () => {
   });
 });
 
-describe("OHLCV handler — token decryption failure", () => {
-  it("returns 502 upstox_token_unreadable (NOT 500) on key mismatch", async () => {
+describe("OHLCV handler — token fallback", () => {
+  it("falls through to UPSTOX_ACCESS_TOKEN env var when user has no connected broker", async () => {
+    getUser.mockResolvedValue({ data: { user: { id: "user-1" } }, error: null });
+    const savedToken = process.env.UPSTOX_ACCESS_TOKEN;
+    process.env.UPSTOX_ACCESS_TOKEN = "service-account-token";
+    try {
+      from.mockReturnValue({
+        select: () => ({
+          eq: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({ data: null, error: null }),
+            }),
+          }),
+        }),
+      });
+       fetchMock.mockClear();
+       fetchMock.mockResolvedValue({
+        status: 200,
+        ok: true,
+        headers: new Map(),
+        json: async () => ({
+          status: "success",
+          data: { candles: [["2024-12-12T00:00:00+05:30", 800, 810, 798, 808, 900, 0]] },
+        }),
+      });
+      const req = makeReq(
+        { authorization: "Bearer jwt" },
+        { symbol: "NSE:SBIN", timeframe: "1D" },
+      );
+      const res = makeRes();
+      await handler(req, res);
+      expect(res.statusCode).toBe(200);
+      expect(fetchMock.mock.calls[0][1]?.headers?.Authorization).toBe(
+        "Bearer service-account-token",
+      );
+    } finally {
+      if (savedToken !== undefined) process.env.UPSTOX_ACCESS_TOKEN = savedToken;
+      else delete process.env.UPSTOX_ACCESS_TOKEN;
+    }
+  });
+
+  it("returns 403 upstox_not_connected when no row exists and no env fallback is set", async () => {
+    getUser.mockResolvedValue({ data: { user: { id: "user-1" } }, error: null });
+    delete process.env.UPSTOX_ACCESS_TOKEN;
+    try {
+      from.mockReturnValue({
+        select: () => ({
+          eq: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({ data: null, error: null }),
+            }),
+          }),
+        }),
+      });
+      const req = makeReq(
+        { authorization: "Bearer jwt" },
+        { symbol: "NSE:SBIN", timeframe: "1D" },
+      );
+      const res = makeRes();
+      await handler(req, res);
+      expect(res.statusCode).toBe(403);
+      expect((res.body as { error: string }).error).toBe("upstox_not_connected");
+    } finally {
+      // UPSTOX_ACCESS_TOKEN was deleted; nothing to restore.
+    }
+  });
+
+  it("returns 403 upstox_not_connected when key is wrong and no env fallback is set", async () => {
     getUser.mockResolvedValue({ data: { user: { id: "user-1" } }, error: null });
     const encrypted = encryptToken("upstox-test-token");
     process.env.UPSTOX_TOKEN_ENCRYPTION_KEY = "different-key-bbbbbbbbbbbbbbbbbb";
+    delete process.env.UPSTOX_ACCESS_TOKEN;
     try {
       from.mockReturnValue({
         select: () => ({
@@ -288,8 +355,8 @@ describe("OHLCV handler — token decryption failure", () => {
       );
       const res = makeRes();
       await handler(req, res);
-      expect(res.statusCode).toBe(502);
-      expect((res.body as { error: string }).error).toBe("upstox_token_unreadable");
+      expect(res.statusCode).toBe(403);
+      expect((res.body as { error: string }).error).toBe("upstox_not_connected");
     } finally {
       process.env.UPSTOX_TOKEN_ENCRYPTION_KEY = ENC_KEY;
     }

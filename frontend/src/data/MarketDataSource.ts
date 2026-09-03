@@ -289,8 +289,8 @@ export class ApiMarketDataSource implements MarketDataSource {
 }
 
 // Single app-wide data source.  Controlled by VITE_DATA_SOURCE:
-//   "mock" (or unset in development)  → MockMarketDataSource  (deterministic, no network)
-//   "api"    → ApiMarketDataSource     (live Vercel proxy to Upstox F&O pipeline)
+//   "mock"   → MockMarketDataSource  (deterministic, no network)
+//   "api" or unset → ApiMarketDataSource     (live Upstox API via Vercel functions)
 // The AppContext derives `mode` / `dataSource` badge from `dataSource.mode`,
 // so no component changes are required when toggling.  See
 // FRONTEND_BACKEND_CONTRACT.md §4 for the swap protocol.

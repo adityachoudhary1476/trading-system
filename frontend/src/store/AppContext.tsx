@@ -12,9 +12,9 @@ interface AppState {
 const Ctx = createContext<AppState | null>(null);
 
 const ENV: AppEnvironment = {
-  mode: dataSource.mode, // "mock" tonight; flips to "live" with real source
+  mode: dataSource.mode,
   environment: "development",
-  dataSource: dataSource.mode === "mock" ? "Mock" : "WebSocket",
+  dataSource: dataSource.mode === "mock" ? "Mock" : "API",
   execution: "DISABLED",
 };
 

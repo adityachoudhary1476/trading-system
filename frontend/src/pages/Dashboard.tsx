@@ -100,7 +100,11 @@ export function DashboardPage() {
     setError(null);
     readModelVersion.current = -1;
     const load = dataSource.getCandleReadModel
-      ? dataSource.getCandleReadModel(selectedSymbol, tf, 160)
+      ? dataSource.getCandleReadModel(selectedSymbol, tf, 160).catch(() =>
+          dataSource
+            .getOHLCV(selectedSymbol, tf, 160)
+            .then((candles) => ({ candles, version: 0 })),
+        )
       : dataSource.getOHLCV(selectedSymbol, tf, 160).then((candles) => ({ candles, version: 0 }));
     load
       .then((model) => {
@@ -135,7 +139,11 @@ export function DashboardPage() {
     // Refresh the authoritative read model during market hours.
     const id = setInterval(() => {
       const load = dataSource.getCandleReadModel
-        ? dataSource.getCandleReadModel(selectedSymbol, tf, 160)
+        ? dataSource.getCandleReadModel(selectedSymbol, tf, 160).catch(() =>
+            dataSource
+              .getOHLCV(selectedSymbol, tf, 160)
+              .then((candles) => ({ candles, version: 0 })),
+          )
         : dataSource.getOHLCV(selectedSymbol, tf, 160).then((candles) => ({ candles, version: 0 }));
       load
         .then((model) => {
@@ -271,7 +279,7 @@ export function DashboardPage() {
         </div>
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>
-        Demo data. The chart consumes OHLCV from <code>MarketDataSource</code> â€” swap to a real API/WS source tomorrow without UI changes.
+        Historical OHLCV is sourced from Upstox via the Vercel /api/market/ohlcv route. The live tick merge (below) updates the in-progress bar; live price updates every second via /api/market/quote.
       </p>
     </>
   );

@@ -49,6 +49,9 @@ export interface UpstoxQuote {
   volume?: number;
   prev_close?: number;
   ohlc?: { open?: number; high?: number; low?: number; close?: number };
+  timestamp?: number | string;
+  instrument_token?: number;
+  average_price?: number;
 }
 
 interface UpstoxQuoteResponse {
@@ -94,22 +97,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return;
   }
 
-  let accessToken: string;
+  // Resolve an Upstox access token. Prefer the per-user encrypted token
+  // from broker_connections. If the user has not connected Upstox (or the
+  // stored token is unreadable), fall back to the shared service-account
+  // token in the Vercel environment so that live quote data is available
+  // out of the box for read-only access.
+  let accessToken: string | null = null;
   try {
     const encrypted = await loadEncryptedToken(userId);
-    if (!encrypted) {
-      res.status(403).json({ error: "upstox_not_connected" });
-      return;
+    if (encrypted) {
+      accessToken = decryptToken(encrypted);
     }
-    accessToken = decryptToken(encrypted);
   } catch (e) {
     if (e instanceof TokenDecryptionError) {
-      res.status(502).json({ error: "upstox_token_unreadable" });
-      return;
+      console.warn("Quote stored token unreadable, falling back to service token:", { symbol });
+    } else {
+      const message = e instanceof Error ? e.message : "Unknown error";
+      console.error("Quote token load failed:", { symbol, message });
     }
-    const message = e instanceof Error ? e.message : "Unknown error";
-    console.error("Quote token load failed:", { symbol, message });
-    res.status(502).json({ error: "upstox_token_unavailable" });
+  }
+
+  if (!accessToken) {
+    accessToken = process.env.UPSTOX_ACCESS_TOKEN ?? null;
+  }
+
+  if (!accessToken) {
+    res.status(403).json({ error: "upstox_not_connected" });
     return;
   }
 
