@@ -6,7 +6,7 @@
   "description": "FINOVA MARKETS — AI Market Intelligence terminal (frontend). Mock-data only tonight; backend-ready data layer.",
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && tsc --noEmit -p tsconfig.api.json && vite build",
     "preview": "vite preview",
     "typecheck": "tsc -b --noEmit",
     "test": "vitest run"

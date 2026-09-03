@@ -13,5 +13,6 @@
     "strict": true,
     "types": ["node"]
   },
-  "include": ["api/**/*.ts"]
+  "include": ["api/**/*.ts"],
+  "exclude": ["api/**/__tests__/**"]
 }

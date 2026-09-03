@@ -53,10 +53,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     });
 
     if (!resp.ok) {
-      const errorBody = await resp.json().catch(() => ({}));
+      const errorBody = (await resp.json().catch(() => ({}))) as Record<string, unknown>;
       res.status(resp.status).json({
         error: "analysis_error",
-        message: errorBody.detail || `Backend returned ${resp.status}`,
+        message: (errorBody.detail as string) || `Backend returned ${resp.status}`,
       });
       return;
     }
