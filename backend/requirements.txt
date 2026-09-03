@@ -2,8 +2,9 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 
-# Supabase
-supabase==2.7.4
+# Supabase (2.18.1+ accepts modern sb_secret_/sb_publishable_ API keys;
+# earlier versions reject non-JWT keys at client construction time)
+supabase==2.18.1
 
 # JWT verification (local, JWKS-based; replaces remote auth.get_user)
 PyJWT[crypto]==2.13.0
