@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "framework": "vite",
   "installCommand": "npm install",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
@@ -17,9 +18,5 @@
       "src": "api/upstox/*.ts",
       "use": "@vercel/node"
     }
-  ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/$1.ts" },
-    { "src": "/(.*)", "dest": "/index.html" }
   ]
 }
