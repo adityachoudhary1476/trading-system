@@ -47,6 +47,7 @@ class APIErrorCode(str, Enum):
     RISK_HALTED = "risk_halted"
     SHORTING_DISABLED = "shorting_disabled"
     ORDER_REJECTED = "order_rejected"
+    DEPLOYMENT_GATE_FAILED = "deployment_gate_failed"
 
 
 # Map domain exceptions to API error codes / HTTP status codes.

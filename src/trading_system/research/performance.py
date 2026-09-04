@@ -51,7 +51,7 @@ def compute_performance(result: BacktestResult) -> PerformanceReport:
     losses = [t.net_pnl for t in trades if t.net_pnl <= 0]
     gross_win = sum(wins)
     gross_loss = -sum(losses)
-    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0
+    profit_factor = (gross_win / gross_loss) if gross_loss > 0 else None if gross_win > 0 else 0.0
 
     # Max drawdown from equity curve.
     if len(eq):

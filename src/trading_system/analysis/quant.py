@@ -56,7 +56,9 @@ def annualized_volatility(returns: pd.Series, timeframe: str = "1d") -> float:
 def drawdown(close: pd.Series) -> pd.Series:
     """Drawdown series (<= 0) from running peak."""
     running_max = close.cummax()
-    return close / running_max - 1.0
+    result = close / running_max - 1.0
+    result[running_max == 0] = 0.0
+    return result
 
 
 def volume_stats(volume: pd.Series, window: int = 20) -> pd.DataFrame:
@@ -73,6 +75,6 @@ def sharpe_ratio(
     """Annualized Sharpe ratio given per-period returns."""
     excess = returns - risk_free_per_period
     std = excess.std(ddof=0)
-    if std == 0 or np.isnan(std):
+    if std == 0 or np.isnan(std) or np.isinf(std):
         return 0.0
     return float(excess.mean() * periods_per_year / std)

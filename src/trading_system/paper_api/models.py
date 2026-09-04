@@ -51,6 +51,50 @@ class DeploymentListResponse(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Creation request / response
+# --------------------------------------------------------------------------- #
+class DeploymentCreateRequest(BaseModel):
+    """Request body for ``POST /deployments``.
+
+    Accepts either a full ``StrategySpec`` dict (``spec``) or a
+    ``strategy_id`` referencing an already-registered strategy. A
+    ``DatasetId`` defaults to ``"market_data"``. ``config`` accepts an
+    optional partial :class:`PaperDeploymentConfig` override (all fields
+    paper-only; live execution is never permitted).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    spec: Optional[dict[str, Any]] = Field(
+        default=None,
+        description="Full StrategySpec JSON dict. Required if strategy_id is not provided.",
+    )
+    strategy_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        description="Reference to an already-registered strategy. Ignored if spec is provided.",
+    )
+    symbol: Optional[str] = Field(default=None, min_length=1)
+    timeframe: Optional[str] = Field(default=None, min_length=1)
+    dataset_id: Optional[str] = Field(default=None, min_length=1)
+    config: Optional[dict[str, Any]] = Field(default=None, description="PaperDeploymentConfig override fields")
+
+
+class DeploymentCreateResponse(BaseModel):
+    """Response body for ``POST /deployments``.
+
+    Returns the created deployment summary together with the live session id
+    the frontend can navigate to.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployment: DashboardDeploymentSummary
+    session_id: str
+    schema_version: int = 1
+
+
+# --------------------------------------------------------------------------- #
 # Lifecycle / session request models
 # --------------------------------------------------------------------------- #
 class LifecycleRequest(BaseModel):
@@ -184,6 +228,8 @@ __all__ = [
     "HealthEndpointResponse",
     "DeploymentListResponse",
     "DeploymentResponse",
+    "DeploymentCreateRequest",
+    "DeploymentCreateResponse",
     "LifecycleRequest",
     "CheckpointRequest",
     "RestoreRequest",

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import time
 import datetime as dt
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -59,7 +60,7 @@ class IngestionPipeline:
         configure_logging(self.cfg.logging)
         self.provider = get_provider(
             self.cfg.market.provider,
-            timeout=int(__import__("os").getenv("PROVIDER_TIMEOUT", "20")),
+            timeout=int(os.getenv("PROVIDER_TIMEOUT", "20")),
         )
         self.store = store or MarketStore(self.cfg.storage.db_url)
 

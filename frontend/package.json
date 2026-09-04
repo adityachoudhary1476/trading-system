@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
-  "description": "FINOVA MARKETS — AI Market Intelligence terminal (frontend). Mock-data only tonight; backend-ready data layer.",
+  "description": "FINOVA MARKETS — AI Market Intelligence terminal (frontend). Fetches live data from Upstox via Vercel serverless functions.",
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && tsc --noEmit -p tsconfig.api.json && vite build",
@@ -16,22 +16,23 @@
     "lightweight-charts": "^5.0.7",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.2"
+    "react-router-dom": "^7.18.3"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
+    "@types/node": "^20.19.43",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
-    "@vercel/node": "^3.2.0",
+    "@vercel/node": "^12.0.0",
     "@vitejs/plugin-react": "^4.3.1",
     "jsdom": "^30.0.1",
     "typescript": "^5.5.4",
-    "vite": "^5.4.6",
-    "vitest": "^2.1.1"
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
   },
   "overrides": {
     "tar": "^7.5.21",
-    "esbuild": "0.21.5"
+    "esbuild": "0.28.2"
   }
 }

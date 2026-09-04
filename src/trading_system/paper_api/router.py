@@ -19,11 +19,18 @@ from typing import Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ..paper.control import PaperTradingControlCenter
+from ..paper.control import PaperTradingControlCenter, ControlCenterError
 from ..paper.dashboard import (
     DashboardEventSummary,
     build_deployment_summary,
 )
+from ..research.evidence import strategy_identity
+from ..research.strategy_lab.spec import StrategySpec
+from ..execution.paper_broker import PaperBroker
+from ..execution.broker import BrokerError
+from ..paper.circuit_breaker import PaperCircuitBreaker
+from ..paper.runner import PaperStrategyRunner
+from ..paper.deployment import PaperDeploymentConfig
 from .errors import (
     APIErrorCode,
     APIErrorException,
@@ -34,6 +41,8 @@ from .models import (
     AccountResponse,
     CheckpointRequest,
     CircuitBreakerResponse,
+    DeploymentCreateRequest,
+    DeploymentCreateResponse,
     DeploymentListResponse,
     DeploymentResponse,
     EventsResponse,
@@ -148,7 +157,7 @@ class PaperAPIRouter:
 
     def _register_routes(self) -> None:
         self._add(r"^/health$", frozenset({"GET"}), self._route_health)
-        self._add(r"^/deployments$", frozenset({"GET"}), self._route_list_deployments)
+        self._add(r"^/deployments$", frozenset({"GET", "POST"}), self._route_deployments)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)$",
                   frozenset({"GET"}), self._route_get_deployment)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/session$",
@@ -356,6 +365,11 @@ class PaperAPIRouter:
         body = HealthEndpointResponse()
         return ResponseEnvelope(status=200, body=_safe_dump(body))
 
+    def _route_deployments(self, ctx: RequestContext) -> ResponseEnvelope:
+        if ctx.method == "POST":
+            return self._route_create_deployment(ctx)
+        return self._route_list_deployments(ctx)
+
     def _route_list_deployments(self, ctx: RequestContext) -> ResponseEnvelope:
         deployment_id = _single(ctx.query, "deployment_id")
         strategy_id = _single(ctx.query, "strategy_id")
@@ -380,6 +394,147 @@ class PaperAPIRouter:
             count=len(rows),
         )
         return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_create_deployment(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /deployments — create (or rehydrate) a paper deployment.
+
+        Accepts either a full ``StrategySpec`` dict (``spec``) or a
+        ``strategy_id`` referencing an already-registered strategy. The spec is
+        registered in the strategy registry (idempotent), then the deployment
+        gate is evaluated. On success the deployment is activated and a live
+        ``PaperStrategyRunner`` + ``PaperBroker`` are attached so the dashboard
+        returns a real account/balance immediately.
+
+        Body::
+            {
+              "spec": { ...StrategySpec dict... },
+              "symbol": "NSE:SBIN",         # optional, must match spec
+              "timeframe": "1d",            # optional, must match spec
+              "dataset_id": "market_data",  # optional
+              "config": { ... }             # optional PaperDeploymentConfig overrides
+            }
+
+        Returns ``201`` with the created :class:`DeploymentCreateResponse`.
+        Gate failure returns ``409`` with the reasons.
+        """
+        if ctx.body is None:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="request body is required (spec or strategy_id, symbol, timeframe)",
+                status=400,
+            )
+        try:
+            req = DeploymentCreateRequest.model_validate(ctx.body)
+        except ValidationError as exc:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message=f"invalid create request: {exc}",
+                status=400,
+            ) from exc
+
+        spec: Optional[StrategySpec] = None
+        strategy_id: Optional[str] = None
+
+        if req.spec is not None:
+            try:
+                spec = StrategySpec(**req.spec)
+            except ValidationError as exc:
+                raise APIErrorException(
+                    code=APIErrorCode.INVALID_STRATEGY_SPEC,
+                    message=f"invalid StrategySpec: {exc}",
+                    status=400,
+                ) from exc
+            strategy_id = strategy_identity(spec)
+        elif req.strategy_id is not None:
+            strategy_id = req.strategy_id
+            existing = self.center.registry.get_strategy(strategy_id)
+            if existing is None:
+                raise APIErrorException(
+                    code=APIErrorCode.UNKNOWN_STRATEGY,
+                    message=f"strategy {strategy_id!r} is not registered",
+                    status=404,
+                )
+            spec = StrategySpec.model_validate_json(existing.spec_json)
+        else:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="either 'spec' or 'strategy_id' must be provided",
+                status=400,
+            )
+
+        if spec is None:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="could not resolve a StrategySpec for this request",
+                status=400,
+            )
+
+        if strategy_id is None:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="could not derive strategy_id from spec",
+                status=400,
+            )
+
+        # Idempotency: register the strategy if not already present.
+        if self.center.registry.get_strategy(strategy_id) is None:
+            self.center.registry.register_strategy(spec)
+
+        # Build deployment config from optional overrides.
+        config_overrides: dict[str, Any] = {}
+        if req.config:
+            config_overrides.update(req.config)
+        cfg = PaperDeploymentConfig(**config_overrides)
+
+        dataset_id = (req.dataset_id or "market_data")
+
+        # Attempt creation (runs the gate). The gate may still fail if
+        # evidence requirements are strict — that is the intended safety check.
+        try:
+            deployment, _spec, decision = self.center.create_deployment(
+                spec=spec, dataset_id=dataset_id, config=cfg
+            )
+        except ControlCenterError as exc:
+            raise APIErrorException(
+                code=APIErrorCode.DEPLOYMENT_GATE_FAILED,
+                message=f"deployment creation failed: {exc}",
+                status=409,
+                details={"reason": str(exc)},
+            ) from exc
+
+        if deployment is None:
+            raise APIErrorException(
+                code=APIErrorCode.DEPLOYMENT_GATE_FAILED,
+                message="deployment gate rejected this strategy",
+                details={"reasons": decision.reasons if decision else []},
+                status=409,
+            )
+
+        # Activate the deployment and attach a live runner so the dashboard
+        # has a session with real account/balance data.
+        self.center.activate_deployment(deployment.deployment_id)
+
+        broker = PaperBroker(initial_cash=cfg.initial_cash)
+        circuit_breaker = PaperCircuitBreaker()
+        runner = PaperStrategyRunner(
+            deployment=deployment,
+            broker=broker,
+            spec=spec,
+            circuit_breaker=circuit_breaker,
+        )
+        session_id = self.center.attach_runner(deployment.deployment_id, runner)
+
+        # Also persist a checkpoint so the session survives a server restart.
+        try:
+            self.center.save_session(session_id)
+        except Exception:
+            pass
+
+        body = DeploymentCreateResponse(
+            deployment=build_deployment_summary(deployment),
+            session_id=session_id,
+        )
+        return ResponseEnvelope(status=201, body=_safe_dump(body))
 
     def _route_get_deployment(self, ctx: RequestContext) -> ResponseEnvelope:
         deployment_id = ctx.params["deployment_id"]

@@ -1210,6 +1210,64 @@ def _cmd_live_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
+    """Start the Phase 21 paper-trading HTTP API server (localhost, paper-only).
+
+    This serves the JSON API that the frontend ``/paper`` section consumes.
+    The server is loopback-only by default (see ``paper_api.server``).
+    """
+    from sqlalchemy import create_engine
+
+    from trading_system.config.settings import settings
+    from trading_system.paper import PaperTradingControlCenter
+    from trading_system.paper_api import PaperAPIRouter, build_default_server
+    from trading_system.research.strategy_intelligence import (
+        EvidenceFreshnessConfig,
+        EvidenceRequirement,
+    )
+
+    engine = create_engine(
+        settings.storage.db_url,
+        connect_args={"check_same_thread": False},
+    )
+
+    # Relaxed evidence requirements: the dev server allows deploying any
+    # registered strategy without prior research/walk-forward evidence.
+    # The gate still enforces: paper-only mode, spec identity binding,
+    # symbol/timeframe match, and non-retired/non-rejected status.
+    requirement = EvidenceRequirement(
+        require_walk_forward=False,
+        require_validation=False,
+        require_recent_evidence=False,
+        min_validation_trades=0,
+    )
+    freshness = EvidenceFreshnessConfig(max_age_days=180)
+
+    center = PaperTradingControlCenter.from_engine(
+        engine, requirement=requirement, freshness_config=freshness
+    )
+    router = PaperAPIRouter(center)
+
+    host = args.host
+    port = args.port
+    if host is None:
+        host = os.getenv("PAPER_API_HOST", "127.0.0.1")
+    if port is None:
+        port = int(os.getenv("PAPER_API_PORT", "8765"))
+
+    server = build_default_server(router, host=host, port=port)
+    print(f"Paper API server starting on {server.host}:{server.port} (paper-only, localhost)")
+    print(f"Database: {settings.storage.db_url}")
+    print("Press Ctrl-C to stop.")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down paper API server...")
+    finally:
+        server.shutdown()
+    return 0
+
+
 def _strategy_names() -> list[str]:
     from .research import list_strategies
 
@@ -1385,6 +1443,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Show paper-trading engine status (simulation only, live orders DISABLED)",
     )
 
+    p_api = sub.add_parser(
+        "paper-api",
+        help="Start the Phase 21 paper-trading HTTP API server (localhost only, paper-only)",
+    )
+    p_api.add_argument("--host", default=None, help="Bind host (default: 127.0.0.1 or PAPER_API_HOST)")
+    p_api.add_argument("--port", type=int, default=None, help="Bind port (default: 8765 or PAPER_API_PORT)")
+
     p_lv2 = sub.add_parser(
         "live-verify",
         help="REAL Upstox market-data verification only (no orders placed)",
@@ -1441,6 +1506,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_paper_status(args)
     if args.command == "live-verify":
         return _cmd_live_verify(args)
+    if args.command == "paper-api":
+        return _cmd_serve_paper_api(args)
     parser.print_help()
     return 1
 

@@ -1798,6 +1798,42 @@ table.data tbody tr.active {
   justify-content: flex-end;
   gap: 8px;
 }
+.modal .form-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.modal .form-group label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-faint);
+  font-weight: 600;
+}
+.modal .form-group input,
+.modal .form-group select {
+  background: var(--panel);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 6px 10px;
+  font-size: 12.5px;
+  font-family: inherit;
+}
+.modal .form-group input:focus-visible,
+.modal .form-group select:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.modal .form-row {
+  display: flex;
+  gap: 12px;
+}
+.modal .form-row .form-group {
+  flex: 1;
+  margin-bottom: 0;
+}
 
 /* ---------- Risk/health blocks ---------- */
 .risk-block {

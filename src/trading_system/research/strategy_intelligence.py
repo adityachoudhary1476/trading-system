@@ -282,7 +282,9 @@ def _walk_forward_summary_metrics(evidence: Optional[StrategyEvidence]) -> dict:
 
     def _float(key: str) -> Optional[float]:
         v = summary.get(key)
-        return float(v) if isinstance(v, (int, float)) else None
+        if isinstance(v, (int, float)) and not (float(v) != float(v) or abs(float(v)) == float("inf")):
+            return float(v)
+        return None
 
     def _int(key: str) -> Optional[int]:
         v = summary.get(key)

@@ -250,6 +250,12 @@ export interface DeploymentResponse {
   schema_version: number;
 }
 
+export interface DeploymentCreateResponse {
+  deployment: DashboardDeploymentSummary;
+  session_id: string;
+  schema_version: number;
+}
+
 export interface SessionResponse {
   session: PaperSession;
   checkpoint: PaperSessionCheckpoint | null;

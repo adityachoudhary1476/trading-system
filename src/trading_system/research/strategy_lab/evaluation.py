@@ -100,7 +100,7 @@ def evaluate_result(result: BacktestResult, strategy_name: str = "") -> Strategy
     # an infinite ratio is not serializable and not a number we rank on blindly.
     profit_factor = perf.profit_factor
     pf_note = None
-    if n == 0 or not math.isfinite(profit_factor):
+    if n == 0 or profit_factor is None or not math.isfinite(profit_factor):
         profit_factor = None
         pf_note = "profit factor undefined (no losing trades or no trades)"
         if "profit_factor" not in unavailable:

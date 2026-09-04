@@ -4,6 +4,7 @@ import type {
   ApiResult,
   CircuitBreakerResponse,
   DashboardSnapshotResponse,
+  DeploymentCreateResponse,
   DeploymentListResponse,
   DeploymentResponse,
   EventsResponse,
@@ -125,6 +126,15 @@ export const paperApi = {
     const q = qs.toString();
     return get<DeploymentListResponse>(`/deployments${q ? `?${q}` : ""}`);
   },
+
+  createDeployment: (payload: {
+    spec?: Record<string, unknown>;
+    strategy_id?: string;
+    symbol?: string;
+    timeframe?: string;
+    dataset_id?: string;
+    config?: Record<string, unknown>;
+  }) => post<DeploymentCreateResponse>("/deployments", payload),
 
   getDeployment: (deploymentId: string) =>
     get<DeploymentResponse>(`/deployments/${encodeURIComponent(deploymentId)}`),

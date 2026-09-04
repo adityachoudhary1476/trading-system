@@ -74,6 +74,7 @@ class PaperStrategyRunner:
         *,
         health_monitor: Optional[PaperHealthMonitor] = None,
         risk_guard: Optional[PaperRiskGuard] = None,
+        risk_manager: Optional["RiskManager"] = None,
         circuit_breaker: Optional[PaperCircuitBreaker] = None,
         event_log: Optional[PaperOperationsEventLog] = None,
     ) -> None:
@@ -109,6 +110,7 @@ class PaperStrategyRunner:
         # ---- Phase 19 operations layer (all optional, keyword-only) ----
         self._health_monitor = health_monitor
         self._risk_guard = risk_guard
+        self._risk_manager = risk_manager
         self._circuit_breaker = circuit_breaker
         self._event_log = event_log
 
@@ -289,6 +291,164 @@ class PaperStrategyRunner:
             signal, ts, fill_happened=fill_happened, rejected=rejected
         )
 
+        return signal
+
+    # ------------------------------------------------------------------ #
+    # Signals engine integration (Phase 19+)
+    # ------------------------------------------------------------------ #
+    def process_signal_bar(
+        self,
+        bar: Union[dict, pd.Series, pd.DataFrame],
+        *,
+        market_view: Optional[object] = None,
+        signal_config: Optional[object] = None,
+    ) -> object:
+        """Process one bar using the deterministic signals engine.
+
+        This wires ``signals.generate_signal()`` into the paper broker pipeline.
+        The ``market_view`` can be a ``MarketView`` instance or a dict; if ``None``
+        a neutral view is constructed from the bar data (HOLD signal guaranteed).
+
+        Returns a ``Signal`` object (see ``signals.Signal``) with direction,
+        confidence, and reason — without modifying the runner's position state
+        or broker book (call ``submit_order_from_signal()`` separately if desired).
+
+        Lazy import avoids the circular dependency between ``signals`` and ``models``
+        at module load time.
+        """
+        # Lazy import to avoid circular dependency with models package.
+        from ..models.snapshot import MarketSnapshot, build_snapshot_from_df  # type: ignore
+        from ..models.market_view import MarketView, MarketViewEnum  # type: ignore
+        from ..signals import generate_signal as sig_gen, SignalConfig  # type: ignore
+
+        bar_df, ts = _coerce_bar(bar)
+
+        # Build snapshot from the bar data.
+        try:
+            snapshot = build_snapshot_from_df(
+                bar_df,
+                symbol=self.deployment.symbol,
+                timeframe=self.config.timeframe or "1d",
+                lookback_closes=self.config.lookback_bars or 60,
+            )
+        except Exception:
+            # Minimal snapshot when full build fails (e.g. not enough history).
+            snapshot = MarketSnapshot(
+                symbol=self.deployment.symbol,
+                timeframe=self.config.timeframe or "1d",
+                timestamp=ts,
+                last_bar_timestamp=ts,
+                latest_price=max(float(bar_df["close"].iloc[-1]), 1e-6),
+                data_points=max(self._bar_count, 1),
+                data_start=ts,
+                data_end=ts,
+                lookahead_safe=True,
+            )
+
+        # Resolve market_view.
+        if market_view is not None:
+            if isinstance(market_view, MarketView):
+                view = market_view
+            elif isinstance(market_view, dict):
+                view = MarketView(**market_view)
+            else:
+                view = MarketView(
+                    symbol=self.deployment.symbol,
+                    timeframe=self.config.timeframe or "1d",
+                    market_view=MarketViewEnum.NEUTRAL,
+                    confidence=0.5,
+                    reasoning_summary="provided via market_view dict",
+                    bullish_factors=[],
+                    bearish_factors=[],
+                    risks=[],
+                    invalidating_conditions=[],
+                    model="provided",
+                )
+        else:
+            # Auto-view: simple rule-based view from price vs SMA20 and MACD if available.
+            # This ensures a non-NEUTRAL view when indicators exist, otherwise NEUTRAL.
+            close = float(bar_df["close"].iloc[-1])
+            # Direct attribute access (no getattr) — snapshot may lack indicators
+            # when there is insufficient history.
+            try:
+                sma20 = snapshot.sma_20
+            except AttributeError:
+                sma20 = None
+            try:
+                macd = snapshot.macd
+            except AttributeError:
+                macd = None
+            try:
+                macd_signal = snapshot.macd_signal
+            except AttributeError:
+                macd_signal = None
+            if sma20 is not None and macd is not None and macd_signal is not None:
+                if close > sma20 and macd > macd_signal:
+                    view = MarketView(
+                        symbol=self.deployment.symbol,
+                        timeframe=self.config.timeframe or "1d",
+                        market_view=MarketViewEnum.BULLISH,
+                        confidence=0.7,
+                        reasoning_summary="auto: price>SMA20 + MACD>signal",
+                        bullish_factors=["price above SMA20", "MACD bullish crossover"],
+                        bearish_factors=[],
+                        risks=["trend dependence on SMA/MACD"],
+                        invalidating_conditions=["price breaks below SMA20"],
+                        model="auto-signals",
+                    )
+                elif close < sma20 and macd < macd_signal:
+                    view = MarketView(
+                        symbol=self.deployment.symbol,
+                        timeframe=self.config.timeframe or "1d",
+                        market_view=MarketViewEnum.BEARISH,
+                        confidence=0.7,
+                        reasoning_summary="auto: price<SMA20 + MACD<signal",
+                        bullish_factors=[],
+                        bearish_factors=["price below SMA20", "MACD bearish crossover"],
+                        risks=["trend dependence on SMA/MACD"],
+                        invalidating_conditions=["price breaks above SMA20"],
+                        model="auto-signals",
+                    )
+                else:
+                    view = MarketView(
+                        symbol=self.deployment.symbol,
+                        timeframe=self.config.timeframe or "1d",
+                        market_view=MarketViewEnum.NEUTRAL,
+                        confidence=0.5,
+                        reasoning_summary="auto: indicators conflicting -> neutral",
+                        bullish_factors=[],
+                        bearish_factors=[],
+                        risks=["indicator conflict"],
+                        invalidating_conditions=[],
+                        model="auto-signals",
+                    )
+            else:
+                view = MarketView(
+                    symbol=self.deployment.symbol,
+                    timeframe=self.config.timeframe or "1d",
+                    market_view=MarketViewEnum.NEUTRAL,
+                    confidence=0.5,
+                    reasoning_summary="auto: insufficient indicators -> neutral",
+                    bullish_factors=[],
+                    bearish_factors=[],
+                    risks=["insufficient data"],
+                    invalidating_conditions=[],
+                    model="auto-signals",
+                )
+
+        # Resolve signal_config.
+        if signal_config is not None:
+            if isinstance(signal_config, SignalConfig):
+                cfg = signal_config
+            elif isinstance(signal_config, dict):
+                cfg = SignalConfig(**signal_config)
+            else:
+                cfg = SignalConfig()
+        else:
+            cfg = SignalConfig()
+
+        # Generate signal via the deterministic engine.
+        signal = sig_gen(snapshot, view, config=cfg)
         return signal
 
     # ------------------------------------------------------------------ #
@@ -517,6 +677,24 @@ class PaperStrategyRunner:
             )
             if decision.value == "halt":
                 risk_halt = reason
+
+        # System-level risk manager evaluation (Phase 19+).
+        if self._risk_manager is not None:
+            decisions = self._risk_manager.to_paper_decisions(
+                equity=equity,
+                max_drawdown=self._max_drawdown,
+                position=position,
+                rejected_orders=self._rejected_orders,
+                consecutive_errors=self._consecutive_errors,
+                n_concurrent_positions=len(self.broker.positions()) if self.broker else 0,
+            )
+            # Merge decisions: if any check halts, risk_halt is set.
+            for key, decision in decisions.items():
+                if decision == "halt" and key in ("max_drawdown", "exposure", "rejected_orders", "consecutive_errors"):
+                    if risk_halt is None:
+                        risk_halt = f"risk_manager:{key}"
+                    else:
+                        risk_halt = f"{risk_halt}+{key}"
 
         # Circuit breaker integration: halt conditions trip the breaker.
         if self._circuit_breaker is not None:
