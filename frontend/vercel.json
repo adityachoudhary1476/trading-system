@@ -18,4 +18,5 @@
       "src": "api/upstox/*.ts",
       "use": "@vercel/node"
     }
+  ]
 }
