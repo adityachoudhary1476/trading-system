@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState } from "react";
+﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { useApp } from "@/store/AppContext";
 import { dataSource } from "@/data/MarketDataSource";
 import type { OHLCVBar } from "@/types";
@@ -9,7 +9,7 @@ import { DataHealthPanel } from "@/components/system/DataHealthPanel";
 import { MarketStatusPanel } from "@/components/layout/MarketStatusPanel";
 import { TickerStrip } from "@/components/market/TickerStrip";
 import { Panel, Loading } from "@/components/ui";
-import { useMarketStatus } from "@/data/useQuote";
+import { useLiveMarketState, useMarketStatus } from "@/data/useQuote";
 import { fmtTimeIST } from "@/lib/format";
 
 // India Standard Time is UTC+5:30. Upstox timestamps NSE candles at
@@ -60,6 +60,21 @@ export function mergeLiveTick(bars: OHLCVBar[] | null, price: number, ts: number
 
 export function floorToBar(ts: number, barMs: number): number {
   return Math.floor((ts + IST_OFFSET_MS) / barMs) * barMs - IST_OFFSET_MS;
+}
+
+export function barMsFor(timeframe: string): number {
+  switch (timeframe) {
+    case "1m":
+      return 60_000;
+    case "1D":
+      return 24 * 60 * 60_000;
+    case "1W":
+      return 7 * 24 * 60 * 60_000;
+    case "1M":
+      return 30 * 24 * 60 * 60_000;
+    default:
+      return 0;
+  }
 }
 
 // Timeframes exposed to the operator. Each entry is a key that the
@@ -125,6 +140,12 @@ export function DashboardPage() {
   }, [selectedSymbol, tf]);
 
   const session = useMarketStatus();
+  const live = useLiveMarketState(selectedSymbol);
+  const barMs = barMsFor(tf);
+  const chartBars = useMemo(
+    () => (live && live.isLive ? mergeLiveTick(bars, live.price, live.marketTimestamp, barMs) : bars),
+    [bars, live, barMs],
+  );
 
   // Periodically refresh OHLCV during market hours so the historical
   // series does not go stale.  The live tick merge (below) smooths the
@@ -160,7 +181,7 @@ export function DashboardPage() {
     return () => { alive = false; clearInterval(id); };
   }, [selectedSymbol, tf, session?.phase]);
 
-  const lastClose = bars && bars.length ? bars[bars.length - 1].close : 0;
+  const lastClose = chartBars && chartBars.length ? chartBars[chartBars.length - 1].close : 0;
   const toggleInd = (k: keyof IndicatorConfig) =>
     setIndicators((prev) => ({ ...prev, [k]: !prev[k] }));
   const addLevel = () => { if (lastClose) setLevels((p) => [...p, lastClose]); };
@@ -250,9 +271,9 @@ export function DashboardPage() {
               </div>
             }
           >
-            {bars ? (
+            {chartBars ? (
               <PriceChart
-                data={bars}
+                data={chartBars}
                 indicators={indicators}
                 levels={levels}
                 drawTool={drawTool}
