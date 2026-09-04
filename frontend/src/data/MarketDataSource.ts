@@ -284,7 +284,7 @@ export class ApiMarketDataSource implements MarketDataSource {
   }
 
   async getMarketStatus(): Promise<MarketStatus> {
-    return this.fetchJson<MarketStatus>("/api/market/status");
+    return this.fetchJson<MarketStatus>("/api/upstox/status");
   }
 }
 
