@@ -1,21 +1,38 @@
-"""Backtesting engine. NOT implemented on Day 1.
+"""Backtesting engine.
 
-Reserved for replaying signals/strategies over stored historical data once a
-signal generator and risk manager exist. Placeholder only.
+Re-exports the deterministic, provider-independent backtester from
+``research/backtester.py``. The implementation supports:
+  * Causal signal replay (enter at next-bar open, no look-ahead).
+  * Transaction costs + slippage (generic pct or India-specific cost model).
+  * Walk-forward / out-of-sample train-test splits.
+  * Max drawdown, Sharpe/Sortino, profit factor, win rate, exposure.
+
+Usage (analysis / paper only — no live orders):
+
+    from trading_system.backtesting import run_backtest, BacktestConfig, BacktestResult
+    result = run_backtest(dataset, strategy, BacktestConfig(initial_capital=1_00_000))
+    perf = compute_performance(result)
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from ..research.backtester import (
+    BacktestConfig,
+    BacktestResult,
+    Trade,
+    run_backtest,
+)
+from ..research.performance import (
+    PerformanceReport,
+    compute_performance,
+)
+from ..research.risk import RiskConfig
 
-
-@dataclass
-class BacktestResult:
-    strategy: str = ""
-    total_return: float = 0.0
-    sharpe: float = 0.0
-    max_drawdown: float = 0.0
-    trades: int = 0
-
-
-def run_backtest(*args, **kwargs) -> BacktestResult:
-    raise NotImplementedError("Backtesting is a Day 2+ component.")
+__all__ = [
+    "BacktestConfig",
+    "BacktestResult",
+    "Trade",
+    "RiskConfig",
+    "run_backtest",
+    "PerformanceReport",
+    "compute_performance",
+]

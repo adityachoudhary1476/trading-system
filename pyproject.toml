@@ -7,7 +7,7 @@ name = "trading-system"
 version = "0.1.0"
 description = "AI-assisted market analysis and paper-trading research system (Day 1 foundation)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
     "pandas==3.0.5",
     "numpy==2.4.6",
