@@ -32,7 +32,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const url = `${PYTHON_BACKEND_URL}/api/market/candles?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}&limit=${encodeURIComponent(limit)}`;
     const response = await fetch(url, {
       headers: { Authorization: `Bearer ${bearer}`, Accept: "application/json" },
-      cache: "no-store",
     });
     const body = await response.json().catch(() => ({}));
     res.status(response.status).json(body);
