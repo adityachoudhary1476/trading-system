@@ -18,9 +18,4 @@
       "src": "api/upstox/*.ts",
       "use": "@vercel/node"
     }
-  ],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/$1" },
-    { "src": "/(.*)", "dest": "/index.html" }
-  ]
 }
