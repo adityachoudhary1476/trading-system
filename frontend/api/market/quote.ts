@@ -208,14 +208,13 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       return;
     }
 
-    // Previous close: prefer explicit prev_close, then close, then ohlc.close.
-    // No fabrication — if every candidate is missing/non-finite, return null
-    // and the frontend will render the field as unavailable.
-    const prevClose = pickFinite(
-      quote.prev_close,
-      quote.close,
-      quote.ohlc?.close,
-    );
+    // Previous close: ONLY use Upstox's explicit prev_close field.
+    // Do NOT fall back to `close` or `ohlc.close` — those represent the
+    // current session's price, not the PREVIOUS trading day's close.
+    // Using them as prevClose produces nonsensical change values.
+    // If prev_close is missing/non-finite, emit null so the frontend
+    // renders the field as unavailable ("—").
+    const prevClose = quote.prev_close != null && isFiniteNumber(quote.prev_close) ? quote.prev_close : null;
 
     // OHLC values: prefer top-level fields, then the nested ``ohlc`` object.
     const dayOpen = pickFinite(quote.open, quote.ohlc?.open);
