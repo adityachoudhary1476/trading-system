@@ -170,10 +170,10 @@ export function MarketsPage() {
           <span className="label">Source</span>
           <span className="value">Live</span>
         </div>
-        <div className="stat-card">
-          <span className="label">Updated</span>
-          <span className="value">1s</span>
-        </div>
+          <div className="stat-card">
+            <span className="label">Updated</span>
+            <span className="value">2s</span>
+          </div>
       </div>
 
       <Table title="Indices" data={filtered.filter((r) => r.instrumentType === "index")} />

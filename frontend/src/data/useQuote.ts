@@ -2,9 +2,10 @@
 //
 // Components call useQuote(symbol) and receive a synchronous snapshot
 // of the current state.  When the store emits a new state, the
-// component re-renders.  The hook also subscribes to the store's 1 Hz
-// clock tick so the freshness badge updates without an extra server
-// round trip.
+// component re-renders.  The hook also subscribes to the store's
+// 1-second clock tick so the freshness badge updates without an extra
+// server round trip (the clock tick is separate from the 0.5 Hz quote
+// poll).
 
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { marketDataStore } from "./marketDataStore";

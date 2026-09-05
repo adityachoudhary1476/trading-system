@@ -300,7 +300,7 @@ export function DashboardPage() {
         </div>
       </div>
       <p className="faint" style={{ fontSize: 11, marginTop: 16 }}>
-        Historical OHLCV is sourced from Upstox via the Vercel /api/market/ohlcv route. The live tick merge (below) updates the in-progress bar; live price updates every second via /api/market/quote.
+        Historical OHLCV is sourced from Upstox via the Vercel /api/market/ohlcv route. The live tick merge (below) updates the in-progress bar; live price updates every 2 seconds via /api/market/quote.
       </p>
     </>
   );

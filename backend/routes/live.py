@@ -87,7 +87,7 @@ async def get_quote(
 ) -> QuoteDTO:
     """Return a single live quote snapshot for ``symbol``.
 
-    Intended to be polled approximately once per second by the
+    Intended to be polled approximately every 2 seconds (0.5 Hz) by the
     dashboard's centralized market-data store; each call hits Upstox
     once, never fabricates values, and surfaces a fresh ``timestamp``
     on every successful response.

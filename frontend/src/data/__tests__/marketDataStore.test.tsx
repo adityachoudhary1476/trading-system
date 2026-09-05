@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { renderHook, act, render, screen, cleanup } from "@testing-library/react";
-import { marketDataStore } from "../marketDataStore";
+import { marketDataStore, LIVE_QUOTE_POLL_INTERVAL_MS, DEFAULT_POLL_INTERVAL_MS } from "../marketDataStore";
 import { useQuote, useMarketStatus, usePriceDelta, useLiveMarketState } from "../useQuote";
 import { QuoteHeader } from "@/components/market/QuoteAndMetrics";
 import type { MarketQuote, MarketStatus } from "@/types";
@@ -367,8 +367,302 @@ describe("usePriceDelta hook (Phase 5)", () => {
     expect(result.current).toBe(5);
   });
 
-  it("returns null when quote data is not yet available", () => {
-    const { result } = renderHook(() => usePriceDelta("NSE:NONEXISTENT", 100));
-    expect(result.current).toBeNull();
-  });
+   it("returns null when quote data is not yet available", () => {
+     const { result } = renderHook(() => usePriceDelta("NSE:NONEXISTENT", 100));
+     expect(result.current).toBeNull();
+   });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 21 — 0.5 Hz (2 s) live quote polling contract
+// ---------------------------------------------------------------------------
+
+describe("live quote poll interval (0.5 Hz)", () => {
+   it("LIVE_QUOTE_POLL_INTERVAL_MS is 2000 (0.5 Hz)", () => {
+     expect(LIVE_QUOTE_POLL_INTERVAL_MS).toBe(2000);
+     expect(DEFAULT_POLL_INTERVAL_MS).toBe(2000);
+   });
+
+   it("does not poll faster than once every 2 seconds by default", () => {
+     // The default (unconfigured) interval must never be 1000 ms.
+     expect(LIVE_QUOTE_POLL_INTERVAL_MS).not.toBe(1000);
+     expect(LIVE_QUOTE_POLL_INTERVAL_MS).toBeGreaterThanOrEqual(2000);
+   });
+});
+
+describe("deduplication & cleanup (0.5 Hz contract)", () => {
+   it("multiple subscribers share a single polling lifecycle", async () => {
+     let calls = 0;
+     setQuote(async (s) => {
+       calls += 1;
+       return makeQuote(100, s);
+     });
+     const unsub1 = marketDataStore.subscribe("NSE:SBIN", () => {});
+     const unsub2 = marketDataStore.subscribe("NSE:SBIN", () => {});
+     const unsub3 = marketDataStore.subscribe("NSE:SBIN", () => {});
+     await wait(20);
+
+     // Three subscribers → exactly ONE initial fetch (dedup).
+     expect(calls).toBe(1);
+
+     unsub1();
+     // Still two subscribers — timer keeps running, next tick at 50 ms.
+     await wait(60);
+     expect(calls).toBe(2); // 1 initial + 1 timer tick
+
+     unsub2();
+     unsub3();
+   });
+
+   it("timer is cleared after the last unsubscribe", async () => {
+     let calls = 0;
+     setQuote(async (s) => {
+       calls += 1;
+       return makeQuote(100, s);
+     });
+     const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+     await wait(20);
+     const before = calls;
+     unsub();
+
+     // Wait well past a timer tick — no new fetches should occur.
+     await wait(150);
+     expect(calls).toBe(before);
+   });
+});
+
+describe("overlap prevention (2 s semantics)", () => {
+   it("a slow in-flight fetch is not duplicated by the next tick", async () => {
+     let calls = 0;
+     let resolveFn: ((v: MarketQuote) => void) | null = null;
+     setQuote((s) => {
+       calls += 1;
+       return new Promise<MarketQuote>((resolve) => {
+         resolveFn = () => resolve(makeQuote(100, s));
+       });
+     });
+     const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+     await wait(20);
+
+     // Allow multiple poll ticks while the fetch is still pending.
+     // With a 50 ms test interval, several ticks fire but only ONE
+     // actual HTTP call is made (inflight dedup).
+     await wait(200);
+     expect(calls).toBe(1);
+
+     if (resolveFn) resolveFn(makeQuote(100, "NSE:SBIN"));
+     await wait(200);
+     expect(calls).toBeGreaterThanOrEqual(2);
+     unsub();
+   });
+});
+
+describe("recovery (tab visibility / network)", () => {
+   let originalHidden: boolean;
+
+   beforeEach(() => {
+     originalHidden = document.hidden;
+   });
+
+   afterEach(() => {
+     Object.defineProperty(document, "hidden", {
+       value: originalHidden,
+       configurable: true,
+     });
+   });
+
+   it("refreshNow triggers an immediate fetch for active subscribers", async () => {
+     let calls = 0;
+     setQuote(async (s) => {
+       calls += 1;
+       return makeQuote(100, s);
+     });
+     const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+     await wait(20);
+     expect(calls).toBe(1); // initial fetch only — 50 ms interval hasn't ticked yet
+
+     marketDataStore.refreshNow();
+     await wait(20);
+     // At least one extra fetch beyond the initial one (immediate on-demand).
+     expect(calls).toBeGreaterThanOrEqual(2);
+
+     unsub();
+   });
+
+   it("pauseAllQuotePolling when tab hidden; resume + immediate fetch on visible", async () => {
+     let calls = 0;
+     setQuote(async (s) => {
+       calls += 1;
+       return makeQuote(100, s);
+     });
+     const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+     await wait(20);
+     const baseline = calls;
+
+     // Hide the tab — the visibilitychange handler should pause polling.
+     Object.defineProperty(document, "hidden", { value: true, configurable: true });
+     document.dispatchEvent(new Event("visibilitychange"));
+     await wait(150); // enough for 2-3 timer ticks at 50 ms
+
+     // No new fetches while hidden.
+     expect(calls).toBe(baseline);
+
+     // Show the tab — immediate fetch + timer resumes.
+     Object.defineProperty(document, "hidden", { value: false, configurable: true });
+     document.dispatchEvent(new Event("visibilitychange"));
+     await wait(20);
+     expect(calls).toBeGreaterThanOrEqual(baseline + 1);
+
+     unsub();
+   });
+
+   it("online event triggers immediate refresh", async () => {
+     let calls = 0;
+     setQuote(async (s) => {
+       calls += 1;
+       return makeQuote(100, s);
+     });
+     const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+     await wait(20);
+     const baseline = calls;
+
+     window.dispatchEvent(new Event("online"));
+     await wait(20);
+     expect(calls).toBeGreaterThanOrEqual(baseline + 1);
+
+     unsub();
+   });
+
+   it("refreshNow is a no-op when the tab is hidden", async () => {
+     let calls = 0;
+     setQuote(async (s) => {
+       calls += 1;
+       return makeQuote(100, s);
+     });
+     const unsub = marketDataStore.subscribe("NSE:SBIN", () => {});
+     await wait(20);
+
+     Object.defineProperty(document, "hidden", { value: true, configurable: true });
+     document.dispatchEvent(new Event("visibilitychange"));
+     await wait(20);
+     const hiddenCalls = calls;
+
+     marketDataStore.refreshNow();
+     await wait(20);
+     expect(calls).toBe(hiddenCalls); // no fetch while hidden
+
+     unsub();
+   });
+});
+
+describe("market-closed gating", () => {
+   it("pauses quote polling when the market is closed", async () => {
+     let calls = 0;
+     setQuote(async (s) => {
+       calls += 1;
+       return makeQuote(100, s);
+     });
+     setStatus(async () => ({
+       market: "NSE",
+       phase: "closed",
+       serverTime: Date.now(),
+       nextOpen: Date.now() + 60_000,
+       nextClose: null,
+     }));
+
+     const unsubQ = marketDataStore.subscribe("NSE:SBIN", () => {});
+     const unsubS = marketDataStore.subscribeSession(() => {});
+     await wait(60);
+
+     // One immediate fetch (from subscribe); no timer ticks since the
+     // session reported closed and paused the timer.
+     expect(calls).toBe(1);
+
+     // Wait past several timer ticks — still only 1 fetch.
+     await wait(200);
+     expect(calls).toBe(1);
+
+     // State is "closed", not "fresh" — no fabricated freshness.
+     expect(marketDataStore.getState("NSE:SBIN").freshness).toBe("closed");
+     expect(marketDataStore.getState("NSE:SBIN").data?.price).toBe(100);
+
+     unsubQ();
+     unsubS();
+   });
+
+    it("preserves last valid quote when market transitions to closed", async () => {
+      setQuote(async (s) => makeQuote(100, s));
+      setStatus(async () => ({
+        market: "NSE",
+        phase: "regular",
+        serverTime: Date.now(),
+        nextOpen: null,
+        nextClose: null,
+      }));
+
+      const unsubQ = marketDataStore.subscribe("NSE:SBIN", () => {});
+      let unsubS = marketDataStore.subscribeSession(() => {});
+      await wait(60);
+
+      expect(marketDataStore.getState("NSE:SBIN").freshness).toBe("fresh");
+
+      // Market closes — re-trigger session fetch to detect the transition.
+      setStatus(async () => ({
+        market: "NSE",
+        phase: "closed",
+        serverTime: Date.now(),
+        nextOpen: Date.now() + 60_000,
+        nextClose: null,
+      }));
+      unsubS(); // clears the 60 s session timer
+      await wait(10);
+      unsubS = marketDataStore.subscribeSession(() => {}); // new immediate fetch
+      await wait(80);
+
+      const state = marketDataStore.getState("NSE:SBIN");
+      expect(state.freshness).toBe("closed");
+      expect(state.data?.price).toBe(100); // last valid quote preserved
+
+      unsubQ();
+      unsubS();
+    });
+
+    it("resumes polling with immediate fetch when market reopens", async () => {
+      let calls = 0;
+      setQuote(async (s) => {
+        calls += 1;
+        return makeQuote(100, s);
+      });
+      setStatus(async () => ({
+        market: "NSE",
+        phase: "closed",
+        serverTime: Date.now(),
+        nextOpen: Date.now() + 60_000,
+        nextClose: null,
+      }));
+
+      const unsubQ = marketDataStore.subscribe("NSE:SBIN", () => {});
+      let unsubS = marketDataStore.subscribeSession(() => {});
+      await wait(60);
+      expect(calls).toBe(1); // only initial fetch while closed
+
+      // Market reopens — re-trigger session fetch to detect the transition.
+      setStatus(async () => ({
+        market: "NSE",
+        phase: "regular",
+        serverTime: Date.now(),
+        nextOpen: null,
+        nextClose: null,
+      }));
+      unsubS(); // clears the 60 s session timer
+      await wait(10);
+      unsubS = marketDataStore.subscribeSession(() => {}); // new immediate fetch
+      await wait(80); // immediate fetch on reopen + timer tick at 50 ms
+
+      // Immediate fetch on reopen + at least one timer tick.
+      expect(calls).toBeGreaterThanOrEqual(2);
+
+      unsubQ();
+      unsubS();
+    });
 });
