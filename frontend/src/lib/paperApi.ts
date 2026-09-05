@@ -26,9 +26,25 @@ import type {
 const DEFAULT_BASE = "";
 const PAPER_API_PREFIX = "/api/paper";
 
+function isLoopbackUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname;
+    return host === "localhost" || host === "127.0.0.1" || host === "[::1]" || host === "::1";
+  } catch {
+    // Not an absolute URL — e.g. a relative path. Those are same-origin and safe.
+    return !url.startsWith("http://") && !url.startsWith("https://");
+  }
+}
+
 function baseUrl(): string {
   const envUrl = typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_PAPER_API_URL;
-  if (envUrl) return envUrl;
+  // VITE_PAPER_API_URL is embedded at build time and is therefore PUBLIC.
+  // Only honour it for loopback (local dev) targets so the browser can never
+  // bypass the Vercel proxy → PYTHON_BACKEND_URL chain in production.
+  // In production leave it unset: the browser uses same-origin /api/paper/*
+  // which Vercel routes to api/paper/[...path].ts.
+  if (envUrl && isLoopbackUrl(envUrl)) return envUrl;
   return DEFAULT_BASE;
 }
 
