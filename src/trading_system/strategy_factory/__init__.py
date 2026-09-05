@@ -11,6 +11,10 @@ The canonical architecture implemented here is::
         -> Strategy Contract  (Strategy.evaluate -> StrategySignal)
         -> Strategy Registry   (in-memory, duplicate-rejected, filtered discovery)
         -> Strategy Validation (validate_strategy / require_valid_strategy)
+        -> Capabilities       (typed data/indicator/timeframe/history requirements)
+        -> Compatibility      (pure, side-effect-free capability match)
+        -> Fingerprint         (deterministic configuration identity)
+        -> Catalog            (read-only introspection facade)
 
 It COMPOSES with (not replaces) the existing stack:
   * indicator math      -> trading_system.indicators (reused, not duplicated)
@@ -23,6 +27,15 @@ A strategy evaluates a look-ahead-safe ``MarketState`` and returns a pure
 """
 from __future__ import annotations
 
+from .catalog import Catalog, CATALOG_SCHEMA_VERSION
+from .capability import (
+    Capabilities,
+    CompatibilityReport,
+    DataRequirement,
+    MarketContext,
+    capabilities_from,
+    is_compatible,
+)
 from .contract import (
     MarketState,
     PositionState,
@@ -45,6 +58,7 @@ from .exceptions import (
     StrategyFactoryError,
     StrategyValidationError,
 )
+from .fingerprint import configuration_fingerprint, contract_schema, strategy_identity
 from .metadata import (
     StrategyFamily,
     StrategyMetadata,
@@ -68,7 +82,7 @@ from .validation import (
     validate_strategy,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "MarketState",
@@ -84,6 +98,17 @@ __all__ = [
     "ParameterSchema",
     "ParameterType",
     "StrategyRegistry",
+    "Catalog",
+    "CATALOG_SCHEMA_VERSION",
+    "Capabilities",
+    "DataRequirement",
+    "MarketContext",
+    "CompatibilityReport",
+    "is_compatible",
+    "capabilities_from",
+    "strategy_identity",
+    "configuration_fingerprint",
+    "contract_schema",
     "register_strategy",
     "registered_strategy_ids",
     "get_strategy_class",
