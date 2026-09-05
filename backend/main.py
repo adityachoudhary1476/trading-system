@@ -12,6 +12,7 @@ from routes.analysis import router as analysis_router
 from routes.signals import router as signals_router
 from routes.pipeline import router as pipeline_router
 from routes.live import router as live_router
+from routes.paper_api import router as paper_api_router
 
 # Configure logging
 logging.basicConfig(
@@ -88,6 +89,7 @@ app.include_router(analysis_router)
 app.include_router(signals_router)
 app.include_router(pipeline_router)
 app.include_router(live_router)
+app.include_router(paper_api_router)
 
 
 @app.get("/health", tags=["health"])

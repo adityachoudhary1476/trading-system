@@ -23,7 +23,8 @@ import type {
   SessionResponse,
 } from "@/types/paper-api";
 
-const DEFAULT_BASE = "http://127.0.0.1:8765";
+const DEFAULT_BASE = "";
+const PAPER_API_PREFIX = "/api/paper";
 
 function baseUrl(): string {
   const envUrl = typeof import.meta !== "undefined" && (import.meta as any).env?.VITE_PAPER_API_URL;
@@ -35,7 +36,7 @@ async function request<T>(
   path: string,
   init?: RequestInit,
 ): Promise<ApiResult<T>> {
-  const url = `${baseUrl()}${path}`;
+  const url = `${baseUrl()}${PAPER_API_PREFIX}${path}`;
   let res: Response;
   try {
     res = await fetch(url, {

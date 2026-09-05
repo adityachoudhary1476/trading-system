@@ -26,6 +26,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY backend/ ./backend/
 COPY src/ ./src/
 
+# Ensure the data directory exists for SQLite paper-trading storage
+RUN mkdir -p /app/data
+
 # Change ownership to non-root user
 RUN chown -R appuser:appuser /app
 

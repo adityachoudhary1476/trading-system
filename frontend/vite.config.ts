@@ -17,6 +17,9 @@ export default defineConfig({
   server: {
     port: 5173,
     host: true,
+    proxy: {
+      "/api/paper": "http://localhost:8000",
+    },
   },
   test: {
     globals: true,
