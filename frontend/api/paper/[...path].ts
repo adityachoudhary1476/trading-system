@@ -1,5 +1,4 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
-import { Readable } from "stream";
 
 const PYTHON_BACKEND_URL = process.env.PYTHON_BACKEND_URL || "http://localhost:8000";
 
@@ -60,7 +59,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     resp = await fetch(backendUrl, {
       method: req.method,
       headers,
-      body,
+      body: body as any,
     });
   } catch {
     res.status(502).json({ error: "backend_unavailable" });
