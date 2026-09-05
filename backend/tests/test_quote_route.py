@@ -270,10 +270,14 @@ class TestQuoteRouteContract:
         assert resp.status_code == 502
 
     def test_requires_authentication(self, client):
-        with TestClient(app) as c:
-            resp = c.get("/api/market/quote?symbol=NSE:SBIN")
-        # The route depends on get_current_user which raises HTTPException;
-        # both 401 and 403 are acceptable evidence of "not authenticated".
+        async def no_token(user_id):
+            return None
+        with patch("routes.live.broker.get_upstox_access_token", side_effect=no_token):
+            with TestClient(app) as c:
+                resp = c.get("/api/market/quote?symbol=NSE:SBIN")
+        # Auth is bypassed by the fixture; the 403 comes from no Upstox
+        # connection (no individual token and no service-account fallback
+        # in the test environment).
         assert resp.status_code in (401, 403)
 
 
