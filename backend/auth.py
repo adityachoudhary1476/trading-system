@@ -255,7 +255,11 @@ def _validate_supabase_jwt(token: str) -> Optional[AuthenticatedUser]:
 
     settings = get_settings()
     if not settings.supabase_url:
-        logger.error("Supabase URL is not configured")
+        logger.error(
+            "Supabase URL is not configured (SUPABASE_URL env var missing). "
+            "JWT verification cannot proceed. Set SUPABASE_URL to your "
+            "Supabase project URL (e.g., https://<project-ref>.supabase.co)."
+        )
         return None
 
     claims: Optional[dict[str, Any]] = None
@@ -295,6 +299,18 @@ async def get_current_user(
     token = credentials.credentials
     if not token:
         raise _unauthorized("Invalid authentication token")
+
+    settings = get_settings()
+    if not settings.supabase_url:
+        logger.error(
+            "JWT validation cannot proceed: SUPABASE_URL is not configured. "
+            "Set the SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment "
+            "variables in your deployment."
+        )
+        raise _unauthorized(
+            "Authentication service is not configured. "
+            "Contact the administrator to set SUPABASE_URL."
+        )
 
     user = _validate_supabase_jwt(token)
     if not user:
