@@ -60,6 +60,7 @@ export function App() {
             <Route path="overview" element={<PaperOverview />} />
             <Route path="deployments" element={<PaperDeployments />} />
             <Route path="deployments/:deploymentId" element={<PaperDeploymentDetail />} />
+            <Route path="strategies" element={<PaperStrategies />} />
             <Route path="strategies/:strategyId" element={<PaperStrategies />} />
             <Route path="sessions" element={<PaperSessions />} />
             <Route path="sessions/:deploymentId" element={<PaperSessions />} />

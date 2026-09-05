@@ -9,12 +9,15 @@ import type {
 } from "@/types/paper-api";
 import { EmptyState, Button, MetricItem } from "@/components/ui";
 import { DeploymentPicker, fmt } from "@/components/paper/paperShared";
+import { CreateDeploymentModal } from "@/components/paper/CreateDeploymentModal";
 
 export function PaperOverview() {
   const [deploymentId, setDeploymentId] = useState("");
   const [snapshot, setSnapshot] = useState<DashboardSnapshotResponse | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createSeq, setCreateSeq] = useState(0);
   const fetchSeqRef = useRef(0);
 
   const fetchData = useCallback(async (id: string) => {
@@ -38,13 +41,23 @@ export function PaperOverview() {
 
   return (
     <div className="paper-shell">
-      <DeploymentPicker value={deploymentId} onChange={setDeploymentId} />
+       <DeploymentPicker
+        value={deploymentId}
+        onChange={setDeploymentId}
+        onCreateDeployment={() => setShowCreate(true)}
+        refreshKey={createSeq}
+      />
 
       {!deploymentId && !loading && (
-        <EmptyState
-          title="No paper deployment selected"
-          hint="Select a deployment above to inspect its terminal state."
-        />
+        <div className="overview-empty">
+          <EmptyState
+            title="No paper deployment selected"
+            hint="Select a deployment above to inspect its terminal state."
+          />
+          <Button variant="primary" size="sm" onClick={() => setShowCreate(true)}>
+            Create paper deployment
+          </Button>
+        </div>
       )}
 
       {loading && deploymentId && <TerminalSkeleton />}
@@ -64,6 +77,16 @@ export function PaperOverview() {
           onRefresh={() => fetchData(deploymentId)}
         />
       )}
+
+      <CreateDeploymentModal
+        open={showCreate}
+        onClose={() => setShowCreate(false)}
+        onCreated={(id) => {
+          setShowCreate(false);
+          setCreateSeq((n) => n + 1);
+          setDeploymentId(id);
+        }}
+      />
     </div>
   );
 }

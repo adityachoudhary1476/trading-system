@@ -388,3 +388,64 @@ export interface ErrorResponse {
 export type ApiResult<T> =
   | { ok: true; data: T }
   | { ok: false; error: ApiError; status: number };
+
+// --------------------------------------------------------------------------- #
+// Phase 22 — Adaptive Multi-Strategy Market Intelligence
+// --------------------------------------------------------------------------- #
+export type Phase22Regime =
+  | "trending_up"
+  | "trending_down"
+  | "range_bound"
+  | "high_volatility"
+  | "low_volatility"
+  | "volatility_expansion"
+  | "volatility_contraction"
+  | "unknown";
+
+export type StrategyCategory =
+  | "trend_following"
+  | "momentum"
+  | "mean_reversion"
+  | "breakout"
+  | "volatility"
+  | "multi_strategy";
+
+export interface Phase22StrategySpec {
+  name: string;
+  strategy_id: string;
+  spec_name: string;
+  description: string;
+  symbol: string;
+  timeframe: string;
+  indicators: string[];
+  entry_condition: string | null;
+  allow_short: boolean;
+  generated_by: string;
+}
+
+export interface RegimeResponse {
+  regime: Phase22Regime;
+  confidence: number;
+  features: string[];
+  warnings: string[];
+  regime_at_ms: number;
+  schema_version?: number;
+}
+
+export interface AllocationStrategyWeight {
+  strategy_name: string;
+  category: StrategyCategory;
+  regime_compatibility: number;
+  research_score: number | null;
+  weight: number;
+}
+
+export interface AllocationResponse {
+  regime: Phase22Regime;
+  regime_confidence: number;
+  regime_fit: number;
+  total_strategies_available: number;
+  timestamp_ms: number;
+  selected_strategies: AllocationStrategyWeight[];
+  schema_version?: number;
+}

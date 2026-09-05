@@ -199,6 +199,11 @@ class PaperAPIRouter:
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/orders$",
                   frozenset({"POST"}), self._route_submit_order)
 
+        # Phase 22 - Adaptive Multi-Strategy Market Intelligence
+        self._add(r"^/regime$", frozenset({"GET"}), self._route_regime)
+        self._add(r"^/strategies$", frozenset({"GET"}), self._route_phase22_strategies)
+        self._add(r"^/allocation$", frozenset({"GET"}), self._route_allocation)
+
     def _add(self, pattern: str, methods: frozenset[str], handler: RouteHandler) -> None:
         self._routes.append((re.compile(pattern), methods, handler))
 
@@ -855,3 +860,95 @@ class PaperAPIRouter:
             body=json.loads(json.dumps(payload, default=str),
                             parse_constant=_strict_constant),
         )
+
+    # ------------------------------------------------------------------ #
+    # Phase 22 - Adaptive Multi-Strategy Market Intelligence routes
+    # ------------------------------------------------------------------ #
+    def _route_regime(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /regime — classify the current market regime from market data."""
+        from ..research.phase22 import RegimeClassifier
+
+        symbol = _single(ctx.query, "symbol") or "NSE:SBIN"
+        timeframe = _single(ctx.query, "timeframe") or "1d"
+        limit = _bounded_int(ctx.query, "limit", default=250, lo=10, hi=5000)
+
+        df = self.center.load_market_data(symbol, timeframe)
+        if df is None or len(df) == 0:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message=f"no market data provider configured for {symbol} {timeframe}",
+                status=400,
+            )
+
+        df = df.tail(limit)
+        classifier = RegimeClassifier()
+        result = classifier.classify(df)
+
+        body = {
+            "regime": result.regime.value,
+            "confidence": result.confidence,
+            "features": result.features,
+            "warnings": result.warnings,
+            "regime_at_ms": result.regime_at_ms,
+        }
+        return ResponseEnvelope(status=200, body=body)
+
+    def _route_phase22_strategies(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /strategies — list available Phase 22 strategy specs."""
+        from ..research.phase22 import build_phase22_strategy_specs
+
+        specs = build_phase22_strategy_specs()
+        body = []
+        for name, spec in specs.items():
+            body.append({
+                "name": name,
+                "strategy_id": strategy_identity(spec),
+                "spec_name": spec.name,
+                "description": spec.description,
+                "symbol": spec.symbol,
+                "timeframe": spec.timeframe,
+                "indicators": [d.key for d in spec.indicators],
+                "entry_condition": spec.entry.op.value if spec.entry else None,
+                "allow_short": spec.risk.allow_short,
+                "generated_by": spec.generated_by,
+            })
+        return ResponseEnvelope(status=200, body=body)
+
+    def _route_allocation(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /allocation — compute adaptive strategy allocation for current regime."""
+        from ..research.phase22 import AdaptiveStrategySelector
+
+        symbol = _single(ctx.query, "symbol") or "NSE:SBIN"
+        timeframe = _single(ctx.query, "timeframe") or "1d"
+        limit = _bounded_int(ctx.query, "limit", default=250, lo=10, hi=5000)
+
+        df = self.center.load_market_data(symbol, timeframe)
+        if df is None or len(df) == 0:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message=f"no market data provider configured for {symbol} {timeframe}",
+                status=400,
+            )
+
+        df = df.tail(limit)
+        selector = AdaptiveStrategySelector(self.center.intelligence)
+        result = selector.allocate(df)
+
+        body = {
+            "regime": result.regime.value,
+            "regime_confidence": result.regime_confidence,
+            "regime_fit": result.regime_fit,
+            "total_strategies_available": result.total_strategies_available,
+            "timestamp_ms": result.timestamp_ms,
+            "selected_strategies": [
+                {
+                    "strategy_name": sw.strategy_name,
+                    "category": sw.category,
+                    "regime_compatibility": sw.regime_compatibility,
+                    "research_score": sw.research_score,
+                    "weight": sw.weight,
+                }
+                for sw in result.selected_strategies
+            ],
+        }
+        return ResponseEnvelope(status=200, body=body)

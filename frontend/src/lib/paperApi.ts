@@ -1,5 +1,6 @@
 import type {
   AccountResponse,
+  AllocationResponse,
   ApiError,
   ApiResult,
   CircuitBreakerResponse,
@@ -15,7 +16,9 @@ import type {
   OrderIntentResponse,
   PaperOrderIntent,
   PerformanceResponse,
+  Phase22StrategySpec,
   PositionsResponse,
+  RegimeResponse,
   RiskResponse,
   SessionResponse,
 } from "@/types/paper-api";
@@ -237,4 +240,25 @@ export const paperApi = {
       `/deployments/${encodeURIComponent(deploymentId)}/orders`,
       order,
     ),
+
+  // Phase 22 — Adaptive Multi-Strategy Market Intelligence
+  getStrategies: () => get<Phase22StrategySpec[]>("/strategies"),
+
+  getRegime: (params?: { symbol?: string; timeframe?: string; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.symbol) qs.set("symbol", params.symbol);
+    if (params?.timeframe) qs.set("timeframe", params.timeframe);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    const q = qs.toString();
+    return get<RegimeResponse>(`/regime${q ? `?${q}` : ""}`);
+  },
+
+  getAllocation: (params?: { symbol?: string; timeframe?: string; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.symbol) qs.set("symbol", params.symbol);
+    if (params?.timeframe) qs.set("timeframe", params.timeframe);
+    if (params?.limit) qs.set("limit", String(params.limit));
+    const q = qs.toString();
+    return get<AllocationResponse>(`/allocation${q ? `?${q}` : ""}`);
+  },
 };

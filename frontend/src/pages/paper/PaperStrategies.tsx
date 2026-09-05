@@ -1,8 +1,15 @@
 import { useEffect, useState, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import { paperApi } from "@/lib/paperApi";
-import type { DeploymentListResponse, DashboardSnapshotResponse, EvidenceResponse } from "@/types/paper-api";
-import { Panel, EmptyState, Button, StatusIndicator, MetricItem } from "@/components/ui";
+import type {
+  AllocationResponse,
+  DeploymentListResponse,
+  DashboardSnapshotResponse,
+  EvidenceResponse,
+  Phase22StrategySpec,
+  RegimeResponse,
+} from "@/types/paper-api";
+import { Panel, EmptyState, Button, StatusIndicator, MetricItem, Loading } from "@/components/ui";
 import { EvidenceTimeline } from "@/components/paper/paperShared";
 
 export function PaperStrategies() {
@@ -52,12 +59,7 @@ export function PaperStrategies() {
   }, [fetchAll]);
 
   if (!strategyId) {
-    return (
-      <div className="paper-shell">
-        <div className="pt-section"><h2>Select Strategy</h2></div>
-        <EmptyState title="No strategy selected" hint="Navigate to a strategy from the Deployments page." />
-      </div>
-    );
+    return <StrategyLeaderboard />;
   }
 
   const hasDeployments = deployments && deployments.deployments.length > 0;
@@ -90,7 +92,7 @@ export function PaperStrategies() {
                     <div className="dh-title">{strategy.name || strategyId}</div>
                     <div className="dh-sub">{strategy.strategy_id} · {strategy.symbol} · {strategy.timeframe}</div>
                   </div>
-                  <div className="row gap-sm wrap">
+                  <div className="row gap_sm wrap">
                     <span className="pill">PAPER</span>
                     <StatusIndicator status={strategy.lifecycle_status} />
                   </div>
@@ -188,9 +190,210 @@ export function PaperStrategies() {
   );
 }
 
+// --------------------------------------------------------------------------- #
+// Phase 22 — Strategy Leaderboard (shown when no strategyId is selected)
+// --------------------------------------------------------------------------- #
+function StrategyLeaderboard() {
+  const [strategies, setStrategies] = useState<Phase22StrategySpec[] | null>(null);
+  const [regime, setRegime] = useState<RegimeResponse | null>(null);
+  const [allocation, setAllocation] = useState<AllocationResponse | null>(null);
+  const [strategiesLoading, setStrategiesLoading] = useState(true);
+  const [regimeLoading, setRegimeLoading] = useState(true);
+  const [allocationLoading, setAllocationLoading] = useState(true);
+  const [strategiesError, setStrategiesError] = useState<string | null>(null);
+  const [regimeError, setRegimeError] = useState<string | null>(null);
+  const [allocationError, setAllocationError] = useState<string | null>(null);
+
+  const fetchStrategies = useCallback(async () => {
+    setStrategiesLoading(true);
+    setStrategiesError(null);
+    setStrategies(null);
+    const res = await paperApi.getStrategies();
+    if (res.ok) {
+      setStrategies(res.data);
+    } else {
+      setStrategiesError(res.error.message);
+    }
+    setStrategiesLoading(false);
+  }, []);
+
+  const fetchRegime = useCallback(async () => {
+    setRegimeLoading(true);
+    setRegimeError(null);
+    setRegime(null);
+    const res = await paperApi.getRegime();
+    if (res.ok) {
+      setRegime(res.data);
+    } else {
+      setRegimeError(res.error.message);
+    }
+    setRegimeLoading(false);
+  }, []);
+
+  const fetchAllocation = useCallback(async () => {
+    setAllocationLoading(true);
+    setAllocationError(null);
+    setAllocation(null);
+    const res = await paperApi.getAllocation();
+    if (res.ok) {
+      setAllocation(res.data);
+    } else {
+      setAllocationError(res.error.message);
+    }
+    setAllocationLoading(false);
+  }, []);
+
+  useEffect(() => {
+    fetchStrategies();
+    fetchRegime();
+    fetchAllocation();
+  }, [fetchStrategies, fetchRegime, fetchAllocation]);
+
+  const refresh = () => {
+    fetchStrategies();
+    fetchRegime();
+    fetchAllocation();
+  };
+
+  return (
+    <div className="paper-shell">
+      <div className="pt-section">
+        <h1>Strategy Intelligence</h1>
+        <span className="section-sub">Phase 22 — Adaptive Multi-Strategy Market Intelligence</span>
+      </div>
+
+      {/* Current Market Regime */}
+      <Panel title="Current Market Regime">
+        {regimeLoading ? (
+          <Loading label="Loading market regime..." />
+        ) : regimeError ? (
+          <div className="es-hint muted">
+            Market regime unavailable — no market data provider configured for the dev server.
+            <br />
+            <span className="detail-error">{regimeError}</span>
+          </div>
+        ) : regime ? (
+          <div className="metric-grid">
+            <MetricItem label="Regime" value={regime.regime} />
+            <MetricItem label="Confidence" value={`${Math.round(regime.confidence * 100)}%`} />
+            <MetricItem label="At" value={new Date(regime.regime_at_ms).toLocaleString()} />
+          </div>
+        ) : null}
+      </Panel>
+
+      {/* Recommended Strategy Allocation */}
+      <Panel title="Strategy Allocation" className="mt_md">
+        {allocationLoading ? (
+          <Loading label="Loading strategy allocation..." />
+        ) : allocationError ? (
+          <div className="es-hint muted">
+            Strategy allocation unavailable — no market data provider configured.
+            <br />
+            <span className="detail-error">{allocationError}</span>
+          </div>
+        ) : allocation ? (
+          <>
+            <div className="metric-grid">
+              <MetricItem label="Strategies Available" value={allocation.total_strategies_available} />
+              <MetricItem label="Regime Fit" value={`${Math.round(allocation.regime_fit * 100)}%`} />
+            </div>
+            <div className="mt_sm">
+              <h3>Recommended Allocation</h3>
+              <table className="data dense">
+                <thead>
+                  <tr>
+                    <th>#</th>
+                    <th>Strategy</th>
+                    <th>Category</th>
+                    <th>Weight</th>
+                    <th>Regime Fit</th>
+                    <th>Research Score</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {allocation.selected_strategies.map((sw, i) => (
+                    <tr key={sw.strategy_name}>
+                      <td>{i + 1}</td>
+                      <td>
+                        <Link to={`/paper/strategies/${sw.strategy_name}`} className="td-id">
+                          {sw.strategy_name}
+                        </Link>
+                      </td>
+                      <td><span className="pill">{sw.category}</span></td>
+                      <td>{Math.round(sw.weight * 100)}%</td>
+                      <td>{Math.round(sw.regime_compatibility * 100)}%</td>
+                      <td>{sw.research_score !== null ? Math.round(sw.research_score * 100) : "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : null}
+      </Panel>
+
+      {/* Strategy Leaderboard */}
+      <Panel title="Strategy Leaderboard" className="mt_md">
+        {strategiesLoading ? (
+          <Loading label="Loading strategies..." />
+        ) : strategiesError ? (
+          <div className="error-state" role="alert">
+            <div className="es-icon" aria-hidden="true">!</div>
+            <div className="es-title">Unable to load strategies</div>
+            <div className="es-hint">{strategiesError}</div>
+            <Button variant="secondary" size="sm" onClick={refresh}>Retry</Button>
+          </div>
+        ) : strategies && strategies.length > 0 ? (
+          <table className="data dense">
+            <thead>
+              <tr>
+                <th>Strategy</th>
+                <th>Category</th>
+                <th>Symbol</th>
+                <th>Timeframe</th>
+                <th>Indicators</th>
+                <th>Entry</th>
+                <th>Short</th>
+                <th>Created By</th>
+              </tr>
+            </thead>
+            <tbody>
+              {strategies.map((s) => (
+                <tr key={s.strategy_id}>
+                  <td>
+                    <Link to={`/paper/strategies/${s.name}`} className="td-id">{s.spec_name}</Link>
+                  </td>
+                  <td>
+                    {s.name.includes("trend") ? "TREND_FOLLOWING" : s.name.includes("moment") ? "MOMENTUM" : s.name.includes("break") ? "BREAKOUT" : "MEAN_REVERSION"}
+                  </td>
+                  <td>{s.symbol}</td>
+                  <td>{s.timeframe}</td>
+                  <td>{s.indicators?.join(", ")}</td>
+                  <td>{s.entry_condition ?? "—"}</td>
+                  <td>{s.allow_short ? "Yes" : "No"}</td>
+                  <td><span className="pill">{s.generated_by}</span></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <EmptyState
+            title="No strategies available"
+            hint="No Phase 22 strategies are registered."
+          />
+        )}
+      </Panel>
+
+      <div className="pt-section">
+        <span className="section-sub">DEMO / SIMULATED — No live market data required.</span>
+      </div>
+    </div>
+  );
+}
+
 function StrategySkeleton() {
   return (
-    <div className="stack gap-lg" aria-label="Loading strategy detail">
+    <div className="stack gap_lg" aria-label="Loading strategy detail">
       <div className="skel skel-block" style={{ height: 100 }} />
       <div className="skel skel-block" style={{ height: 80 }} />
       <div className="skel skel-block" style={{ height: 180 }} />

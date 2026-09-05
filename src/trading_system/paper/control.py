@@ -42,7 +42,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from sqlalchemy import create_engine
 
@@ -178,6 +178,7 @@ class PaperTradingControlCenter:
         session_store: Optional[PaperSessionStore] = None,
         requirement: Optional[EvidenceRequirement] = None,
         freshness_config: Optional[EvidenceFreshnessConfig] = None,
+        market_data_provider: Optional[Callable] = None,
     ) -> None:
         self.registry = registry
         self.intelligence = intelligence
@@ -189,6 +190,7 @@ class PaperTradingControlCenter:
         self.session_store = session_store or PaperSessionStore(registry.store.engine)
         self.requirement = self.gate.requirement
         self.freshness_config = self.gate.freshness_config
+        self._market_data_provider = market_data_provider
         # In-memory map of live sessions.
         self._runners: dict[str, PaperStrategyRunner] = {}
         self._deployments: dict[str, PaperDeployment] = {}
@@ -203,6 +205,7 @@ class PaperTradingControlCenter:
         *,
         requirement: Optional[EvidenceRequirement] = None,
         freshness_config: Optional[EvidenceFreshnessConfig] = None,
+        market_data_provider: Optional[Callable] = None,
     ) -> "PaperTradingControlCenter":
         """Build a control center over the project's existing SQLAlchemy engine."""
         store = EvidenceStore(engine)
@@ -220,9 +223,15 @@ class PaperTradingControlCenter:
             session_store=PaperSessionStore(engine),
             requirement=requirement,
             freshness_config=freshness_config,
+            market_data_provider=market_data_provider,
         )
 
     # ------------------------------------------------------------------ #
+    def load_market_data(self, symbol: str, timeframe: str):
+        if self._market_data_provider is None:
+            return None
+        return self._market_data_provider(symbol, timeframe)
+
     # Deployment discovery
     # ------------------------------------------------------------------ #
     def list_deployments(

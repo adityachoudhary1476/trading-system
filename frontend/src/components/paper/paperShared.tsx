@@ -1,38 +1,87 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { paperApi } from "@/lib/paperApi";
 import type { DeploymentListResponse } from "@/types/paper-api";
-import { Loading } from "@/components/ui";
+import { Loading, Button } from "@/components/ui";
 
 /** Shared deployment picker dropdown used across paper-trading index pages. */
 export function DeploymentPicker({
   value,
   onChange,
   placeholder = "Select deployment…",
+  onCreateDeployment,
+  refreshKey,
 }: {
   value: string;
   onChange: (id: string) => void;
   placeholder?: string;
+  /** Called when the user picks "Create" from an empty/error state. */
+  onCreateDeployment?: () => void;
+  /** Bump to force a reload (e.g. after a sibling created a deployment). */
+  refreshKey?: unknown;
 }) {
   const [list, setList] = useState<DeploymentListResponse | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
+  const load = useCallback(() => {
     let alive = true;
     setLoading(true);
+    setError(null);
     paperApi.listDeployments({ limit: 200 }).then((res) => {
       if (!alive) return;
-      if (res.ok) setList(res.data);
+      if (res.ok) {
+        setList(res.data);
+      } else {
+        setList(null);
+        setError(res.error.message);
+      }
       setLoading(false);
     });
     return () => { alive = false; };
   }, []);
 
+  useEffect(() => {
+    return load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [load, refreshKey]);
+
   if (loading) return <Loading label="Loading deployments…" />;
+
+  if (error) {
+    return (
+      <div className="deploy-picker dp-error" role="alert">
+        <span className="dp-label">Deployment</span>
+        <div className="dp-error-block">
+          <span className="dp-error-msg">Unable to load deployments</span>
+          <span className="dp-error-hint">{error}</span>
+          <Button variant="secondary" size="sm" onClick={load}>Retry</Button>
+          {onCreateDeployment && (
+            <Button variant="primary" size="sm" onClick={onCreateDeployment}>Create deployment</Button>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const empty = list?.deployments.length === 0;
 
   return (
     <div className="deploy-picker">
       <span className="dp-label">Deployment</span>
-      <select value={value} onChange={(e) => onChange(e.target.value)} aria-label="Select deployment">
+      {empty && (
+        <div className="dp-empty">
+          <span className="dp-empty-hint">No paper deployments yet</span>
+          {onCreateDeployment && (
+            <Button variant="primary" size="sm" onClick={onCreateDeployment}>Create deployment</Button>
+          )}
+        </div>
+      )}
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        aria-label="Select deployment"
+        style={empty ? { display: "none" } : undefined}
+      >
         <option value="">{placeholder}</option>
         {list?.deployments.map((d) => (
           <option key={d.deployment_id} value={d.deployment_id}>

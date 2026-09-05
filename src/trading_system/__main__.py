@@ -1268,6 +1268,113 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
     return 0
 
 
+def _demo_seed_spec(symbol: str = "NSE:SBIN", timeframe: str = "1d") -> dict:
+    """Deterministic dev/demo StrategySpec dict (SMA(5) trend following).
+
+    Mirrors the ``sma5`` preset used by the frontend create-deployment modal so
+    the seed and the UI produce identical deployments. The strategy id is
+    derived from the full spec (including symbol/timeframe), so each
+    symbol/timeframe combination is seeded idempotently.
+    """
+    return {
+        "name": "DemoSMA5",
+        "description": "Buy when close exceeds the 5-period simple moving average.",
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "indicators": [{"name": "sma", "params": {"window": 5}}],
+        "entry": {
+            "type": "comparison",
+            "left": {"kind": "field", "field": "close"},
+            "op": ">",
+            "right": {"kind": "indicator", "indicator": "sma_5"},
+        },
+        "allow_long": True,
+        "generated_by": "paper-seed",
+    }
+
+
+def _cmd_seed_paper_deployment(args: argparse.Namespace) -> int:
+    """DEVELOPMENT/DEMO seed: create one valid paper deployment.
+
+    Builds the same control center used by ``paper-api`` (relaxed evidence
+    requirements, in-process strategy registry) and persists a single demo
+    deployment from a validated strategy spec. Idempotent: if a deployment for
+    the demo strategy already exists it is reported instead of recreated.
+    """
+    from sqlalchemy import create_engine
+
+    from trading_system.config.settings import settings
+    from trading_system.execution.paper_broker import PaperBroker
+    from trading_system.paper import PaperTradingControlCenter
+    from trading_system.paper.circuit_breaker import PaperCircuitBreaker
+    from trading_system.paper.deployment import PaperDeploymentConfig
+    from trading_system.paper.runner import PaperStrategyRunner
+    from trading_system.research.evidence import strategy_identity
+    from trading_system.research.strategy_intelligence import (
+        EvidenceFreshnessConfig,
+        EvidenceRequirement,
+    )
+    from trading_system.research.strategy_lab.spec import StrategySpec
+
+    engine = create_engine(
+        settings.storage.db_url,
+        connect_args={"check_same_thread": False},
+    )
+    requirement = EvidenceRequirement(
+        require_walk_forward=False,
+        require_validation=False,
+        require_recent_evidence=False,
+        min_validation_trades=0,
+    )
+    freshness = EvidenceFreshnessConfig(max_age_days=180)
+    center = PaperTradingControlCenter.from_engine(
+        engine, requirement=requirement, freshness_config=freshness
+    )
+
+    spec = StrategySpec(**_demo_seed_spec(args.symbol, args.timeframe))
+    strategy_id = strategy_identity(spec)
+
+    existing = center.list_deployments(strategy_id=strategy_id)
+    if existing:
+        dep = existing[0]
+        print(f"Demo deployment already exists: {dep.deployment_id}")
+        print(f"  Symbol: {dep.symbol} @ {dep.timeframe}  Status: {dep.status}")
+        print(f"  List:     http://127.0.0.1:8765/deployments")
+        print(f"  Dashboard: http://127.0.0.1:8765/deployments/{dep.deployment_id}/dashboard")
+        return 0
+
+    if center.registry.get_strategy(strategy_id) is None:
+        center.registry.register_strategy(spec)
+
+    deployment, resolved_spec, decision = center.create_deployment(
+        spec=spec, dataset_id="market_data", config=PaperDeploymentConfig()
+    )
+    if deployment is None:
+        print(f"Deployment gate rejected the demo strategy: {decision.reasons if decision else []}")
+        return 1
+
+    center.activate_deployment(deployment.deployment_id)
+    cfg = deployment.config
+    broker = PaperBroker(initial_cash=cfg.initial_cash)
+    runner = PaperStrategyRunner(
+        deployment=deployment,
+        broker=broker,
+        spec=resolved_spec,
+        circuit_breaker=PaperCircuitBreaker(),
+    )
+    session_id = center.attach_runner(deployment.deployment_id, runner)
+    center.save_session(session_id)
+
+    print(f"Created demo paper deployment: {deployment.deployment_id}")
+    print(f"  Strategy:  {strategy_id}")
+    print(f"  Symbol:    {deployment.symbol} @ {deployment.timeframe}")
+    print(f"  Status:    {deployment.status}")
+    print(f"  Account:   {cfg.initial_cash} cash (paper-only)")
+    print(f"  List:      http://127.0.0.1:8765/deployments")
+    print(f"  Dashboard: http://127.0.0.1:8765/deployments/{deployment.deployment_id}/dashboard")
+    return 0
+
+
 def _strategy_names() -> list[str]:
     from .research import list_strategies
 
@@ -1450,6 +1557,13 @@ def main(argv: list[str] | None = None) -> int:
     p_api.add_argument("--host", default=None, help="Bind host (default: 127.0.0.1 or PAPER_API_HOST)")
     p_api.add_argument("--port", type=int, default=None, help="Bind port (default: 8765 or PAPER_API_PORT)")
 
+    p_seed = sub.add_parser(
+        "paper-seed",
+        help="DEVELOPMENT/DEMO: create one valid paper deployment from a preset strategy spec",
+    )
+    p_seed.add_argument("--symbol", default="NSE:SBIN", help="Symbol for the demo deployment (default: NSE:SBIN)")
+    p_seed.add_argument("--timeframe", default="1d", help="Timeframe for the demo deployment (default: 1d)")
+
     p_lv2 = sub.add_parser(
         "live-verify",
         help="REAL Upstox market-data verification only (no orders placed)",
@@ -1508,6 +1622,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_live_verify(args)
     if args.command == "paper-api":
         return _cmd_serve_paper_api(args)
+    if args.command == "paper-seed":
+        return _cmd_seed_paper_deployment(args)
     parser.print_help()
     return 1
 

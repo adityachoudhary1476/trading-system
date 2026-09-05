@@ -1,0 +1,40 @@
+=== src/trading_system/research/intelligence_v3.py ===
+class TimeframeRole: 
+def _role_for(timeframe)  [defaults:0]
+class MultiTimeframeConsensus: short_term_bias, short_term_alignment, swing_bias, higher_timeframe_conflict, intraday_momentum, regime_agreement, volatility_agreement, participating_timeframes, total_timeframes, data_quality, notes
+def _align(items)  [defaults:0]
+def compute_timeframe_consensus(tf_results)  [defaults:0]
+class TransitionRisk: 
+class RegimeTransition: regime, transition_risk, transition_type, notes
+def detect_regime_transition(current, previous, features)  [defaults:2]
+def _assess_transition_risk(regime, features)  [defaults:0]
+class OptionsAnalytics: strike, option_type, moneyness, spread_pct, liquidity_score, iv_suitability, oi_significance, delta_suitability, theta_risk, expected_move_compatible, data_sufficient, missing_fields
+def compute_options_analytics(contract, spot, expected_move_pct)  [defaults:1]
+class EvidenceCategory: 
+class EvidenceItem: category, signal, direction, strength, weight, source, data_quality, timestamp, availability, explanation
+class EvidenceLedgerV2: items
+def build_evidence_ledger_v2(features, regime, direction, consensus, breadth, sector, transition)  [defaults:4]
+def compute_confidence_v2(ledger)  [defaults:0]
+class ReplayForecast: timestamp, instrument, timeframe, bias, confidence, horizon, direction, expected_move_lower_pct, expected_move_upper_pct, invalidation
+class ReplayResult: forecasts, lookahead_violations
+def replay_history(instrument, timeframe, df, forecast_store, start_idx, step)  [defaults:3]
+class OutcomeLabel: outcome, realized_return_pct, max_favorable_excursion_pct, max_adverse_excursion_pct, target_hit, invalidation_hit, horizon_completed
+def label_outcome(bias, entry_price, future_prices, expected_move_lower_pct, expected_move_upper_pct)  [defaults:2]
+class CalibrationBucket: bucket_range, forecasts, wins, win_rate, avg_return_pct
+class CalibrationReport: buckets, total_forecasts, total_resolved, sample_sufficient, note
+def compute_calibration(outcomes, min_resolved)  [defaults:1]
+class FeaturePerformance: category, forecast_count, win_count, win_rate, avg_return_pct, sample_confidence
+def analyze_feature_performance(feature_outcomes, min_samples)  [defaults:1]
+=== src/trading_system/research/market_context.py ===
+class DataQualityTier: 
+class EvidenceAvailability: 
+class MarketBreadth: advancing_count, declining_count, unchanged_count, new_highs, new_lows, timestamp, source, data_quality
+class IndiaVIXContext: india_vix, vix_change, vix_percentile, vix_regime, timestamp, source, data_quality
+class InstitutionalFlow: buy, sell
+class FIIDIIFlow: fii, dii, date, source, data_quality
+class SectorContext: sector_symbol, sector_name, sector_return, relative_strength, trend, momentum, volatility, breadth, timestamp, source, data_quality
+class NewsEventType: 
+class NewsEvent: timestamp, source, headline, symbol, sector, sentiment, sentiment_confidence, relevance, event_type, data_quality
+class NewsContext: events, aggregate_sentiment, news_status, data_quality
+class CrossAssetContext: usdinr, usdinr_change, us_index_change, crude_oil_change, gold_change, bond_yield_10y, timestamp, source, data_quality
+class MarketIntelligenceContext: breadth, vix, institutional_flow, sector, news, cross_asset
