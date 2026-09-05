@@ -59,6 +59,7 @@ from .exceptions import (
     StrategyValidationError,
 )
 from .fingerprint import configuration_fingerprint, contract_schema, strategy_identity
+from .runtime import StrategyRuntime, create_strategy_runtime
 from .metadata import (
     StrategyFamily,
     StrategyMetadata,
@@ -82,7 +83,7 @@ from .validation import (
     validate_strategy,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "MarketState",
@@ -109,6 +110,8 @@ __all__ = [
     "strategy_identity",
     "configuration_fingerprint",
     "contract_schema",
+    "StrategyRuntime",
+    "create_strategy_runtime",
     "register_strategy",
     "registered_strategy_ids",
     "get_strategy_class",
