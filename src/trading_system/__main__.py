@@ -1228,7 +1228,11 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
 
     engine = create_engine(
         settings.storage.db_url,
-        connect_args={"check_same_thread": False},
+        connect_args=(
+            {"check_same_thread": False}
+            if settings.storage.db_url.startswith("sqlite")
+            else {}
+        ),
     )
 
     # Relaxed evidence requirements: the dev server allows deploying any
@@ -1318,7 +1322,11 @@ def _cmd_seed_paper_deployment(args: argparse.Namespace) -> int:
 
     engine = create_engine(
         settings.storage.db_url,
-        connect_args={"check_same_thread": False},
+        connect_args=(
+            {"check_same_thread": False}
+            if settings.storage.db_url.startswith("sqlite")
+            else {}
+        ),
     )
     requirement = EvidenceRequirement(
         require_walk_forward=False,

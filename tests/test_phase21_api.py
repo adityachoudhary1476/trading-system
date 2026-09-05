@@ -1062,3 +1062,161 @@ class TestBackwardCompatibility:
         }
         missing = required - set(dir(PaperTradingControlCenter))
         assert not missing, f"missing Phase 20 methods: {missing}"
+
+
+# --------------------------------------------------------------------------- #
+# Persistence regression tests (production bug: ephemeral SQLite on Railway)
+# --------------------------------------------------------------------------- #
+class TestPersistenceRegression:
+    """Verify that paper deployments and session checkpoints survive
+    control-center reinitialization (simulating a backend restart).
+
+    These tests use a file-based SQLite database to reproduce the production
+    scenario where the backend process restarts but the database persists.
+    """
+
+    @pytest.fixture
+    def file_db_engine(self, tmp_path_factory):
+        """Create a file-based SQLite engine that persists across instances."""
+        db_path = tmp_path_factory.mktemp("persist") / "persist_test.db"
+        engine = create_engine(f"sqlite:///{db_path}")
+        yield engine
+
+    @pytest.fixture
+    def ready(self, file_db_engine):
+        """Build a control center with a persisted deployment + checkpoint.
+
+        Returns (center, reg, intel, gate, dep, sid) so the test can construct
+        a fresh center over the same store to simulate a restart.
+        """
+        store, reg, intel, gate, dep = _build_eligible(file_db_engine, _spec())
+
+        # Persist the deployment record (mirrors what create_deployment does).
+        with store._Session() as s:
+            s.merge(dep.as_record())
+            s.commit()
+
+        # Build a center, attach a runner, process bars, and checkpoint.
+        from trading_system.paper.control import PaperTradingControlCenter
+        center = PaperTradingControlCenter(
+            registry=reg, intelligence=intel, gate=gate,
+        )
+        broker, runner = _seed_runner(dep)
+        for bar in _bars(_uptrend(30)):
+            runner.process_bar(bar)
+        sid = center.attach_runner(dep.deployment_id, runner)
+        center.save_session(sid)
+
+        return center, reg, intel, gate, dep, sid
+
+    @staticmethod
+    def _rebuild(reg, intel, gate):
+        """Simulate a backend restart: fresh center over the same store."""
+        from trading_system.paper.control import PaperTradingControlCenter
+        return PaperTradingControlCenter(
+            registry=reg, intelligence=intel, gate=gate,
+        )
+
+    def test_deployment_persists_across_center_reinit(self, ready):
+        """A deployment persisted by one center must be visible to a
+        freshly-constructed center using the same database file."""
+        _, reg, intel, gate, dep, _ = ready
+        center2 = self._rebuild(reg, intel, gate)
+
+        found = center2.list_deployments(deployment_id=dep.deployment_id)
+        assert len(found) == 1
+        assert found[0].deployment_id == dep.deployment_id
+        assert found[0].symbol == dep.symbol
+        assert found[0].status.value == dep.status.value
+
+    def test_session_checkpoint_persists_across_center_reinit(self, ready):
+        """A session checkpoint saved by one center must be recoverable by a
+        freshly-constructed center using the same database file."""
+        _, reg, intel, gate, dep, sid = ready
+        center2 = self._rebuild(reg, intel, gate)
+
+        # The live runner is gone (center2 has empty _runners).
+        assert center2.find_session_for_deployment(dep.deployment_id) is None
+
+        # But the checkpoint should exist in the session store.
+        cp = center2.get_session(sid)
+        assert cp is not None
+        assert cp.deployment_id == dep.deployment_id
+        assert cp.session_id == sid
+
+        # list_sessions should also find it.
+        sessions = center2.list_sessions(deployment_id=dep.deployment_id)
+        assert len(sessions) == 1
+        assert sessions[0].session_id == sid
+
+    def test_dashboard_reconstructs_from_checkpoint_without_runner(self, ready):
+        """After a restart (no live runner), the dashboard snapshot must be
+        reconstructable from the persisted checkpoint alone."""
+        _, reg, intel, gate, dep, sid = ready
+        center2 = self._rebuild(reg, intel, gate)
+        router2 = PaperAPIRouter(center2)
+
+        env = router2.dispatch("GET", f"/deployments/{dep.deployment_id}/dashboard")
+        assert env.status == 200, env.body
+
+        snap = env.body
+        assert snap["deployment"]["deployment_id"] == dep.deployment_id
+        assert snap["account"]["initial_cash"] == 100000.0
+        assert snap["account"]["equity"] > 0
+        assert snap["session"]["session_status"] == "checkpointed"
+
+    def test_save_session_error_is_logged_not_swallowed(self, file_db_engine):
+        """When save_session raises, the error must be logged, not silently
+        swallowed by 'except Exception: pass'."""
+        import logging
+        from io import StringIO
+
+        store, reg, intel, gate, dep = _build_eligible(file_db_engine, _spec())
+        with store._Session() as s:
+            s.merge(dep.as_record())
+            s.commit()
+
+        from trading_system.paper.control import PaperTradingControlCenter
+        center = PaperTradingControlCenter(
+            registry=reg, intelligence=intel, gate=gate,
+        )
+        router = PaperAPIRouter(center)
+
+        log_stream = StringIO()
+        handler = logging.StreamHandler(log_stream)
+        handler.setLevel(logging.DEBUG)
+        test_logger = logging.getLogger("trading_system.paper_api.router")
+        original_level = test_logger.level
+        original_propagate = test_logger.propagate
+        test_logger.setLevel(logging.DEBUG)
+        test_logger.propagate = True
+        test_logger.addHandler(handler)
+        try:
+            # Patch save_session to raise, simulating a checkpoint persistence
+            # failure (e.g. DB write error on ephemeral storage).
+            original_save = center.save_session
+
+            def _failing_save(sid):
+                raise RuntimeError("simulated checkpoint write failure")
+
+            center.save_session = _failing_save
+            try:
+                # Dispatch through the router to trigger the error path.
+                env = router.dispatch(
+                    "POST", "/deployments",
+                    raw_body=json.dumps({"strategy_id": dep.strategy_id}),
+                )
+            finally:
+                center.save_session = original_save
+
+            log_output = log_stream.getvalue()
+            assert "save_session failed" in log_output, (
+                f"Expected 'save_session failed' in log output, got: {log_output!r}"
+            )
+            assert "simulated checkpoint write failure" in log_output, (
+                f"Expected error message in log, got: {log_output!r}"
+            )
+        finally:
+            test_logger.removeHandler(handler)
+            test_logger.setLevel(original_level)
+            test_logger.propagate = original_propagate

@@ -13,6 +13,7 @@ of any kind.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -62,6 +63,8 @@ from .models import (
 
 # Type alias for a route handler.
 RouteHandler = Callable[["RequestContext"], "ResponseEnvelope"]
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -533,7 +536,11 @@ class PaperAPIRouter:
         try:
             self.center.save_session(session_id)
         except Exception:
-            pass
+            logger.exception(
+                "save_session failed for deployment %s after creation",
+                deployment.deployment_id,
+                exc_info=True,
+            )
 
         body = DeploymentCreateResponse(
             deployment=build_deployment_summary(deployment),

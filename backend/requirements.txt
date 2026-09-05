@@ -15,6 +15,9 @@ pandas==3.0.5
 numpy==2.4.6
 SQLAlchemy==2.0.52
 
+# PostgreSQL driver (for production Railway persistent storage)
+psycopg2-binary==2.9.10
+
 # HTTP Client
 requests==2.31.0
 

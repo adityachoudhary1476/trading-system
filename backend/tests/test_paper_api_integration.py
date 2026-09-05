@@ -272,3 +272,74 @@ class TestAdapterContract:
         body = resp.json()
         assert "error" in body
         assert "symbol" in body["error"]["message"] or "market data provider" in body["error"]["message"].lower()
+
+
+# --------------------------------------------------------------------------- #
+# Database configuration tests
+# --------------------------------------------------------------------------- #
+class TestDatabaseConfiguration:
+    """Verify that MARKET_DATA_DB_URL is honored and SQLite-only connect_args
+    are not passed to PostgreSQL engines."""
+
+    def test_postgresql_url_does_not_get_check_same_thread(self, monkeypatch):
+        """PostgreSQL URLs must not receive SQLite-only connect_args."""
+        from unittest.mock import patch, MagicMock
+        from config import get_settings
+
+        get_settings.cache_clear()
+        monkeypatch.setenv("MARKET_DATA_DB_URL", "postgresql://user:pass@db.supabase.co:5432/postgres")
+        get_settings.cache_clear()
+        _reset_paper_singleton()
+
+        captured = {}
+
+        def mock_create_engine(url, **kwargs):
+            captured["url"] = url
+            captured["connect_args"] = kwargs.get("connect_args", {})
+            mock_engine = MagicMock()
+            return mock_engine()
+
+        with patch("sqlalchemy.create_engine", side_effect=mock_create_engine):
+            try:
+                _get_api_router()
+            except Exception:
+                pass
+
+        assert captured.get("url", "").startswith("postgresql")
+        assert "check_same_thread" not in captured.get("connect_args", {}), (
+            "PostgreSQL URL must not receive SQLite-only connect_args"
+        )
+
+        _reset_paper_singleton()
+        get_settings.cache_clear()
+
+    def test_sqlite_url_gets_check_same_thread(self, monkeypatch, tmp_path):
+        """SQLite URLs must still receive check_same_thread=False."""
+        from unittest.mock import patch, MagicMock
+        from config import get_settings
+
+        db_path = tmp_path / "test_sqlite.db"
+        get_settings.cache_clear()
+        monkeypatch.setenv("MARKET_DATA_DB_URL", f"sqlite:///{db_path}")
+        get_settings.cache_clear()
+        _reset_paper_singleton()
+
+        captured = {}
+
+        def mock_create_engine(url, **kwargs):
+            captured["url"] = url
+            captured["connect_args"] = kwargs.get("connect_args", {})
+            mock_engine = MagicMock()
+            return mock_engine()
+
+        with patch("sqlalchemy.create_engine", side_effect=mock_create_engine):
+            try:
+                _get_api_router()
+            except Exception:
+                pass
+
+        assert "check_same_thread" in captured.get("connect_args", {})
+        assert captured["connect_args"]["check_same_thread"] is False
+
+        _reset_paper_singleton()
+        get_settings.cache_clear()

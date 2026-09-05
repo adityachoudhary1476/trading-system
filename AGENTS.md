@@ -9,10 +9,14 @@ Phase 21 paper-trading stack this repo currently exercises.
   The paper-trading pages live under `frontend/src/pages/paper/` and the shared
   picker/modal under `frontend/src/components/paper/`.
 - **Backend API**: a stdlib HTTP server in `src/trading_system/paper_api/`.
-  It is **not** a Vercel serverless function. It is started by the
-  `paper-api` CLI subcommand (see `src/trading_system/__main__.py`).
-  The frontend `paperApi` client targets `http://127.0.0.1:8765` by default
-  (override with Vite env var `VITE_PAPER_API_URL`).
+  In production, the paper-trading API is served through the FastAPI backend
+  on Railway (via `backend/routes/paper_api.py`). It is **not** a Vercel
+  serverless function. The dev CLI server is started with:
+  `python -m trading_system paper-api --host 127.0.0.1 --port 8765`
+  The frontend `paperApi` client targets `http://127.0.0.1:8765` in dev
+  (override with Vite env var `VITE_PAPER_API_URL`), but in production the
+  frontend uses same-origin `/api/paper/*` which Vercel proxies to the
+  Railway backend via `PYTHON_BACKEND_URL`.
 
 ## Running the paper-trading environment (dev)
 
@@ -134,3 +138,9 @@ python -m pytest tests/test_intelligence_v3.py tests/test_news_intelligence.py t
   an explicit network-error state with Retry, and an empty state with a
   "Create paper deployment" affordance — it no longer silently renders an
   empty dropdown when the API is unreachable.
+- **Production persistence**: On Railway, `MARKET_DATA_DB_URL` MUST be set to
+  a persistent PostgreSQL database (e.g. Supabase). The default
+  `sqlite:///./data/market_data.db` lives in the ephemeral container
+  filesystem and is wiped on every container restart, causing paper
+  deployments and session checkpoints to disappear. The `psycopg2-binary`
+  driver is included in `backend/requirements.txt` for PostgreSQL support.

@@ -47,9 +47,21 @@ def _get_api_router():
 
     settings = get_settings()
 
+    connect_args: dict = {}
+    if settings.market_data_db_url.startswith("sqlite"):
+        # SQLite-only: ensure the parent directory exists so create_all() can
+        # open the database file. Mirrors MarketStore._ensure_dir() behaviour.
+        from pathlib import Path
+
+        if settings.market_data_db_url.startswith("sqlite:///"):
+            rel_path = settings.market_data_db_url[10:]
+            if not rel_path.endswith(":memory:"):
+                Path(rel_path).parent.mkdir(parents=True, exist_ok=True)
+        connect_args["check_same_thread"] = False
+
     engine = create_engine(
         settings.market_data_db_url,
-        connect_args={"check_same_thread": False},
+        connect_args=connect_args,
     )
 
     # Relaxed evidence requirements — paper-only dev mode.
@@ -68,9 +80,10 @@ def _get_api_router():
     )
     _api_router = PaperAPIRouter(center)
 
+    db_kind = "postgresql" if settings.market_data_db_url.startswith("postgresql") else "sqlite"
     logger.info(
-        "Paper API router initialised (db=%s, routes=%d)",
-        settings.market_data_db_url,
+        "Paper API router initialised (db_kind=%s, routes=%d)",
+        db_kind,
         len(_api_router.routes()),
     )
     return _api_router
