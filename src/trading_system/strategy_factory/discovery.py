@@ -26,6 +26,7 @@ from .exceptions import DuplicateStrategyError, StrategyFactoryError
 from .metadata import StrategyMetadata
 
 _DISCOVERED: dict[str, type[Strategy]] = {}
+_DISCOVERED_MODULES: set[str] = set()
 
 
 class DiscoveryError(StrategyFactoryError):
@@ -104,6 +105,7 @@ def discover(modules: list[str], *, reload: bool = False) -> int:
                 f"discovery failed importing {modname!r}: {exc}"
             ) from exc
         newly_registered += len(_DISCOVERED) - before
+        _DISCOVERED_MODULES.add(modname)
     return newly_registered
 
 
@@ -122,8 +124,18 @@ def build_from_discovery(strategy_id: str, **params) -> Strategy:
 
 
 def clear_discovery() -> None:
-    """Remove all discovered classes (intended for test isolation)."""
+    """Remove all discovered classes (intended for test isolation).
+
+    Also evicts discovered modules from ``sys.modules`` so that a subsequent
+    ``discover()`` call re-executes the module body and re-runs
+    ``@register_strategy`` decorators.  Without this, ``importlib.import_module``
+    would return the cached module object without re-executing it, leaving
+    ``_DISCOVERED`` empty.
+    """
     _DISCOVERED.clear()
+    for modname in _DISCOVERED_MODULES:
+        sys.modules.pop(modname, None)
+    _DISCOVERED_MODULES.clear()
 
 
 def discovery_count() -> int:

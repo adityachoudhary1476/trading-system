@@ -50,11 +50,26 @@ from .coordinator import (
     AutonomousDeploymentCoordinator,
     DeploymentCreationResult,
 )
+from .ranker import (
+    OpportunityRanker,
+    OpportunityRankingResult,
+    RankerConfig,
+)
 from .scanner import (
     MarketScanResult,
     MarketScanner,
     MarketUniverse,
     ScannerConfig,
+)
+from .compatibility import (
+    CompatibilityConfig,
+    CompatibilityResult,
+    StrategyCompatibilityEvaluator,
+)
+from .decision import (
+    DecisionResult,
+    SelectionConfig,
+    StrategyDecisionEngine,
 )
 
 
@@ -430,6 +445,75 @@ class AutonomousController(BaseModel):
 
         self.config.last_scan_timestamp = _dt.now(_tz.utc).isoformat()
         return result
+
+    def rank_candidates(
+        self,
+        scan_result: MarketScanResult,
+        config: Optional[RankerConfig] = None,
+    ) -> OpportunityRankingResult:
+        """Rank eligible candidates from a Phase 2 scan result into opportunities.
+
+        Delegates to :class:`OpportunityRanker` with the control center's
+        ``load_market_data`` callable for feature calculation.  Does NOT select
+        strategies, generate signals, place orders, or create deployments.
+        """
+        ranker_config = config or RankerConfig(enabled=self.config.enabled)
+        ranker = OpportunityRanker(
+            config=ranker_config,
+            data_provider=self.control_center.load_market_data,
+        )
+        return ranker.rank(scan_result)
+
+    # ------------------------------------------------------------------ #
+    # Phase 4 — Strategy & Timeframe Compatibility
+    # ------------------------------------------------------------------ #
+
+    def evaluate_strategy_compatibility(
+        self,
+        ranking_result: OpportunityRankingResult,
+        config: Optional[CompatibilityConfig] = None,
+    ) -> CompatibilityResult:
+        """Evaluate which registered strategies are compatible with ranked opportunities.
+
+        Delegates to :class:`StrategyCompatibilityEvaluator` using the operator's
+        ``allowed_strategy_ids`` constraint.  Does NOT execute strategies, generate
+        signals, place orders, create deployments, or perform live trading.
+
+        Snapshot consistency:
+        The evaluator consumes the Phase 3 :class:`OpportunityRankingResult`
+        directly — no new market-data fetches are performed.  All market-condition
+        features come from the Phase 2 snapshot embedded in the ranking.
+        """
+        compat_config = config or CompatibilityConfig(enabled=self.config.enabled)
+        evaluator = StrategyCompatibilityEvaluator(compat_config)
+        allowed = self.config.user_constraints.allowed_strategy_ids
+        return evaluator.evaluate(ranking_result, allowed_strategies=allowed)
+
+    # ------------------------------------------------------------------ #
+    # Phase 5 -- Strategy Selection & Signal Generation
+    # ------------------------------------------------------------------ #
+
+    def generate_strategy_decisions(
+        self,
+        compatibility_result: CompatibilityResult,
+        config: Optional[SelectionConfig] = None,
+    ) -> DecisionResult:
+        """Phase 5 -- select a strategy/timeframe per opportunity and generate signals.
+
+        Orchestrates Phase 5 on top of a Phase 4 compatibility result:
+        CompatibilityResult -> StrategySelection -> StrategyEvaluation -> DecisionResult.
+
+        Delegates to :class:`StrategyDecisionEngine` using the control center's
+        ``load_market_data`` callable for look-ahead-safe OHLCV data.  Does NOT
+        create orders, create deployments, allocate capital, submit broker
+        orders, or manage positions.
+        """
+        sel_config = config or SelectionConfig(enabled=self.config.enabled)
+        engine = StrategyDecisionEngine(
+            sel_config,
+            data_provider=self.control_center.load_market_data,
+        )
+        return engine.generate_decisions(compatibility_result)
 
     # ------------------------------------------------------------------ #
     # Inspect bot state

@@ -606,5 +606,8 @@ class MarketScanner:
                 "exchange": internal.exchange,
                 "instrument": internal.symbol,
                 "session_phase": self._calendar.phase(last_ts.to_pydatetime()).value,
+                # Validated close prices captured at scan time — enables Phase 3
+                # (ranker) to reproduce features without re-fetching market data.
+                "close_prices": valid["close"].tolist(),
             },
         ), None
