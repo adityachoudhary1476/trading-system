@@ -9,42 +9,43 @@ vi.mock("@/lib/paperApi", () => ({
     getAutonomousScan: vi.fn(),
     getAutonomousDecisions: vi.fn(),
     getAutonomousEvents: vi.fn(),
+    getAutonomousDeployments: vi.fn(),
     setAutonomousBotLifecycle: vi.fn(),
   },
 }));
 
-const mockBot = (status = "running") => ({
+const mockBot = (state = "running") => ({
   bot_id: "bot-paper-default",
   name: "Paper Autonomous Bot",
-  status,
-  config: {
-    bot_id: "bot-paper-default",
-    name: "Paper Autonomous Bot",
-    mode: "AUTONOMOUS",
-    trading_mode: "PAPER",
-    enabled: true,
-    source: "AUTONOMOUS",
-    constraints: {
-      allowed_symbols: ["NSE:SBIN", "NSE:TCS"],
-      allowed_timeframes: ["1d", "1h"],
-      allowed_strategy_ids: [],
-      max_simultaneous_positions: 5,
-    },
-  },
-  current_scan: null,
-  current_ranking: null,
-  current_decisions: null,
-  deployments: [],
+  state,
+  mode: "AUTONOMOUS",
+  trading_mode: "paper",
+  enabled: true,
+  decision_count: 0,
   deployment_count: 0,
-  policies: {},
+  last_decision_timestamp: null,
+  last_scan_timestamp: null,
   event_count: 0,
   last_event_type: null,
   last_event_timestamp: null,
+  source: "AUTONOMOUS",
+  allowed_symbols: ["NSE:SBIN", "NSE:TCS"],
+  allowed_strategy_ids: [],
+  allowed_timeframes: ["1d", "1h"],
+  max_simultaneous_positions: 5,
+  max_position_allocation_pct: 0.25,
+  max_exposure_pct: 1.0,
+  max_drawdown_pct: 0.2,
+  safety: {
+    kill_switch_state: "active",
+    kill_switch_reason: null,
+    kill_switch_halted_at: null,
+  },
   uptime_seconds: 120,
   started_at: "2025-01-01T00:00:00Z",
   stopped_at: null,
   is_ready: true,
-  is_active: true,
+  is_active: state === "running",
 });
 
 const mockScan = (signals: any[] = []) => ({
@@ -102,6 +103,7 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     vi.mocked(paperApi.getAutonomousScan).mockResolvedValue({ scan: mockScan([]), ranking: null });
     vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({ decisions: [] });
     vi.mocked(paperApi.getAutonomousEvents).mockResolvedValue({ events: [], count: 0, schema_version: 1 });
+    vi.mocked(paperApi.getAutonomousDeployments).mockResolvedValue({ deployments: [], count: 0, schema_version: 1 });
     vi.mocked(paperApi.setAutonomousBotLifecycle).mockResolvedValue({
       success: true,
       message: "ok",
@@ -117,10 +119,10 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     vi.mocked(paperApi.getAutonomousScan).mockImplementation(
       () => new Promise(() => {})
     );
-    vi.mocked(paperApi.getAutonomousDecisions).mockImplementation(
+    vi.mocked(paperApi.getAutonomousEvents).mockImplementation(
       () => new Promise(() => {})
     );
-    vi.mocked(paperApi.getAutonomousEvents).mockImplementation(
+    vi.mocked(paperApi.getAutonomousDeployments).mockImplementation(
       () => new Promise(() => {})
     );
 
@@ -129,22 +131,21 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     expect(screen.getByText("Loading autonomous dashboard…")).toBeDefined();
   });
 
-  it("renders error state when API fails with retry", async () => {
+  it("renders error state when bot API fails with retry (does not crash)", async () => {
     vi.mocked(paperApi.getAutonomousBot).mockRejectedValue(new Error("Network error"));
     vi.mocked(paperApi.getAutonomousScan).mockRejectedValue(new Error("Network error"));
-    vi.mocked(paperApi.getAutonomousDecisions).mockRejectedValue(new Error("Network error"));
     vi.mocked(paperApi.getAutonomousEvents).mockRejectedValue(new Error("Network error"));
+    vi.mocked(paperApi.getAutonomousDeployments).mockRejectedValue(new Error("Network error"));
 
     render(<AutonomousCenter />);
 
     await waitFor(() => {
-      expect(screen.getByText("Failed to load autonomous dashboard")).toBeDefined();
+      expect(screen.getByText("Autonomous engine unavailable")).toBeDefined();
     });
 
     const retryBtn = screen.getByRole("button", { name: "Retry" });
     expect(retryBtn).toBeDefined();
 
-    // Clicking retry re-triggers fetchAll which shows loading state
     vi.mocked(paperApi.getAutonomousBot).mockImplementation(
       () => new Promise(() => {})
     );
@@ -153,6 +154,79 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     await waitFor(() => {
       expect(screen.getByText("Loading autonomous dashboard…")).toBeDefined();
     });
+  });
+
+  it("does NOT throw when bot API returns undefined bot payload", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({
+      bot: {
+        bot_id: "bot-paper-default",
+        name: "Paper Autonomous Bot",
+        state: "stopped",
+        // intentionally omitting trading_mode / safety / config etc.
+      } as any,
+    });
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("STOPPED")).toBeDefined();
+    });
+  });
+
+  it("does NOT call /autonomous/decide on initial load", async () => {
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+
+    expect(paperApi.getAutonomousDecisions).not.toHaveBeenCalled();
+  });
+
+  it("calls /autonomous/decide only when Run Decision button is clicked (POST)", async () => {
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+
+    vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({
+      decisions: [mockDecision()],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Run Decision" }));
+
+    await waitFor(() => {
+      expect(paperApi.getAutonomousDecisions).toHaveBeenCalledTimes(1);
+    });
+    // Verify the call uses POST, not GET — the frontend must not fire a GET
+    // decide request on dashboard mount.
+    const callArgs = vi.mocked(paperApi.getAutonomousDecisions).mock.calls[0];
+    expect(callArgs).toEqual([]);
+  });
+
+  it("renders deployments empty state when API returns 200 with []", async () => {
+    vi.mocked(paperApi.getAutonomousDeployments).mockResolvedValue({
+      deployments: [],
+      count: 0,
+      schema_version: 1,
+    });
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("No active deployments")).toBeDefined();
+    });
+  });
+
+  it("renders deployments error state without crashing when API fails", async () => {
+    vi.mocked(paperApi.getAutonomousDeployments).mockRejectedValue(
+      new Error("500 internal")
+    );
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("Deployments unavailable")).toBeDefined();
+    });
+    // The rest of the dashboard still renders — no crash, no missing bot section.
+    expect(screen.getByText("ACTIVE")).toBeDefined();
   });
 
   it("renders empty states when no data", async () => {
@@ -179,9 +253,8 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     expect(screen.getByRole("button", { name: "Pause" })).toBeDefined();
     expect(screen.getByRole("button", { name: "Stop" })).toBeDefined();
 
-    // Bot config metrics
     expect(screen.getByText("Paper Autonomous Bot")).toBeDefined();
-    expect(screen.getByText("PAPER")).toBeDefined();
+    expect(screen.getByText("paper")).toBeDefined();
   });
 
   it("renders scan signals table with multiple signals", async () => {
@@ -205,7 +278,7 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     expect(screen.getByText("SELL")).toBeDefined();
   });
 
-  it("renders decisions table with valid and invalid entries", async () => {
+  it("renders decisions table after Run Decision is clicked", async () => {
     vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({
       decisions: [
         mockDecision({ decision_id: "dec_valid", symbol: "NSE:SBIN", is_valid: true }),
@@ -220,11 +293,18 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
 
     render(<AutonomousCenter />);
 
+    // Wait for the page to finish loading before asserting on the empty
+    // decisions state.
     await waitFor(() => {
-      expect(screen.getByText("Trading Decisions")).toBeDefined();
+      expect(screen.getByText("ACTIVE")).toBeDefined();
     });
+    expect(screen.getByText("No decisions")).toBeDefined();
 
-    expect(screen.getByText("1 valid / 2 total decisions")).toBeDefined();
+    fireEvent.click(screen.getByRole("button", { name: "Run Decision" }));
+
+    await waitFor(() => {
+      expect(screen.getByText("1 valid / 2 total decisions")).toBeDefined();
+    });
     expect(screen.getByText("NSE:SBIN")).toBeDefined();
     expect(screen.getByText("NSE:TCS")).toBeDefined();
     expect(screen.getByText("policy_violation")).toBeDefined();

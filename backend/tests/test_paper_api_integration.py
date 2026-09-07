@@ -509,3 +509,102 @@ class TestAutonomousWiring:
         assert md_provider.is_authenticated is False
         assert market_data_callable("NSE:SBIN", "1d") is None
         assert market_data_callable("NSE:INFY", "1h") is None
+
+
+# --------------------------------------------------------------------------- #
+# E. /api/paper/deployments per-row safety tests
+# --------------------------------------------------------------------------- #
+class TestDeploymentsPerRowSafety:
+    """Regression tests for the deployments 500 caused by a per-row failure
+    during ``build_deployment_summary`` (e.g. a Postgres-only NULL/NoneType
+    on a field that should be ``""``).
+
+    The route must NOT 500 the entire list when one row is broken: it logs,
+    skips the broken row, and surfaces a ``skipped`` array in the response
+    body so operators can diagnose. We never fabricate deployments.
+    """
+
+    def test_list_deployments_skips_unserializable_row(
+        self, isolated_client, monkeypatch
+    ):
+        """If ``build_deployment_summary`` raises for a single row, the
+        handler must skip that row and still return 200 for the rest."""
+        from trading_system.paper import dashboard as dashboard_mod
+        from trading_system.paper.deployment import (
+            PaperDeploymentRecord,
+        )
+        import json
+        from datetime import datetime, timezone
+
+        api_router = _get_api_router()
+        # Insert two deployment records directly so list_deployments returns
+        # both — independent of the strategy registry / spec construction.
+        with api_router.center.registry.store._Session() as s:  # type: ignore[union-attr]
+            now = datetime.now(timezone.utc)
+            for label, did in [("good", "dep-good"), ("bad", "dep-bad")]:
+                rec = PaperDeploymentRecord(
+                    deployment_id=did,
+                    strategy_id=f"strat-{label}",
+                    strategy_spec_hash="x" * 64,
+                    symbol="NSE:SBIN",
+                    timeframe="1d",
+                    dataset_id="market_data",
+                    config_json=json.dumps({}),
+                    status="active",
+                    evidence_ids_json="[]",
+                    created_at=now,
+                    updated_at=now,
+                    notes="",
+                    options_enabled=False,
+                    allowed_option_types_json='["CE","PE"]',
+                    max_options_contracts_per_trade=None,
+                )
+                s.add(rec)
+            s.commit()
+
+        # Patch build_deployment_summary to fail on the "bad" row only.
+        original = dashboard_mod.build_deployment_summary
+
+        def flaky(deployment):
+            if deployment.deployment_id == "dep-bad":
+                raise TypeError("simulated Postgres NoneType failure")
+            return original(deployment)
+
+        monkeypatch.setattr(dashboard_mod, "build_deployment_summary", flaky)
+        # Patch where the FastAPI adapter actually imported it. Note the module
+        # path is ``trading_system.paper_api.router`` (not the
+        # ``src.trading_system`` prefix) — the test runs from ``backend/``,
+        # so ``sys.path`` resolves these as two distinct module objects even
+        # though both point to the same source file.
+        import trading_system.paper_api.router as router_mod
+        monkeypatch.setattr(router_mod, "build_deployment_summary", flaky)
+
+        resp = isolated_client.get("/api/paper/deployments?limit=200")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "deployments" in body
+        assert "count" in body
+        assert body["count"] == len(body["deployments"])
+        assert "skipped" in body, (
+            "Response must include the ``skipped`` array so operators can "
+            "diagnose per-row failures without the API silently dropping "
+            "deployments"
+        )
+        assert "dep-bad" in body["skipped"]
+        assert "dep-good" not in body["skipped"]
+        assert len(body["deployments"]) == 1
+        assert body["deployments"][0]["deployment_id"] == "dep-good"
+
+    def test_list_deployments_no_failure_returns_no_skipped(
+        self, isolated_client
+    ):
+        """Sanity: when no per-row failure occurs the response is the
+        normal ``DeploymentListResponse`` shape."""
+        resp = isolated_client.get("/api/paper/deployments?limit=200")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "deployments" in body
+        assert "count" in body
+        # When nothing was skipped the key may be absent or an empty list —
+        # both are acceptable contract forms.
+        assert body.get("skipped", []) == []

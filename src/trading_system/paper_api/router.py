@@ -432,11 +432,34 @@ class PaperAPIRouter:
             status=status,
         )
         rows = rows[:limit]
+        summaries: list[DashboardDeploymentSummary] = []
+        skipped: list[str] = []
+        for d in rows:
+            dep_id = self._safe_deployment_id(d)
+            try:
+                summaries.append(build_deployment_summary(d))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "skipping un-serializable deployment %s in /deployments: %s",
+                    dep_id,
+                    exc,
+                )
+                skipped.append(dep_id)
         body = DeploymentListResponse(
-            deployments=[build_deployment_summary(d) for d in rows],
-            count=len(rows),
+            deployments=summaries,
+            count=len(summaries),
         )
-        return ResponseEnvelope(status=200, body=_safe_dump(body))
+        dumped = _safe_dump(body)
+        if skipped:
+            dumped["skipped"] = skipped
+        return ResponseEnvelope(status=200, body=dumped)
+
+    @staticmethod
+    def _safe_deployment_id(d) -> str:
+        try:
+            return str(d.deployment_id) if d.deployment_id is not None else "<unknown>"
+        except Exception:
+            return "<unknown>"
 
     def _route_create_deployment(self, ctx: RequestContext) -> ResponseEnvelope:
         """POST /deployments — create (or rehydrate) a paper deployment.

@@ -6,6 +6,8 @@ import type {
   AutonomousScan,
   AutonomousScanResponse,
   AutonomousDecideResponse,
+  AutonomousDeploymentsResponse,
+  AutonomousDeploymentSummary,
   AutonomousEventsResponse,
   TradingDecision,
 } from "@/types/paper-api";
@@ -20,21 +22,33 @@ import {
   Loading,
 } from "@/components/ui";
 
+type SectionState<T> =
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "ok"; data: T }
+  | { status: "error"; message: string };
+
 export default function AutonomousCenter() {
-  const [bot, setBot] = useState<AutonomousBot | null>(null);
+  const [botState, setBotState] = useState<SectionState<AutonomousBot>>({ status: "idle" });
   const [scan, setScan] = useState<AutonomousScan | null>(null);
   const [decisions, setDecisions] = useState<TradingDecision[]>([]);
   const [events, setEvents] = useState<AutonomousEventsResponse["events"]>([]);
+  const [deployments, setDeployments] = useState<
+    SectionState<AutonomousDeploymentSummary[]>
+  >({ status: "idle" });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
+  const [decisionsLoading, setDecisionsLoading] = useState(false);
 
   const fetchBot = async () => {
+    setBotState({ status: "loading" });
     try {
       const res = await paperApi.getAutonomousBot();
-      setBot(res.bot);
+      setBotState({ status: "ok", data: res.bot });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load bot status");
+      const message = err instanceof Error ? err.message : "Failed to load bot status";
+      setBotState({ status: "error", message });
     }
   };
 
@@ -47,12 +61,15 @@ export default function AutonomousCenter() {
     }
   };
 
-  const fetchDecisions = async () => {
+  const fetchDecisionsNow = async () => {
+    setDecisionsLoading(true);
     try {
       const res: AutonomousDecideResponse = await paperApi.getAutonomousDecisions();
       setDecisions(res.decisions || []);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to load decisions");
+    } finally {
+      setDecisionsLoading(false);
     }
   };
 
@@ -65,10 +82,22 @@ export default function AutonomousCenter() {
     }
   };
 
+  const fetchDeployments = async () => {
+    setDeployments({ status: "loading" });
+    try {
+      const res: AutonomousDeploymentsResponse = await paperApi.getAutonomousDeployments();
+      setDeployments({ status: "ok", data: res.deployments || [] });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to load deployments";
+      setDeployments({ status: "error", message });
+    }
+  };
+
   const fetchAll = async () => {
     setLoading(true);
     setError(null);
-    await Promise.allSettled([fetchBot(), fetchScan(), fetchDecisions(), fetchEvents()]);
+    await Promise.allSettled([fetchBot(), fetchScan(), fetchEvents(), fetchDeployments()]);
     setLoading(false);
   };
 
@@ -141,7 +170,7 @@ export default function AutonomousCenter() {
     return undefined;
   };
 
-  if (loading && !bot) {
+  if (loading && botState.status !== "ok") {
     return (
       <div className="empty">
         <Loading label="Loading autonomous dashboard…" />
@@ -149,20 +178,23 @@ export default function AutonomousCenter() {
     );
   }
 
-  if (error && !bot) {
+  if (botState.status === "error") {
     return (
       <div className="error-state" role="alert">
         <div className="es-icon" aria-hidden="true">
           !
         </div>
-        <div className="es-title">Failed to load autonomous dashboard</div>
-        <div className="es-hint">{error || "Unknown error"}</div>
+        <div className="es-title">Autonomous engine unavailable</div>
+        <div className="es-hint">{botState.message || "Unknown error"}</div>
         <Button variant="secondary" size="sm" onClick={fetchAll}>
           Retry
         </Button>
       </div>
     );
   }
+
+  const bot: AutonomousBot | null =
+    botState.status === "ok" ? botState.data : null;
 
   return (
     <div className="paper-shell">
@@ -180,19 +212,21 @@ export default function AutonomousCenter() {
             flexWrap: "wrap",
           }}
         >
-          {bot && <StatusIndicator status={botStatusToIndicator(bot.status)} />}
+          {bot && (
+            <StatusIndicator status={botStatusToIndicator(bot.state as AutonomousBotStatus)} />
+          )}
           <div style={{ display: "inline-flex", gap: 8, flexWrap: "wrap" }}>
-            {bot?.status !== "running" && (
+            {bot && bot.state !== "running" && (
               <Button
                 variant="primary"
                 size="sm"
-                disabled={actionLoading || bot?.status === "stopped"}
+                disabled={actionLoading || bot.state === "stopped"}
                 onClick={() => handleLifecycle("start")}
               >
                 Start
               </Button>
             )}
-            {bot?.status === "running" && (
+            {bot && bot.state === "running" && (
               <>
                 <Button
                   variant="secondary"
@@ -212,7 +246,7 @@ export default function AutonomousCenter() {
                 </Button>
               </>
             )}
-            {bot?.status === "paused" && (
+            {bot && bot.state === "paused" && (
               <Button
                 variant="primary"
                 size="sm"
@@ -244,13 +278,16 @@ export default function AutonomousCenter() {
       {bot && (
         <Panel title="Bot Summary">
           <div className="metric-grid">
-            <MetricItem label="Status" value={bot.status} />
+            <MetricItem label="State" value={bot.state ?? "unknown"} />
             <MetricItem
               label="Uptime"
-              value={`${Math.floor(bot.uptime_seconds / 60)}m ${Math.floor(bot.uptime_seconds % 60)}s`}
+              value={`${Math.floor((bot.uptime_seconds ?? 0) / 60)}m ${Math.floor((bot.uptime_seconds ?? 0) % 60)}s`}
             />
-            <MetricItem label="Deployments" value={bot.deployment_count.toString()} />
-            <MetricItem label="Event Count" value={bot.event_count.toString()} />
+            <MetricItem
+              label="Deployments"
+              value={(bot.deployment_count ?? 0).toString()}
+            />
+            <MetricItem label="Event Count" value={(bot.event_count ?? 0).toString()} />
           </div>
         </Panel>
       )}
@@ -264,53 +301,93 @@ export default function AutonomousCenter() {
               value={<span className="mono">{bot.bot_id}</span>}
             />
             <MetricItem label="Name" value={bot.name} />
-            <MetricItem label="Trading Mode" value={<Pill>{bot.config.trading_mode}</Pill>} />
-            <MetricItem label="Source" value={bot.config.source} />
+            <MetricItem
+              label="Trading Mode"
+              value={<Pill>{bot.trading_mode}</Pill>}
+            />
+            <MetricItem label="Source" value={bot.source} />
             <MetricItem
               label="Allowed Symbols"
-              value={bot.config.constraints.allowed_symbols.join(", ")}
+              value={(bot.allowed_symbols || []).join(", ") || "—"}
             />
             <MetricItem
               label="Allowed Timeframes"
-              value={bot.config.constraints.allowed_timeframes.join(", ")}
+              value={(bot.allowed_timeframes || []).join(", ") || "—"}
             />
             <MetricItem
               label="Max Positions"
-              value={bot.config.constraints.max_simultaneous_positions.toString()}
+              value={(bot.max_simultaneous_positions ?? 0).toString()}
+            />
+            <MetricItem
+              label="Kill Switch"
+              value={
+                <Pill
+                  tone={
+                    bot.safety?.kill_switch_state === "active" ? "pos" : "warn"
+                  }
+                >
+                  {bot.safety?.kill_switch_state ?? "unknown"}
+                </Pill>
+              }
             />
           </div>
         </Panel>
       )}
 
-      {/* Active Deployments */}
-      {bot && bot.deployments.length > 0 && (
+      {/* Active Deployments — fetched independently; never crashes the page */}
+      {deployments.status === "loading" && (
         <Panel title="Active Deployments">
-          <table className="data dense">
-            <thead>
-              <tr>
-                <th>Deployment ID</th>
-                <th>Symbol</th>
-                <th>Status</th>
-                <th>Strategy</th>
-                <th>Timeframe</th>
-                <th>Created</th>
-              </tr>
-            </thead>
-            <tbody>
-              {bot.deployments.map((dep) => (
-                <tr key={dep.deployment_id}>
-                  <td className="td-id">{dep.deployment_id}</td>
-                  <td>{dep.symbol}</td>
-                  <td>
-                    <StatusIndicator status={dep.status} />
-                  </td>
-                  <td className="mono">{dep.strategy_id}</td>
-                  <td>{dep.timeframe}</td>
-                  <td className="td-muted">{dep.created_at}</td>
+          <Loading label="Loading deployments…" />
+        </Panel>
+      )}
+      {deployments.status === "error" && (
+        <Panel title="Active Deployments">
+          <EmptyState
+            title="Deployments unavailable"
+            hint={`Could not load deployments: ${deployments.message}. The autonomous bot remains operational; this section will refresh automatically.`}
+          />
+          <Button variant="secondary" size="sm" onClick={fetchDeployments}>
+            Retry
+          </Button>
+        </Panel>
+      )}
+      {deployments.status === "ok" &&
+        deployments.data.length > 0 && (
+          <Panel title="Active Deployments">
+            <table className="data dense">
+              <thead>
+                <tr>
+                  <th>Deployment ID</th>
+                  <th>Symbol</th>
+                  <th>Status</th>
+                  <th>Strategy</th>
+                  <th>Timeframe</th>
+                  <th>Created</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {deployments.data.map((dep) => (
+                  <tr key={dep.deployment_id}>
+                    <td className="td-id">{dep.deployment_id}</td>
+                    <td>{dep.symbol}</td>
+                    <td>
+                      <StatusIndicator status={dep.status} />
+                    </td>
+                    <td className="mono">{dep.strategy_id}</td>
+                    <td>{dep.timeframe}</td>
+                    <td className="td-muted">{dep.created_at}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Panel>
+        )}
+      {deployments.status === "ok" && deployments.data.length === 0 && (
+        <Panel title="Active Deployments">
+          <EmptyState
+            title="No active deployments"
+            hint="The autonomous bot has not linked any paper deployments yet."
+          />
         </Panel>
       )}
 
@@ -364,8 +441,20 @@ export default function AutonomousCenter() {
         </Panel>
       )}
 
-      {/* Generated Decisions */}
-      <Panel title="Trading Decisions">
+      {/* Generated Decisions — only fetched on user action */}
+      <Panel
+        title="Trading Decisions"
+        actions={
+          <Button
+            variant="secondary"
+            size="sm"
+            disabled={decisionsLoading}
+            onClick={fetchDecisionsNow}
+          >
+            {decisionsLoading ? "Running…" : "Run Decision"}
+          </Button>
+        }
+      >
         {decisions.length > 0 ? (
           <>
             <p className="muted" style={{ marginBottom: 8 }}>

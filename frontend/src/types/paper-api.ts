@@ -476,40 +476,48 @@ export interface AllocationResponse {
 // Phase 6 — Autonomous Trading Operations Center
 export type AutonomousBotStatus = "stopped" | "running" | "paused" | "error"
 
-export interface AutonomousBotConfigSummary {
-  bot_id: string
-  name: string
-  mode: string
-  trading_mode: string
-  enabled: boolean
-  source: string
-  constraints: {
-    allowed_symbols: string[]
-    allowed_timeframes: string[]
-    allowed_strategy_ids: string[]
-    max_simultaneous_positions: number
-  }
+export interface AutonomousBotConstraints {
+  allowed_symbols: string[]
+  allowed_timeframes: string[]
+  allowed_strategy_ids: string[]
+  max_simultaneous_positions: number
+}
+
+export interface AutonomousBotSafety {
+  kill_switch_state: string
+  kill_switch_reason: string | null
+  kill_switch_halted_at: string | null
 }
 
 export interface AutonomousBot {
   bot_id: string
   name: string
-  status: AutonomousBotStatus
-  config: AutonomousBotConfigSummary
-  current_scan: string | null
-  current_ranking: string | null
-  current_decisions: string | null
-  deployments: AutonomousDeploymentSummary[]
+  state: string
+  mode: string
+  trading_mode: string
+  enabled: boolean
+  decision_count: number
   deployment_count: number
-  policies: Record<string, unknown>
+  last_decision_timestamp: string | null
+  last_scan_timestamp: string | null
   event_count: number
   last_event_type: string | null
   last_event_timestamp: string | null
+  source: string
+  allowed_symbols: string[]
+  allowed_strategy_ids: string[]
+  allowed_timeframes: string[]
+  max_simultaneous_positions: number
+  max_position_allocation_pct: number
+  max_exposure_pct: number
+  max_drawdown_pct: number | null
+  safety: AutonomousBotSafety
   uptime_seconds: number
   started_at: string | null
   stopped_at: string | null
   is_ready: boolean
   is_active: boolean
+  deployments?: AutonomousDeploymentSummary[]
 }
 
 export interface AutonomousBotResponse {

@@ -310,7 +310,10 @@ export const paperApi = {
   },
 
   async getAutonomousDecisions(): Promise<AutonomousDecideResponse> {
-    return this.request<AutonomousDecideResponse>("/autonomous/decide")
+    return this.request<AutonomousDecideResponse>(
+      "/autonomous/decide",
+      { method: "POST" }
+    )
   },
 
   async getAutonomousDeployments(): Promise<AutonomousDeploymentsResponse> {
