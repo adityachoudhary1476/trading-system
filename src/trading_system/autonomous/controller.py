@@ -836,6 +836,7 @@ class AutonomousController(BaseModel):
         spot_price: float,
         config: Optional[DiscoveryConfig] = None,
         as_of: Optional[str] = None,
+        explicit_direction: Optional[Any] = None,
     ) -> Optional[CandidateEvaluationResult]:
         """Discover and evaluate current option candidates for a decision.
 
@@ -858,13 +859,16 @@ class AutonomousController(BaseModel):
             return None
 
         from .options.model import OptionDirection
-        action = decision.action
-        if action == "buy":
-            direction = OptionDirection.CALL
-        elif action == "sell":
-            direction = OptionDirection.PUT
+        if explicit_direction is not None:
+            direction = explicit_direction
         else:
-            return None  # HOLD or EXIT — no new option contract
+            action = decision.action
+            if action == "buy":
+                direction = OptionDirection.CALL
+            elif action == "sell":
+                direction = OptionDirection.PUT
+            else:
+                return None  # HOLD or EXIT � no new option contract
 
         underlying = decision.opportunity_symbol
         # Strip exchange prefix if present (e.g. "NSE:NIFTY" → "NIFTY")
@@ -923,6 +927,7 @@ class AutonomousController(BaseModel):
         config: Optional[DiscoveryConfig] = None,
         as_of: Optional[str] = None,
         max_quote_age_seconds: Optional[float] = None,
+        explicit_direction: Optional[Any] = None,
     ) -> Optional[OptionQuote]:
         """Discover the exact option contract and fetch its current premium.
 
@@ -945,6 +950,7 @@ class AutonomousController(BaseModel):
             spot_price=spot_price,
             config=config,
             as_of=as_of,
+            explicit_direction=explicit_direction,
         )
         if result is None or not result.has_selection:
             return None
@@ -981,6 +987,8 @@ class AutonomousController(BaseModel):
         max_quote_age_seconds: Optional[float] = None,
         order_quantity: float = 1.0,
         client_order_id: Optional[str] = None,
+        options_deployment_config: Optional[Any] = None,
+        explicit_option_type: Optional[str] = None,
     ) -> Optional["OrderResult"]:
         """Full autonomous options execution: discovery → premium → safety → paper fill.
 
@@ -1016,23 +1024,40 @@ class AutonomousController(BaseModel):
             return None
 
         # --- Phase 8B + 8C: discover + fetch premium ---
+        from .options.model import OptionDirection
+        explicit_direction = None
+        if explicit_option_type == "CE":
+            explicit_direction = OptionDirection.CALL
+        elif explicit_option_type == "PE":
+            explicit_direction = OptionDirection.PUT
         quote = self.fetch_option_premium(
             decision=decision,
             spot_price=spot_price,
             config=config,
             as_of=as_of,
             max_quote_age_seconds=max_quote_age_seconds,
+            explicit_direction=explicit_direction,
         )
         if quote is None:
             return None
 
         instrument = quote.instrument
 
+        # Deterministic client_order_id for idempotency (generated before
+        # the idempotency guard so cached results can be looked up on replay).
+        if client_order_id is None:
+            import hashlib
+            action_for_id = decision.action
+            client_order_id = hashlib.sha256(
+                f"{decision.decision_id}:{instrument.contract_id}:{action_for_id}".encode("utf-8")
+            ).hexdigest()[:48]
+
         # --- Phase 7 safety: contract validity ---
+        option_type = explicit_option_type or instrument.option_type
         selection = OptionsContractSelection.from_instrument(instrument)
         safety = self._safety_layer.validator.check_contract_validity(
             options_selection=selection,
-            allowed_option_types=["CE", "PE"],
+            allowed_option_types=[option_type] if option_type else ["CE", "PE"],
             now_date=__import__("datetime").date.today().isoformat(),
         )
         if not safety.passed:
@@ -1042,6 +1067,32 @@ class AutonomousController(BaseModel):
                 message=f"Phase 7 contract safety failed: {safety.failed_checks}",
             )
             return None
+
+        # --- Deployment config checks ---
+        if options_deployment_config is not None:
+            if not getattr(options_deployment_config, "options_enabled", True):
+                self._record_event(
+                    AutonomousEventType.ERROR,
+                    symbol=instrument.underlying or decision.opportunity_symbol,
+                    message="option execution skipped: options not enabled on deployment",
+                )
+                return None
+            allowed_types = getattr(options_deployment_config, "allowed_option_types", []) or []
+            if option_type not in allowed_types:
+                self._record_event(
+                    AutonomousEventType.POLICY_VIOLATION,
+                    symbol=instrument.underlying or decision.opportunity_symbol,
+                    message=f"option type {option_type} not allowed; allowed={allowed_types}",
+                )
+                return None
+            max_contracts = getattr(options_deployment_config, "max_options_contracts_per_trade", None)
+            if max_contracts is not None and order_quantity > max_contracts:
+                self._record_event(
+                    AutonomousEventType.POLICY_VIOLATION,
+                    symbol=instrument.underlying or decision.opportunity_symbol,
+                    message=f"order quantity {order_quantity} exceeds max {max_contracts}",
+                )
+                return None
 
         # --- Resolve session ---
         sid = session_id
@@ -1055,6 +1106,10 @@ class AutonomousController(BaseModel):
             )
             return None
 
+        # Pre-compute values needed for idempotency replay and OrderIntent.
+        action = decision.action
+        side = Side.BUY if action == "buy" else Side.SELL
+
         # --- Feed premium to PaperBroker BEFORE order submission ---
         # This sets _last_price so the broker has a current market price for
         # the exact option symbol, enabling correct mark-to-market later.
@@ -1065,14 +1120,6 @@ class AutonomousController(BaseModel):
         )
 
         # --- Construct OrderIntent with the fetched premium (no manual injection) ---
-        action = decision.action
-        side = Side.BUY if action == "buy" else Side.SELL
-        if client_order_id is None:
-            import hashlib
-            client_order_id = hashlib.sha256(
-                f"{decision.decision_id}:{instrument.contract_id}:{action}".encode("utf-8")
-            ).hexdigest()[:48]
-
         intent = OrderIntent(
             symbol=instrument.key,
             side=side,
@@ -1083,7 +1130,8 @@ class AutonomousController(BaseModel):
             options_contract_id=instrument.contract_id,
             strike=instrument.strike,
             expiry=instrument.expiry,
-            option_type=instrument.option_type,
+            option_type=option_type,
+            contract_size=getattr(instrument, "lot_size", None),
         )
 
         # --- Phase 7: idempotency guard ---
@@ -1095,6 +1143,40 @@ class AutonomousController(BaseModel):
             options_contract_id=instrument.contract_id,
         )
         if self._safety_layer.idempotency.is_duplicate_deployment(dep_key):
+            # Return cached result from the session store if available.
+            if client_order_id is not None and sid is not None:
+                try:
+                    cached = self.control_center.session_store.get_order(sid, client_order_id)
+                    if cached is not None:
+                        import json
+                        result_data = json.loads(cached.result_json or "{}")
+                        from ..paper.control import OrderResult, OrderStatus
+                        return OrderResult(
+                            order_id=result_data.get("order_id", cached.order_id),
+                            client_order_id=result_data.get("client_order_id", cached.client_order_id),
+                            symbol=result_data.get("symbol", instrument.key),
+                            side=result_data.get("side", side.value),
+                            quantity=result_data.get("quantity", order_quantity),
+                            order_type=result_data.get("order_type", OrderType.MARKET.value),
+                            limit_price=result_data.get("limit_price"),
+                            status=result_data.get("status", OrderStatus.FILLED.value),
+                            filled_quantity=result_data.get("filled_quantity", 0.0),
+                            avg_fill_price=result_data.get("avg_fill_price", 0.0),
+                            fills=[],
+                            cash_after=result_data.get("cash_after"),
+                            equity_after=result_data.get("equity_after"),
+                            realized_pnl_after=result_data.get("realized_pnl_after"),
+                            unrealized_pnl_after=result_data.get("unrealized_pnl_after"),
+                            position_qty_after=result_data.get("position_qty_after"),
+                            reject_reason=result_data.get("reject_reason", ""),
+                            is_idempotent_replay=True,
+                            options_contract_id=result_data.get("options_contract_id"),
+                            strike=result_data.get("strike"),
+                            expiry=result_data.get("expiry"),
+                            option_type=result_data.get("option_type"),
+                        )
+                except Exception:  # noqa: BLE001
+                    pass
             self._record_event(
                 AutonomousEventType.DECISION_REJECTED,
                 symbol=instrument.underlying or decision.opportunity_symbol,

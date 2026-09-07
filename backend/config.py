@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # These are the symbols for which signals are generated
     signal_universe: str = "NSE:SBIN,NSE:RELIANCE,NSE:TCS,NSE:INFY,NSE:HDFCBANK,NSE:ICICIBANK,NSE:KOTAKBANK,NSE:AXISBANK,NSE:LT,NSE:WIPRO"
 
+    # CORS
+    cors_origins: str = ""
+
 
 @lru_cache
 def get_settings() -> Settings:

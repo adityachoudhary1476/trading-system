@@ -15,11 +15,13 @@ dist/
 .venv/
 venv/
 
+# Untrusted local/Vercel storage — never commit
+.vercel
+
 # Secrets — never commit
 .env
 .env.backup
-
-# Data & logs (local artifacts)
+.env*
 data/*.db
 data/*.db-journal
 data/*.sqlite
@@ -43,6 +45,3 @@ vibetrading-inspection/
 # OS
 Thumbs.db
 .DS_Store
-
-.vercel
-.env*

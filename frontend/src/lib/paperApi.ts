@@ -30,6 +30,8 @@ import type {
   SessionResponse,
 } from "@/types/paper-api";
 
+import { getSupabaseClient } from "@/lib/supabase";
+
 const DEFAULT_BASE = "";
 const PAPER_API_PREFIX = "/api/paper";
 
@@ -60,6 +62,20 @@ async function request<T>(
   init?: RequestInit,
 ): Promise<ApiResult<T>> {
   const url = `${baseUrl()}${PAPER_API_PREFIX}${path}`;
+
+  let authHeaders: Record<string, string> = {};
+  try {
+    const sb = getSupabaseClient();
+    const { data: sessionData } = await sb.auth.getSession();
+    const token = sessionData.session?.access_token;
+    if (token) {
+      authHeaders.Authorization = `Bearer ${token}`;
+    }
+  } catch {
+    // Proceed without auth if Supabase is not configured or no session exists.
+    // The backend will reject unauthenticated requests when auth is required.
+  }
+
   let res: Response;
   try {
     res = await fetch(url, {
@@ -67,6 +83,7 @@ async function request<T>(
       headers: {
         "Content-Type": "application/json",
         Accept: "application/json",
+        ...authHeaders,
         ...(init?.headers ?? {}),
       },
       // Prevent accidental credential caching.

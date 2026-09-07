@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 from main import app
 from routes import paper_api
 from routes.paper_api import _api_router, _build_controller, _build_market_data_callable, _get_api_router
+from auth import get_current_user, AuthenticatedUser
 
 
 # --------------------------------------------------------------------------- #
@@ -38,6 +39,17 @@ def _reset_paper_singleton():
     import trading_system.paper.control as cmod
     if hasattr(tmod, "_init_cache"):
         tmod._init_cache.clear()
+
+
+def _mock_get_current_user() -> AuthenticatedUser:
+    return AuthenticatedUser(user_id="test-user", email="test@example.com")
+
+
+@pytest.fixture(autouse=True)
+def mock_auth():
+    app.dependency_overrides[get_current_user] = _mock_get_current_user
+    yield
+    app.dependency_overrides.pop(get_current_user, None)
 
 
 @pytest.fixture

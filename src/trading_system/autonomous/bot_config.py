@@ -118,6 +118,11 @@ class UserConstraints(BaseModel):
         default_factory=frozenset,
         description="Immutable set of timeframes the autonomous bot may use.",
     )
+    # Option underlyings the bot may discover contracts for (Phase B).
+    allowed_option_underlyings: frozenset[str] = Field(
+        default_factory=frozenset,
+        description="Immutable set of underlying names the bot may use for option discovery.",
+    )
     # Maximum simultaneous positions across all deployments managed by this bot.
     max_simultaneous_positions: int = Field(
         default=1,

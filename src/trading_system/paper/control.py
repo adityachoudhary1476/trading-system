@@ -1006,6 +1006,7 @@ class PaperTradingControlCenter:
 
         # --- 6. Validate inputs against broker rules ---
         broker = runner.broker
+        order = None
         # Pre-validate: broker.submit_order raises BrokerError on bad input.
         try:
             order = broker.submit_order(
@@ -1019,6 +1020,7 @@ class PaperTradingControlCenter:
                 strike=intent.strike,
                 expiry=intent.expiry,
                 option_type=intent.option_type,
+                contract_size=intent.contract_size,
             )
         except BrokerError as exc:
             result = OrderResult(
@@ -1049,10 +1051,11 @@ class PaperTradingControlCenter:
                 symbol=intent.symbol, client_order_id=intent.client_order_id,
                 reason=str(exc),
             )
-            self._persist_order(
-                session_id=session_id, intent=intent,
-                order=order, result=result,
-            )
+            if order is not None:
+                self._persist_order(
+                    session_id=session_id, intent=intent,
+                    order=order, result=result,
+                )
             return result
 
         # --- 7. Build result from the fill ---

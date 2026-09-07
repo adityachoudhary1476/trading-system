@@ -78,6 +78,7 @@ class Instrument:
     underlying: Optional[str] = None        # for F&O / index-based derivatives
     expiry: Optional[str] = None            # ISO date for F&O ("2025-12-25")
     strike: Optional[float] = None          # for options
+    lot_size: Optional[int] = None          # exchange lot size (Phase D)
     option_type: Optional[str] = None       # "CE"/"PE"
     exchange_full: Optional[str] = None     # e.g. "NSE F&O" / "MCX COMM"
 
@@ -141,6 +142,7 @@ class Instrument:
         option_type: OptionType | str,
         name: Optional[str] = None,
         provider_symbol: Optional[str] = None,
+        lot_size: Optional[int] = None,
     ) -> "Instrument":
         ot = option_type.value if isinstance(option_type, OptionType) else str(option_type).upper()
         itype = InstrumentType.OPTION_CE if ot == "CE" else InstrumentType.OPTION_PE
@@ -152,6 +154,7 @@ class Instrument:
             underlying=underlying,
             expiry=expiry,
             strike=float(strike),
+            lot_size=lot_size,
             option_type=ot,
             exchange_full=exchange,
         )

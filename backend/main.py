@@ -74,12 +74,14 @@ app = FastAPI(
 )
 
 # CORS middleware
-# Note: In production, this should be configured with specific origins
-# The current permissive setting is for development only
+# Production must set CORS_ORIGINS to a comma-separated list of trusted origins.
+# An empty value disables cross-origin access entirely.
+settings = get_settings()
+cors_origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
-    allow_credentials=True,
+    allow_origins=cors_origins,
+    allow_credentials=bool(cors_origins),
     allow_methods=["*"],
     allow_headers=["*"],
 )

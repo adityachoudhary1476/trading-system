@@ -12,9 +12,10 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
+from auth import get_current_user, AuthenticatedUser
 from config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -216,7 +217,11 @@ def _build_query(request: Request) -> dict[str, list[str]]:
 
 
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-async def _catch_all(request: Request, path: str) -> Response:
+async def _catch_all(
+    request: Request,
+    path: str,
+    user: AuthenticatedUser = Depends(get_current_user),
+) -> Response:
     """Forward every request to the Phase 21 dispatcher."""
     api_router = _get_api_router()
 

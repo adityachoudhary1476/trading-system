@@ -321,8 +321,14 @@ class TestPaperDeploymentMigration:
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from routes.paper_api import router as paper_api_router
+        from auth import get_current_user, AuthenticatedUser
+
+        def _mock_get_current_user() -> AuthenticatedUser:
+            return AuthenticatedUser(user_id="test-user", email="test@example.com")
+
         app = FastAPI()
         app.include_router(paper_api_router)
+        app.dependency_overrides[get_current_user] = _mock_get_current_user
         client = TestClient(app)
 
         try:

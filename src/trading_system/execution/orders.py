@@ -106,6 +106,7 @@ class Order:
     strike: Optional[float] = None
     expiry: Optional[str] = None
     option_type: Optional[str] = None
+    contract_size: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.quantity <= 0:
@@ -191,6 +192,7 @@ class OrderIntent:
     strike: Optional[float] = None
     expiry: Optional[str] = None
     option_type: Optional[str] = None
+    contract_size: Optional[int] = None  # explicit lot size override for options
 
 
 @dataclass

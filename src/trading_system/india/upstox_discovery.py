@@ -140,6 +140,14 @@ class UpstoxInstrumentDiscovery:
         )
         if provider_key:
             instr.provider_symbol = provider_key
+        # Exchange lot size (Phase D)
+        # Try to extract lotSize from the API response; if absent, lot_size stays None.
+        lot_size_raw = entry.get("lotSize") or entry.get("lot_size") or entry.get("lot size")
+        if lot_size_raw is not None:
+            try:
+                instr.lot_size = int(lot_size_raw)
+            except (ValueError, TypeError):
+                pass
         return instr
 
     @staticmethod

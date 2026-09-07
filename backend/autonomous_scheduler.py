@@ -478,7 +478,13 @@ def _build_control_center(engine: Engine):
     return center, md_provider, market_data_callable
 
 
-def _build_controller(center, md_provider, market_data_callable, bot_id: str):
+def _build_controller(
+    center,
+    md_provider,
+    market_data_callable,
+    bot_id: str,
+    option_underlyings: frozenset = frozenset(),
+):
     """Build a fresh ``AutonomousController`` for one bot."""
     from trading_system.autonomous.bot_config import (
         AutonomousBotConfig,
@@ -499,6 +505,7 @@ def _build_controller(center, md_provider, market_data_callable, bot_id: str):
             allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
             allowed_strategy_ids=frozenset(),
             allowed_timeframes=frozenset({"1m", "5m", "15m", "30m", "1h", "4h", "1d"}),
+            allowed_option_underlyings=option_underlyings,
         ),
         max_simultaneous_positions=5,
         source=Source.AUTONOMOUS,
@@ -511,6 +518,245 @@ def _build_controller(center, md_provider, market_data_callable, bot_id: str):
     controller = AutonomousController(config=bot_config, control_center=center)
     controller.set_chain_provider(None)
     return controller
+
+
+# --------------------------------------------------------------------------- #
+# Phase B — Options provider wiring
+# --------------------------------------------------------------------------- #
+def _env_option_underlyings() -> frozenset:
+    """Parse ``AUTONOMOUS_OPTION_UNDERLYINGS`` into a frozenset of uppercase strings."""
+    raw = os.environ.get("AUTONOMOUS_OPTION_UNDERLYINGS", "").strip()
+    if not raw:
+        return frozenset()
+    return frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
+
+
+def _env_max_option_quote_age() -> float:
+    """Parse ``AUTONOMOUS_MAX_OPTION_QUOTE_AGE_SECONDS``; default 300."""
+    raw = os.environ.get("AUTONOMOUS_MAX_OPTION_QUOTE_AGE_SECONDS", "300").strip()
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 300.0
+
+
+def _build_options_wiring(
+    *,
+    repository: Optional[InstrumentRepository] = None,
+    seed_instruments: Optional[list[Instrument]] = None,
+    authenticated: bool = True,
+    max_quote_age_seconds: float = 300.0,
+) -> "OptionsPhaseBWiring":
+    """Build a Phase B wiring with real providers backed by a repository."""
+    from backend.options_phase_b import OptionsPhaseBWiring
+    from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
+    from trading_system.autonomous.options_selector import CurrentOptionQuoteProvider
+    from trading_system.india.upstox import UpstoxMarketDataProvider
+
+    repo = repository or InstrumentRepository()
+    for instr in seed_instruments or []:
+        repo.register(instr)
+
+    discoverer = CurrentOptionDiscoverer(repository=repo)
+
+    access_token = os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN", "").strip() or None
+    upstox = UpstoxMarketDataProvider(access_token=access_token)
+    quote_provider = CurrentOptionQuoteProvider(
+        provider=upstox,
+        max_quote_age_seconds=max_quote_age_seconds,
+    )
+
+    return OptionsPhaseBWiring(
+        repository=repo,
+        discoverer=discoverer,
+        quote_provider=quote_provider,
+        discovery=None,
+    )
+
+
+def _attach_options_wiring(controller, wiring: "OptionsPhaseBWiring") -> bool:
+    """Attach Phase B wiring to a controller. Returns True on success."""
+    return wiring.attach_to_controller(controller)
+
+
+def _list_options_enabled_deployments(
+    controller,
+    allowed_underlyings: frozenset,
+) -> list:
+    """Return active options-enabled deployments.
+
+    When ``allowed_underlyings`` is empty, all options-enabled deployments
+    are returned (no underlying filtering).
+    """
+    try:
+        center = controller.control_center
+    except Exception:  # noqa: BLE001
+        return []
+    results = []
+    for dep in center.list_deployments():
+        cfg = getattr(dep, "config", None)
+        if cfg is None:
+            continue
+        if not getattr(cfg, "options_enabled", False):
+            continue
+        if not allowed_underlyings:
+            results.append(dep)
+            continue
+        symbol = getattr(dep, "symbol", "") or ""
+        underlying = symbol.split(":")[-1] if ":" in symbol else symbol
+        if underlying.upper() in {u.upper() for u in allowed_underlyings}:
+            results.append(dep)
+    return results
+
+
+def _run_phase_b_validation(
+    controller,
+    wiring: "OptionsPhaseBWiring",
+    max_quote_age_seconds: float = 300.0,
+) -> list[dict]:
+    """Run Phase B validation for all options-enabled deployments.
+
+    Returns a list of observation dicts. No orders are submitted.
+    """
+    from backend.options_phase_b import EVENT_PHASE_B_NO_EXECUTION
+
+    underlyings = _env_option_underlyings()
+    deps = _list_options_enabled_deployments(controller, underlyings)
+    if not deps:
+        return [
+            {
+                "event": EVENT_PHASE_B_NO_EXECUTION,
+                "underlying": None,
+                "detail": "no options-enabled deployments",
+            }
+        ]
+
+    observations: list[dict] = []
+    for dep in deps:
+        underlying = (getattr(dep, "symbol", "") or "").split(":")[-1]
+        obs = wiring.verify_deployment_capability(
+            underlying=underlying,
+            direction=OptionDirection.CALL,
+            spot_price=25000.0,
+            max_quote_age_seconds=max_quote_age_seconds,
+        )
+        for o in obs:
+            observations.append({**o.to_dict(), "underlying": underlying})
+    return observations
+
+
+def _execute_one_option_decision(
+    controller,
+    decision,
+    *,
+    spot_price: float,
+    target_qty: float = 1.0,
+) -> dict:
+    """Execute one option decision via the controller's option path.
+
+    Returns a structured result dict. Never raises — all failures are
+    captured in the result dict.
+    """
+    from backend.options_phase_b import EVENT_PHASE_B_NO_EXECUTION
+
+    # --- Pre-checks ---
+    underlyings = _env_option_underlyings()
+    if not underlyings:
+        # Fall back to the controller's configured option underlyings, or
+        # allow all options-enabled deployments when nothing is configured.
+        underlyings = getattr(
+            getattr(controller, "config", None),
+            "user_constraints",
+            None,
+        ) and getattr(controller.config.user_constraints, "allowed_option_underlyings", frozenset()) or frozenset()
+    deps = _list_options_enabled_deployments(controller, underlyings)
+    if not deps:
+        return {
+            "result": "no_options_deployment",
+            "detail": "no active options-enabled deployment",
+        }
+
+    action = getattr(decision.signal, "action", None)
+    action_value = action.value if hasattr(action, "value") else str(action)
+    if action_value != "buy":
+        return {
+            "result": "option_selling_not_supported",
+            "detail": f"Phase C supports BUY only, got action={action_value!r}",
+        }
+
+    option_intent = getattr(decision.signal, "option_intent", None)
+    if option_intent is None:
+        return {
+            "result": "option_selling_not_supported",
+            "detail": "no option_intent on signal",
+        }
+
+    # Find the first options-enabled deployment.
+    dep = deps[0]
+    deployment_id = dep.deployment_id
+    sid = controller.control_center.find_session_for_deployment(deployment_id)
+    if sid is None:
+        return {
+            "result": "no_session",
+            "deployment_id": deployment_id,
+        }
+
+    # --- Check allowed_option_types ---
+    cfg = getattr(dep, "config", None)
+    allowed_types = getattr(cfg, "allowed_option_types", []) or []
+    if option_intent not in allowed_types:
+        return {
+            "result": "option_type_not_allowed",
+            "detail": f"{option_intent} not in {allowed_types}",
+            "deployment_id": deployment_id,
+        }
+
+    # --- Check max contracts ---
+    max_contracts = getattr(cfg, "max_options_contracts_per_trade", None)
+    if max_contracts is not None and target_qty > max_contracts:
+        return {
+            "result": "max_contracts_exceeded",
+            "detail": f"target_qty={target_qty} > max={max_contracts}",
+            "deployment_id": deployment_id,
+        }
+
+    # --- Kill switch ---
+    if controller.is_halted:
+        return {
+            "result": "kill_switch_halted",
+            "deployment_id": deployment_id,
+        }
+
+    # --- Execute via controller ---
+    result = controller.execute_option_order(
+        decision=decision,
+        spot_price=spot_price,
+        deployment_id=deployment_id,
+        session_id=sid,
+        order_quantity=target_qty,
+        options_deployment_config=cfg,
+        explicit_option_type=option_intent,
+    )
+
+    if result is None:
+        return {
+            "result": "rejected",
+            "deployment_id": deployment_id,
+        }
+
+    return {
+        "result": "already_executed" if getattr(result, "is_idempotent_replay", False) else "submitted",
+        "status": result.status,
+        "order_id": result.order_id,
+        "option_intent": option_intent,
+        "options_contract_id": getattr(result, "options_contract_id", None),
+        "strike": getattr(result, "strike", None),
+        "expiry": getattr(result, "expiry", None),
+        "filled_quantity": getattr(result, "filled_quantity", None),
+        "avg_fill_price": getattr(result, "avg_fill_price", None),
+        "deployment_id": deployment_id,
+        "session_id": sid,
+    }
 
 
 # --------------------------------------------------------------------------- #

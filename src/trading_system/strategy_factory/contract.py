@@ -163,6 +163,7 @@ class StrategySignal:
     metadata: dict = field(default_factory=dict)
     version: str = ""
     options_selection: "Optional[OptionsContractSelection]" = None
+    option_intent: Optional[str] = None  # "CE" / "PE" for Phase C option execution
 
     def __post_init__(self) -> None:
         if self.reference_price <= 0:
@@ -196,6 +197,8 @@ class StrategySignal:
         }
         if self.options_selection is not None:
             d["options_selection"] = self.options_selection.to_dict()
+        if self.option_intent is not None:
+            d["option_intent"] = self.option_intent
         return d
 
     def __repr__(self) -> str:  # pragma: no cover - trivial

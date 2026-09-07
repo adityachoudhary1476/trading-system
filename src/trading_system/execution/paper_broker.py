@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
+from ..india.instruments import Instrument
+from ..paper_trading.lot_size import resolve_contract_size
 from .broker import AccountSnapshot, Broker, BrokerError, CostModel
 from .orders import Fill, Order, OrderStatus, OrderType, Side
 
@@ -89,6 +91,7 @@ class PaperBroker(Broker):
     initial_cash: float = 100_000.0
     slippage: SlippageConfig = field(default_factory=SlippageConfig)
     cost_model: CostModel = field(default_factory=SimpleCostModel)
+    instrument_resolver: Optional[Callable[[str], Optional[Instrument]]] = None
     # Simple cash-only margin model: margin_used is 0 by default (no leverage).
     # Real FYERS margin rules are explicitly OUT of scope (paper accounting only).
     _cash: float = field(init=False)
@@ -112,6 +115,33 @@ class PaperBroker(Broker):
     # -- internal helpers -----------------------------------------------------
     def _now(self) -> datetime:
         return self._clock()
+
+    def _resolve_contract_size(self, contract_id: str, symbol: str = ""):
+        """Resolve contract size from the instrument resolver or InstrumentRepository."""
+        if self.instrument_resolver is not None:
+            # Try contract_id first (canonical), then symbol (test doubles).
+            for key in (contract_id, symbol):
+                if not key:
+                    continue
+                try:
+                    instrument = self.instrument_resolver(key)
+                    if instrument is not None:
+                        return resolve_contract_size(instrument)
+                except Exception:  # noqa: BLE001
+                    pass
+        # Fallback: try the global repository.
+        for key in (contract_id, symbol):
+            if not key:
+                continue
+            try:
+                from trading_system.india.instrument_repository import InstrumentRepository
+                repo = InstrumentRepository()
+                instrument = repo.resolve(key)
+                if instrument is not None:
+                    return resolve_contract_size(instrument)
+            except Exception:  # noqa: BLE001
+                pass
+        return None
 
     def _position(self, symbol: str):
         from ..paper_trading import Position
@@ -145,6 +175,7 @@ class PaperBroker(Broker):
         strike: Optional[float] = None,
         expiry: Optional[str] = None,
         option_type: Optional[str] = None,
+        contract_size: Optional[int] = None,
     ) -> Order:
         side = Side(side) if not isinstance(side, Side) else side
         order_type = OrderType(order_type) if not isinstance(order_type, OrderType) else order_type
@@ -177,7 +208,7 @@ class PaperBroker(Broker):
         self._orders[order.order_id] = order
 
         if order_type == OrderType.MARKET:
-            self._fill_order(order, ref_price, fill_qty=order.quantity)
+            self._fill_order(order, ref_price, fill_qty=order.quantity, explicit_contract_size=contract_size)
         else:
             # LIMIT: evaluate now in case the condition is already met.
             self._evaluate_limit_order(order, ref_price)
@@ -198,8 +229,19 @@ class PaperBroker(Broker):
     def update_market_price(self, symbol: str, price: float) -> None:
         if price is None or price <= 0:
             raise BrokerError(f"invalid market price for {symbol}: {price}")
-        self._last_price[symbol] = float(price)
         pos = self._positions.get(symbol)
+        if pos is not None and pos.is_option and pos.expiry is not None:
+            from datetime import date
+            try:
+                exp = date.fromisoformat(pos.expiry)
+                if exp < date.today():
+                    raise BrokerError(
+                        f"option_expired: cannot mark-to-market expired option {symbol} "
+                        f"with expiry={pos.expiry}"
+                    )
+            except (ValueError, TypeError):
+                pass
+        self._last_price[symbol] = float(price)
         if pos is not None:
             pos.current_price = float(price)
         # Evaluate any resting LIMIT orders for this symbol.
@@ -220,13 +262,34 @@ class PaperBroker(Broker):
             self._fill_order(order, market_price, fill_qty=order.quantity)
 
     # -- fill engine (core accounting) ---------------------------------------
-    def _fill_order(self, order: Order, market_price: float, fill_qty: float) -> None:
+    def _fill_order(self, order: Order, market_price: float, fill_qty: float, explicit_contract_size: Optional[int] = None) -> None:
         if fill_qty <= 0 or order.remaining_quantity <= 0:
             return
         fill_qty = min(fill_qty, order.remaining_quantity)
 
         exec_price = self.slippage.apply(order.side, market_price)
-        fee = self.cost_model.estimate_fill_fee(order.symbol, order.side, exec_price, fill_qty)
+        # For options, fee is based on notional = price * qty * contract_size.
+        contract_size = 1
+        if order.options_contract_id is not None:
+            # Explicit contract_size on the order takes precedence.
+            if explicit_contract_size is not None:
+                contract_size = explicit_contract_size
+            elif order.contract_size is not None:
+                contract_size = order.contract_size
+            else:
+                resolved = self._resolve_contract_size(order.options_contract_id, symbol=order.symbol)
+                if resolved is not None and resolved.has_lot_size:
+                    contract_size = resolved.contract_size
+                elif self.instrument_resolver is not None:
+                    # A resolver was provided but could not resolve the contract size.
+                    raise BrokerError(
+                        f"option_lot_size_unknown: cannot resolve contract size for "
+                        f"{order.options_contract_id}"
+                    )
+                # else: no resolver available; fall back to contract_size=1
+        fee = self.cost_model.estimate_fill_fee(
+            order.symbol, order.side, exec_price, fill_qty * contract_size
+        )
         fill = Fill(
             fill_id=uuid.uuid4().hex,
             order_id=order.order_id,
@@ -245,7 +308,7 @@ class PaperBroker(Broker):
             prev = order.avg_fill_price * (order.filled_quantity - fill_qty)
             order.avg_fill_price = (prev + exec_price * fill_qty) / order.filled_quantity
 
-        self._apply_fill_to_book(order, fill_qty, exec_price, fee)
+        self._apply_fill_to_book(order, fill_qty, exec_price, fee, contract_size=contract_size)
 
         # Order status transition
         if order.remaining_quantity <= 1e-12:
@@ -254,7 +317,7 @@ class PaperBroker(Broker):
             order.transition_to(OrderStatus.PARTIALLY_FILLED)
 
     def _apply_fill_to_book(
-        self, order: OrderIntent, qty: float, price: float, fee: float
+        self, order: OrderIntent, qty: float, price: float, fee: float, contract_size: int = 1
     ) -> None:
         """Update cash + position with one fill. Signed qty: BUY +, SELL -."""
         symbol = order.symbol
@@ -267,14 +330,14 @@ class PaperBroker(Broker):
             pos.strike = order.strike
             pos.expiry = order.expiry
             pos.option_type = order.option_type
+            pos.contract_size = contract_size
 
         # Cash effect: buying spends cash + fee; selling receives cash - fee.
-        cash_delta = -signed * price - (fee if side == Side.BUY else fee)
-        # For SELL, fee reduces proceeds: cash += qty*price - fee.
+        notional = abs(signed) * price * contract_size
         if side == Side.SELL:
-            cash_delta = qty * price - fee
+            cash_delta = notional - fee
         else:
-            cash_delta = -(qty * price) - fee
+            cash_delta = -notional - fee
         self._cash += cash_delta
 
         # Position update + realized PnL on reducing/closing/reversing.
@@ -293,11 +356,11 @@ class PaperBroker(Broker):
             # Reducing / closing / reversing.
             closing_qty = min(abs(signed), abs(old_qty))
             # Realized PnL: for a LONG (old_qty>0) being reduced by a SELL:
-            #   pnl = (sell_price - avg_entry) * closing_qty
+            #   pnl = (sell_price - avg_entry) * closing_qty * contract_size
             # For a SHORT (old_qty<0) being reduced by a BUY:
-            #   pnl = (avg_entry - buy_price) * closing_qty
+            #   pnl = (avg_entry - buy_price) * closing_qty * contract_size
             direction_sign = 1.0 if old_qty > 0 else -1.0
-            realized = direction_sign * (price - old_avg) * closing_qty
+            realized = direction_sign * (price - old_avg) * closing_qty * contract_size
             self._realized_pnl += realized
             pos.realized_pnl += realized
 
