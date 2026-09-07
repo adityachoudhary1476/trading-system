@@ -424,13 +424,28 @@ class PaperAPIRouter:
         except APIErrorException as exc:
             return self._error_response(exc)
 
-        rows = self.center.list_deployments(
-            deployment_id=deployment_id,
-            strategy_id=strategy_id,
-            symbol=symbol,
-            timeframe=timeframe,
-            status=status,
-        )
+        try:
+            rows = self.center.list_deployments(
+                deployment_id=deployment_id,
+                strategy_id=strategy_id,
+                symbol=symbol,
+                timeframe=timeframe,
+                status=status,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "list_deployments failed in /deployments; returning empty list"
+            )
+            return ResponseEnvelope(
+                status=200,
+                body={
+                    "deployments": [],
+                    "count": 0,
+                    "warning": f"deployment query failed: {exc.__class__.__name__}",
+                    "skipped": [],
+                },
+            )
+
         rows = rows[:limit]
         summaries: list[DashboardDeploymentSummary] = []
         skipped: list[str] = []
@@ -450,8 +465,7 @@ class PaperAPIRouter:
             count=len(summaries),
         )
         dumped = _safe_dump(body)
-        if skipped:
-            dumped["skipped"] = skipped
+        dumped["skipped"] = skipped
         return ResponseEnvelope(status=200, body=dumped)
 
     @staticmethod
