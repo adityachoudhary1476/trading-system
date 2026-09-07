@@ -1,7 +1,6 @@
 import type { VercelRequest, VercelResponse } from "@vercel/node";
 
 const PYTHON_BACKEND_URL = process.env.PYTHON_BACKEND_URL || "http://localhost:8000";
-const PAPER_API_PREFIX = "/api/paper";
 
 const PROXIED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 
@@ -51,7 +50,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const { path, search } = extractPathAndQuery(req);
-  const backendUrl = `${PYTHON_BACKEND_URL}${PAPER_API_PREFIX}${path}${search}`;
+  const backendUrl = `${PYTHON_BACKEND_URL}${path}${search}`;
   const headers = filterHeaders(req);
   const body = shouldForwardBody(req.method) ? buildRequestBody(req) : undefined;
 
