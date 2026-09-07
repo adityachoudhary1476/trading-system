@@ -666,22 +666,63 @@ class EvidenceStore:
             s.commit()
 
     # --- schema migration (Phase 17) ---
-    CURRENT_SCHEMA_VERSION = 2
+    CURRENT_SCHEMA_VERSION = 3
 
     def ensure_schema_current(self) -> int:
         """Idempotent forward migration. Returns the resulting schema version.
 
-        Phase 17 added the append-only ``strategy_lifecycle_events`` table;
-        Phase 18 reuses the existing ``strategies`` / ``strategy_evidence``
-        tables (PAPER_TRADING is just a new ``EvidenceType`` value, the
-        underlying column is a free-text String). All migrations are additive
-        only: existing tables/columns are untouched, so Phase 16/17 records
-        remain readable. Safe to call on every startup.
+        Schema versions:
+          * v1 — initial schema (hypotheses, evidence_runs, strategies,
+            strategy_evidence, paper_deployments, paper_sessions).
+          * v2 — Phase 17 added ``strategy_lifecycle_events``;
+            Phase 18 reused the existing strategies/strategy_evidence tables
+            (PAPER_TRADING is a new ``EvidenceType`` value, the underlying
+            column is a free-text String).
+          * v3 — Phase 8 added three columns to ``paper_deployments``
+            (``options_enabled``, ``allowed_option_types_json``,
+            ``max_options_contracts_per_trade``) for paper-options support.
+
+        All migrations are additive only: existing tables/columns are
+        untouched, so Phase 16/17 records remain readable. Safe to call on
+        every startup; safe to re-run after partial failure.
         """
         current = self._schema_version()
         if current is not None and current >= self.CURRENT_SCHEMA_VERSION:
             return current
+
+        # Reuse the same idempotent ``inspect + conditional ALTER`` pattern
+        # that ``storage.database.init_db`` uses for SQLite. PostgreSQL ≥9.6
+        # natively supports ``ADD COLUMN IF NOT EXISTS`` for the same effect.
+        from sqlalchemy import inspect as _inspect, text as _text
+
+        inspector = _inspect(self.engine)
+        # ``create_all`` first: this adds any missing TABLES (e.g. when the
+        # database predates Phase 18 entirely), but never columns on existing
+        # tables. Column-level migrations follow below.
         Base.metadata.create_all(self.engine)
+
+        with self.engine.begin() as conn:
+            current = self._schema_version() or 0
+            if current < 3 and inspector.has_table("paper_deployments"):
+                existing = {c["name"] for c in inspector.get_columns("paper_deployments")}
+                if "options_enabled" not in existing:
+                    conn.execute(_text(
+                        "ALTER TABLE paper_deployments "
+                        "ADD COLUMN options_enabled BOOLEAN NOT NULL "
+                        "DEFAULT FALSE"
+                    ))
+                if "allowed_option_types_json" not in existing:
+                    conn.execute(_text(
+                        "ALTER TABLE paper_deployments "
+                        "ADD COLUMN allowed_option_types_json TEXT NOT NULL "
+                        "DEFAULT '[\"CE\",\"PE\"]'"
+                    ))
+                if "max_options_contracts_per_trade" not in existing:
+                    conn.execute(_text(
+                        "ALTER TABLE paper_deployments "
+                        "ADD COLUMN max_options_contracts_per_trade INTEGER"
+                    ))
+
         self._set_schema_version(self.CURRENT_SCHEMA_VERSION)
         return self.CURRENT_SCHEMA_VERSION
 

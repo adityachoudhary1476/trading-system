@@ -1271,6 +1271,20 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
         except Exception:
             return None
 
+    # Idempotent forward migration: see ``EvidenceStore.ensure_schema_current``.
+    # The CLI server starts before any SELECT against ``paper_deployments`` so
+    # this runs at startup, ensuring the Phase 8 options columns exist. Fail
+    # closed: a broken migration must not prevent the API server from
+    # starting — the deployment routes have their own degraded fallback.
+    try:
+        from trading_system.research.evidence import EvidenceStore as _EvidenceStore
+        _EvidenceStore(engine).ensure_schema_current()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"warning: paper_deployments migration helper raised: {exc!r}; "
+            "deployment listing may fall back to empty + warning."
+        )
+
     center = PaperTradingControlCenter.from_engine(
         engine,
         requirement=requirement,
@@ -1408,6 +1422,19 @@ def _cmd_seed_paper_deployment(args: argparse.Namespace) -> int:
             else {}
         ),
     )
+
+    # Idempotent forward migration: ensures the Phase 8 paper-options
+    # columns exist on ``paper_deployments`` before any list / insert /
+    # update. Idempotent, additive only; safe to call on every invocation.
+    try:
+        from trading_system.research.evidence import EvidenceStore as _EvidenceStore
+        _EvidenceStore(engine).ensure_schema_current()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"warning: paper_deployments migration helper raised: {exc!r}; "
+            "paper-seed may fail to list or insert deployments."
+        )
+
     requirement = EvidenceRequirement(
         require_walk_forward=False,
         require_validation=False,

@@ -122,6 +122,7 @@ def _get_api_router():
 
     from trading_system.paper_api import PaperAPIRouter
     from trading_system.paper.control import PaperTradingControlCenter
+    from trading_system.research.evidence import EvidenceStore
     from trading_system.research.strategy_intelligence import (
         EvidenceFreshnessConfig,
         EvidenceRequirement,
@@ -143,6 +144,24 @@ def _get_api_router():
         settings.market_data_db_url,
         connect_args=connect_args,
     )
+
+    # Idempotent forward migration: adds missing columns introduced after the
+    # initial ``Base.metadata.create_all``. Phase 8 added
+    # ``options_enabled`` / ``allowed_option_types_json`` /
+    # ``max_options_contracts_per_trade`` to ``paper_deployments``; without
+    # this step the SELECT against that table fails with
+    # ``UndefinedColumn: paper_deployments.options_enabled`` on the existing
+    # Railway database (schema pre-dating Phase 8). Fail-closed: a broken
+    # migration must not prevent the API from starting — the deployment
+    # routes have their own degraded fallback returning 200 + warning.
+    try:
+        EvidenceStore(engine).ensure_schema_current()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "paper_deployments migration helper raised: %r; deployment "
+            "listing may fall back to empty + warning.",
+            exc,
+        )
 
     requirement = EvidenceRequirement(
         require_walk_forward=False,
