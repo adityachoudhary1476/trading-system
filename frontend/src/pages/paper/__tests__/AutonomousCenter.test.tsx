@@ -332,3 +332,202 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     expect(screen.getByText("3 recent events")).toBeDefined();
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Regression: response-shape drift must NOT crash the page
+// --------------------------------------------------------------------------- //
+// These tests reproduce the exact production failure mode:
+// the backend returns ``scan.candidates`` and ``ranking.opportunities`` while
+// the historical frontend type expected ``scan.signals`` and ``ranking.candidates``.
+// The page must tolerate either shape and render the section accordingly.
+describe("AutonomousCenter — regression: shape drift tolerance", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("running") });
+    vi.mocked(paperApi.getAutonomousScan).mockResolvedValue({
+      scan: mockScan([]),
+      ranking: null,
+    });
+    vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({ decisions: [] });
+    vi.mocked(paperApi.getAutonomousEvents).mockResolvedValue({
+      events: [],
+      count: 0,
+      schema_version: 1,
+    });
+    vi.mocked(paperApi.getAutonomousDeployments).mockResolvedValue({
+      deployments: [],
+      count: 0,
+      schema_version: 1,
+    });
+  });
+
+  it("does NOT crash when scan returns the live Phase 8C-B shape (candidates, not signals)", async () => {
+    vi.mocked(paperApi.getAutonomousScan).mockResolvedValue({
+      scan: {
+        scan_id: "scan-live",
+        scan_timestamp: "2026-09-07T00:00:00Z",
+        timeframe: "1d",
+        universe_size: 3,
+        scanned_count: 3,
+        eligible_count: 0,
+        rejected_count: 3,
+        candidates: [],
+        rejections: [],
+        data_provider_source: "control_center.load_market_data",
+        // NB: ``signals`` is intentionally absent.
+      },
+      ranking: {
+        ranking_id: "rank-live",
+        ranking_timestamp: "2026-09-07T00:00:00Z",
+        candidates_evaluated: 0,
+        opportunities: [],
+        exclusions: [],
+        score_range: [0, 0],
+      },
+    } as any);
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+    expect(screen.getByText(/No signals found/i)).toBeDefined();
+  });
+
+  it("renders scan candidates table when Phase 8C-B shape includes candidates", async () => {
+    vi.mocked(paperApi.getAutonomousScan).mockResolvedValue({
+      scan: {
+        scan_id: "scan-c",
+        scan_timestamp: "2026-09-07T00:00:00Z",
+        timeframe: "1d",
+        universe_size: 3,
+        scanned_count: 3,
+        eligible_count: 1,
+        rejected_count: 2,
+        candidates: [
+          {
+            symbol: "NSE:SBIN",
+            strategy_id: "strat-1",
+            timeframe: "1d",
+            confidence: 0.92,
+            rank_score: 0.88,
+            signal_action: "BUY",
+            signal_timestamp: "2026-09-07T00:00:00Z",
+          },
+        ],
+        rejections: [],
+        data_provider_source: "control_center.load_market_data",
+      },
+      ranking: {
+        ranking_id: "rank-c",
+        opportunities: [],
+        exclusions: [],
+      },
+    } as any);
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("NSE:SBIN")).toBeDefined();
+    });
+    expect(screen.getByText("BUY")).toBeDefined();
+    expect(screen.getByText("92%")).toBeDefined();
+  });
+
+  it("does NOT crash when scan ranking.opportunities is undefined (older shim)", async () => {
+    vi.mocked(paperApi.getAutonomousScan).mockResolvedValue({
+      scan: {
+        scan_id: "scan-x",
+        scan_timestamp: "2026-09-07T00:00:00Z",
+        candidates: [
+          {
+            symbol: "NSE:SBIN",
+            strategy_id: "strat-1",
+            timeframe: "1d",
+            confidence: 0.7,
+            rank_score: 0.7,
+            signal_action: "SELL",
+            signal_timestamp: "2026-09-07T00:00:00Z",
+          },
+        ],
+      },
+      ranking: {
+        ranking_id: "rank-x",
+        // older shim: no opportunities array
+      },
+    } as any);
+
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("NSE:SBIN")).toBeDefined();
+    });
+  });
+
+  it("renders scan error state without crashing when /autonomous/scan 500s", async () => {
+    vi.mocked(paperApi.getAutonomousScan).mockRejectedValue(
+      new Error("500 internal")
+    );
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+    expect(screen.getByText(/Scan unavailable/i)).toBeDefined();
+  });
+
+  it("renders deployments error state without crashing when /autonomous/deployments 500s", async () => {
+    vi.mocked(paperApi.getAutonomousDeployments).mockRejectedValue(
+      new Error("500 internal — paper_deployments.options_enabled missing")
+    );
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+    expect(screen.getByText(/Deployments unavailable/i)).toBeDefined();
+  });
+
+  it("does NOT crash when bot payload is missing deploy counts / status fields", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({
+      bot: {
+        bot_id: "b",
+        name: "Bare Bot",
+        state: "running",
+        // intentionally omitting deployment_count, event_count, uptime_seconds,
+        // trading_mode, source, allowed_*, max_*, safety
+      } as any,
+    });
+
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+    expect(screen.getByText("Bare Bot")).toBeDefined();
+  });
+
+  it("does NOT crash when decisions response has empty/missing decisions array", async () => {
+    vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({
+      // No `decisions` field at all.
+      result_id: "rid",
+      decisions: [],
+    } as any);
+
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+    expect(screen.getByText("No decisions")).toBeDefined();
+  });
+
+  it("does NOT crash when events array is null", async () => {
+    vi.mocked(paperApi.getAutonomousEvents).mockResolvedValue({
+      events: null,
+      count: 0,
+      schema_version: 1,
+    } as any);
+
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+    expect(screen.getByText(/0 recent events/i)).toBeDefined();
+  });
+});

@@ -543,12 +543,29 @@ export interface AutonomousSignal {
 
 export interface AutonomousScan {
   scan_id: string
-  timestamp: string
-  signals: AutonomousSignal[]
-  scan_metadata: Record<string, unknown>
-  total_symbols: number
-  total_signals: number
-  elapsed_ms: number
+  scan_timestamp?: string
+  timestamp?: string
+  timeframe?: string
+  enabled?: boolean
+  universe_size?: number
+  scanned_count?: number
+  eligible_count?: number
+  rejected_count?: number
+  skipped_count?: number
+  started_at?: string
+  completed_at?: string
+  config_snapshot?: Record<string, unknown>
+  // The live backend returns `candidates` (Phase 8C-B). The page is also
+  // tolerant of the older `signals` field if present.
+  candidates: AutonomousCandidateSignal[]
+  signals?: AutonomousSignal[]
+  rejections?: unknown[]
+  data_provider_source?: string
+  // Legacy fields the older scanner returned.
+  scan_metadata?: Record<string, unknown>
+  total_symbols?: number
+  total_signals?: number
+  elapsed_ms?: number
 }
 
 export interface AutonomousCandidateSignal {
@@ -562,16 +579,27 @@ export interface AutonomousCandidateSignal {
 }
 
 export interface AutonomousRanking {
-  candidates: AutonomousCandidateSignal[]
   ranking_id: string
-  elapsed_ms: number
-  timestamp: string
+  scan_id?: string
+  ranking_timestamp?: string
+  timestamp?: string
+  elapsed_ms?: number
+  ranking_version?: string
+  candidates_evaluated?: number
+  // Live backend returns `opportunities` (Phase 8C-B). Older shim used
+  // `candidates`. The page reads both via a helper.
+  opportunities: AutonomousCandidateSignal[]
+  candidates?: AutonomousCandidateSignal[]
+  exclusions?: unknown[]
+  config_snapshot?: Record<string, unknown>
+  score_range?: [number, number]
+  data_provider_source?: string
 }
 
 export interface AutonomousScanResponse {
   scan: AutonomousScan
   ranking: AutonomousRanking | null
-  schema_version: number
+  schema_version?: number
 }
 
 export interface TradingDecision {

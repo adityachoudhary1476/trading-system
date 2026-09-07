@@ -30,7 +30,7 @@ type SectionState<T> =
 
 export default function AutonomousCenter() {
   const [botState, setBotState] = useState<SectionState<AutonomousBot>>({ status: "idle" });
-  const [scan, setScan] = useState<AutonomousScan | null>(null);
+  const [scan, setScan] = useState<SectionState<AutonomousScan>>({ status: "idle" });
   const [decisions, setDecisions] = useState<TradingDecision[]>([]);
   const [events, setEvents] = useState<AutonomousEventsResponse["events"]>([]);
   const [deployments, setDeployments] = useState<
@@ -53,11 +53,13 @@ export default function AutonomousCenter() {
   };
 
   const fetchScan = async () => {
+    setScan({ status: "loading" });
     try {
       const res: AutonomousScanResponse = await paperApi.getAutonomousScan();
-      setScan(res.scan);
+      setScan({ status: "ok", data: res.scan });
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to load scan");
+      const message = err instanceof Error ? err.message : "Failed to load scan";
+      setScan({ status: "error", message });
     }
   };
 
@@ -169,6 +171,33 @@ export default function AutonomousCenter() {
     }
     return undefined;
   };
+
+  // Safe accessor for scan candidates — the live backend returns
+  // ``scan.candidates`` (Phase 8C-B); an older shim returned ``scan.signals``.
+  // Both shapes are tolerated here so the page never crashes on shape drift.
+  function getScanCandidates(s: AutonomousScan | undefined | null) {
+    if (!s) return [];
+    const c = (s as { candidates?: unknown }).candidates;
+    if (Array.isArray(c)) return c as AutonomousScan["candidates"];
+    const sig = (s as { signals?: unknown }).signals;
+    if (Array.isArray(sig)) return sig as AutonomousScan["candidates"];
+    return [];
+  }
+  function getScanTotalSymbols(s: AutonomousScan | undefined | null): number {
+    if (!s) return 0;
+    if (typeof s.universe_size === "number") return s.universe_size;
+    if (typeof s.total_symbols === "number") return s.total_symbols;
+    return 0;
+  }
+  function getScanTotalSignals(
+    s: AutonomousScan | undefined | null,
+    candidatesLen: number
+  ): number {
+    if (!s) return candidatesLen;
+    if (typeof s.eligible_count === "number") return s.eligible_count;
+    if (typeof s.total_signals === "number") return s.total_signals;
+    return candidatesLen;
+  }
 
   if (loading && botState.status !== "ok") {
     return (
@@ -352,6 +381,7 @@ export default function AutonomousCenter() {
         </Panel>
       )}
       {deployments.status === "ok" &&
+        Array.isArray(deployments.data) &&
         deployments.data.length > 0 && (
           <Panel title="Active Deployments">
             <table className="data dense">
@@ -382,7 +412,7 @@ export default function AutonomousCenter() {
             </table>
           </Panel>
         )}
-      {deployments.status === "ok" && deployments.data.length === 0 && (
+      {deployments.status === "ok" && Array.isArray(deployments.data) && deployments.data.length === 0 && (
         <Panel title="Active Deployments">
           <EmptyState
             title="No active deployments"
@@ -399,47 +429,74 @@ export default function AutonomousCenter() {
         </p>
       </Panel>
 
-      {/* Current Scan Results */}
-      {scan && scan.signals.length > 0 && (
+      {/* Current Scan Results — never crashes if scan fails or returns partial data */}
+      {scan.status === "loading" && (
         <Panel title="Current Market Scan">
-          <p className="muted" style={{ marginBottom: 8 }}>
-            Scan ID: <span className="mono">{scan.scan_id}</span> •{" "}
-            {scan.total_signals} signals across {scan.total_symbols} symbols
-          </p>
-          <div style={{ overflowX: "auto" }}>
-            <table className="data dense">
-              <thead>
-                <tr>
-                  <th>Symbol</th>
-                  <th>Timeframe</th>
-                  <th>Action</th>
-                  <th>Strategy</th>
-                  <th>Confidence</th>
-                  <th>Timestamp</th>
-                </tr>
-              </thead>
-              <tbody>
-                {scan.signals.map((signal, i) => (
-                  <tr key={`${signal.symbol}-${signal.strategy_id}-${i}`}>
-                    <td>{signal.symbol}</td>
-                    <td>{signal.timeframe}</td>
-                    <td>{getActionBadge(signal.action)}</td>
-                    <td className="mono">{signal.strategy_id}</td>
-                    <td>{getConfidenceBadge(signal.confidence)}</td>
-                    <td className="td-muted">{signal.signal_timestamp}</td>
+          <Loading label="Loading scan…" />
+        </Panel>
+      )}
+      {scan.status === "error" && (
+        <Panel title="Current Market Scan">
+          <EmptyState
+            title="Scan unavailable"
+            hint={`Could not run market scan: ${scan.message}. The autonomous bot remains operational; this section will refresh automatically.`}
+          />
+          <Button variant="secondary" size="sm" onClick={fetchScan}>
+            Retry
+          </Button>
+        </Panel>
+      )}
+      {scan.status === "ok" && (() => {
+        const candidates = getScanCandidates(scan.data);
+        const totalSymbols = getScanTotalSymbols(scan.data);
+        const totalSignals = getScanTotalSignals(scan.data, candidates.length);
+        if (candidates.length === 0) {
+          return (
+            <Panel title="Current Market Scan">
+              <EmptyState
+                title="No signals found"
+                hint="The market scan completed but found no qualifying signals."
+              />
+            </Panel>
+          );
+        }
+        return (
+          <Panel title="Current Market Scan">
+            <p className="muted" style={{ marginBottom: 8 }}>
+              Scan ID: <span className="mono">{scan.data.scan_id}</span> •{" "}
+              {totalSignals} signals across {totalSymbols} symbols
+            </p>
+            <div style={{ overflowX: "auto" }}>
+              <table className="data dense">
+                <thead>
+                  <tr>
+                    <th>Symbol</th>
+                    <th>Timeframe</th>
+                    <th>Action</th>
+                    <th>Strategy</th>
+                    <th>Confidence</th>
+                    <th>Timestamp</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </Panel>
-      )}
-
-      {scan && scan.signals.length === 0 && (
-        <Panel title="Current Market Scan">
-          <EmptyState title="No signals found" hint="The market scan completed but found no qualifying signals." />
-        </Panel>
-      )}
+                </thead>
+                <tbody>
+                  {candidates.map((signal: any, i: number) => (
+                    <tr key={`${signal.symbol}-${signal.strategy_id}-${i}`}>
+                      <td>{signal.symbol}</td>
+                      <td>{signal.timeframe}</td>
+                      <td>
+                        {getActionBadge(signal.signal_action ?? signal.action ?? "HOLD")}
+                      </td>
+                      <td className="mono">{signal.strategy_id}</td>
+                      <td>{getConfidenceBadge(signal.confidence ?? 0)}</td>
+                      <td className="td-muted">{signal.signal_timestamp ?? "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </Panel>
+        );
+      })()}
 
       {/* Generated Decisions — only fetched on user action */}
       <Panel
@@ -455,94 +512,113 @@ export default function AutonomousCenter() {
           </Button>
         }
       >
-        {decisions.length > 0 ? (
-          <>
-            <p className="muted" style={{ marginBottom: 8 }}>
-              {decisions.filter((d) => d.is_valid).length} valid / {decisions.length} total decisions
-            </p>
-            <div style={{ overflowX: "auto" }}>
-              <table className="data dense">
-                <thead>
-                  <tr>
-                    <th>Symbol</th>
-                    <th>Strategy</th>
-                    <th>Timeframe</th>
-                    <th>Action</th>
-                    <th>Confidence</th>
-                    <th>Valid</th>
-                    <th>Status</th>
-                    <th>Exclusion</th>
-                    <th>Timestamp</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {decisions.map((decision) => (
-                    <tr key={decision.decision_id}>
-                      <td>{decision.symbol}</td>
-                      <td className="mono">{decision.strategy_id}</td>
-                      <td>{decision.timeframe}</td>
-                      <td>{getActionBadge(decision.action)}</td>
-                      <td>{getConfidenceBadge(decision.confidence)}</td>
-                      <td>
-                        <Badge kind={decision.is_valid ? "healthy" : "disconnected"}>
-                          {decision.is_valid ? "Yes" : "No"}
-                        </Badge>
-                      </td>
-                      <td>{decision.status}</td>
-                      <td className="td-muted">{decision.exclusion_reason || "-"}</td>
-                      <td className="td-muted">{decision.decision_timestamp}</td>
+        {(() => {
+          const safeDecisions = Array.isArray(decisions) ? decisions : [];
+          if (safeDecisions.length === 0) {
+            return (
+              <EmptyState
+                title="No decisions"
+                hint="No trading decisions have been generated yet. Start the bot to begin."
+              />
+            );
+          }
+          const validCount = safeDecisions.filter(
+            (d) => (d as { is_valid?: boolean }).is_valid === true
+          ).length;
+          return (
+            <>
+              <p className="muted" style={{ marginBottom: 8 }}>
+                {validCount} valid / {safeDecisions.length} total decisions
+              </p>
+              <div style={{ overflowX: "auto" }}>
+                <table className="data dense">
+                  <thead>
+                    <tr>
+                      <th>Symbol</th>
+                      <th>Strategy</th>
+                      <th>Timeframe</th>
+                      <th>Action</th>
+                      <th>Confidence</th>
+                      <th>Valid</th>
+                      <th>Status</th>
+                      <th>Exclusion</th>
+                      <th>Timestamp</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        ) : (
-          <EmptyState
-            title="No decisions"
-            hint="No trading decisions have been generated yet. Start the bot to begin."
-          />
-        )}
+                  </thead>
+                  <tbody>
+                    {safeDecisions.map((decision) => (
+                      <tr key={(decision as { decision_id?: string }).decision_id ?? Math.random()}>
+                        <td>{(decision as { symbol?: string }).symbol ?? "—"}</td>
+                        <td className="mono">{(decision as { strategy_id?: string }).strategy_id ?? "—"}</td>
+                        <td>{(decision as { timeframe?: string }).timeframe ?? "—"}</td>
+                        <td>{getActionBadge((decision as { action?: string }).action ?? "HOLD")}</td>
+                        <td>{getConfidenceBadge((decision as { confidence?: number }).confidence ?? 0)}</td>
+                        <td>
+                          <Badge kind={(decision as { is_valid?: boolean }).is_valid ? "healthy" : "disconnected"}>
+                            {(decision as { is_valid?: boolean }).is_valid ? "Yes" : "No"}
+                          </Badge>
+                        </td>
+                        <td>{(decision as { status?: string }).status ?? "—"}</td>
+                        <td className="td-muted">{(decision as { exclusion_reason?: string }).exclusion_reason || "-"}</td>
+                        <td className="td-muted">{(decision as { decision_timestamp?: string }).decision_timestamp ?? "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          );
+        })()}
       </Panel>
 
       {/* Event Log */}
       <Panel
         title="Event Log"
-        actions={<span className="muted">{events.length} recent events</span>}
+        actions={
+          <span className="muted">
+            {Array.isArray(events) ? events.length : 0} recent events
+          </span>
+        }
       >
-        {events.length > 0 ? (
-          <div
-            style={{
-              display: "flex",
-              flexDirection: "column",
-              maxHeight: 384,
-              overflowY: "auto",
-            }}
-          >
-            {events.map((event) => (
-              <div
-                key={event.event_id}
-                style={{
-                  display: "flex",
-                  gap: 10,
-                  alignItems: "flex-start",
-                  padding: "8px 0",
-                  borderBottom: "1px solid var(--panel-border-soft)",
-                }}
-              >
-                <Pill tone={eventPillTone(event.event_type)}>{event.event_type}</Pill>
-                <div style={{ flex: 1 }}>
-                  <p style={{ margin: 0 }}>{event.message}</p>
-                  <p className="td-muted" style={{ fontSize: 11, marginTop: 2 }}>
-                    {event.timestamp} • Symbol: {event.symbol || "—"}
-                  </p>
+        {(() => {
+          const safeEvents = Array.isArray(events) ? events : [];
+          if (safeEvents.length === 0) {
+            return <EmptyState title="No events" hint="The event log is empty." />;
+          }
+          return (
+            <div
+              style={{
+                display: "flex",
+                flexDirection: "column",
+                maxHeight: 384,
+                overflowY: "auto",
+              }}
+            >
+              {safeEvents.map((event) => (
+                <div
+                  key={(event as { event_id?: string }).event_id ?? Math.random()}
+                  style={{
+                    display: "flex",
+                    gap: 10,
+                    alignItems: "flex-start",
+                    padding: "8px 0",
+                    borderBottom: "1px solid var(--panel-border-soft)",
+                  }}
+                >
+                  <Pill tone={eventPillTone((event as { event_type?: string }).event_type ?? "")}>
+                    {(event as { event_type?: string }).event_type ?? "unknown"}
+                  </Pill>
+                  <div style={{ flex: 1 }}>
+                    <p style={{ margin: 0 }}>{(event as { message?: string }).message ?? ""}</p>
+                    <p className="td-muted" style={{ fontSize: 11, marginTop: 2 }}>
+                      {(event as { timestamp?: string }).timestamp ?? "—"} • Symbol: {(event as { symbol?: string | null }).symbol || "—"}
+                    </p>
+                  </div>
                 </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <EmptyState title="No events" hint="The event log is empty." />
-        )}
+              ))}
+            </div>
+          );
+        })()}
       </Panel>
     </div>
   );

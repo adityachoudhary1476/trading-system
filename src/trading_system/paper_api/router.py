@@ -1116,12 +1116,41 @@ class PaperAPIRouter:
     def _route_autonomous_deployments(self, ctx: RequestContext) -> ResponseEnvelope:
         """GET /autonomous/deployments — list autonomous deployments."""
         controller = self._require_controller()
-        deps = controller.list_autonomous_deployments()
+        try:
+            deps = controller.list_autonomous_deployments()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception(
+                "list_autonomous_deployments failed in /autonomous/deployments"
+            )
+            return ResponseEnvelope(
+                status=200,
+                body={
+                    "deployments": [],
+                    "count": 0,
+                    "warning": f"autonomous deployment query failed: {exc.__class__.__name__}",
+                    "schema_version": 1,
+                },
+            )
+        summaries: list[DashboardDeploymentSummary] = []
+        skipped: list[str] = []
+        for d in deps:
+            dep_id = self._safe_deployment_id(d)
+            try:
+                summaries.append(build_deployment_summary(d))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "skipping un-serializable autonomous deployment %s: %s",
+                    dep_id,
+                    exc,
+                )
+                skipped.append(dep_id)
         body = AutonomousDeploymentsResponse(
-            deployments=[build_deployment_summary(d) for d in deps],
-            count=len(deps),
+            deployments=summaries,
+            count=len(summaries),
         )
-        return ResponseEnvelope(status=200, body=_safe_dump(body))
+        dumped = _safe_dump(body)
+        dumped["skipped"] = skipped
+        return ResponseEnvelope(status=200, body=dumped)
 
     def _route_autonomous_stop_deployment(self, ctx: RequestContext) -> ResponseEnvelope:
         """POST /autonomous/deployments/{id}/stop — stop an autonomous deployment."""

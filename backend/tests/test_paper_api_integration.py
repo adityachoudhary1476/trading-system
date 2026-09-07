@@ -608,3 +608,32 @@ class TestDeploymentsPerRowSafety:
         # When nothing was skipped the key may be absent or an empty list —
         # both are acceptable contract forms.
         assert body.get("skipped", []) == []
+
+    def test_autonomous_deployments_returns_safe_degraded_on_db_error(
+        self, isolated_client, monkeypatch
+    ):
+        """``/api/paper/autonomous/deployments`` must never 500 because of a
+        DB schema mismatch or transient query failure. The route must return
+        200 with an empty list plus a ``warning`` field so the frontend can
+        render a degraded state.
+        """
+        api_router = _get_api_router()
+        controller = getattr(paper_api, "_controller", None)
+        if controller is None:
+            pytest.skip("AutonomousController not wired in this environment")
+
+        def boom():
+            raise RuntimeError("simulated DB schema mismatch")
+
+        # ``AutonomousController`` is a Pydantic model; we can't replace its
+        # methods directly, so patch the underlying ``list_deployments``
+        # call on the control center instead — that's the actual DB read.
+        monkeypatch.setattr(controller.control_center, "list_deployments", boom)
+
+        resp = isolated_client.get("/api/paper/autonomous/deployments")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body.get("deployments") == []
+        assert body.get("count") == 0
+        assert "warning" in body
+        assert "RuntimeError" in body["warning"]
