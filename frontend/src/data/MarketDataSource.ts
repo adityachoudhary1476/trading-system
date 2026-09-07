@@ -283,8 +283,8 @@ export class ApiMarketDataSource implements MarketDataSource {
     return this.fetchJson<PipelineStage[]>("/api/market/pipeline");
   }
 
-  async getMarketStatus(): Promise<MarketStatus> {
-    return this.fetchJson<MarketStatus>("/api/upstox/status");
+   async getMarketStatus(): Promise<MarketStatus> {
+    return this.fetchJson<MarketStatus>("/api/market/status");
   }
 }
 

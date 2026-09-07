@@ -90,7 +90,7 @@ from .deployment import (
     PaperDeploymentConfig,
     PaperDeploymentRecord,
     PaperDeploymentStatus,
-    _rec_to_deployment,
+    rec_to_deployment,
 )
 from .events import PaperOperationEvent, PaperOperationEventType
 from .gate import (
@@ -263,12 +263,12 @@ class PaperTradingControlCenter:
             if status is not None:
                 q = q.filter(PaperDeploymentRecord.status == status)
             recs = q.order_by(PaperDeploymentRecord.created_at.asc()).all()
-            return [_rec_to_deployment(r) for r in recs]
+            return [rec_to_deployment(r) for r in recs]
 
     def get_deployment(self, deployment_id: str) -> Optional[PaperDeployment]:
         with self.registry.store._Session() as s:
             rec = s.get(PaperDeploymentRecord, deployment_id)
-            return _rec_to_deployment(rec) if rec else None
+            return rec_to_deployment(rec) if rec else None
 
     def has_deployment(self, deployment_id: str) -> bool:
         return self.get_deployment(deployment_id) is not None
@@ -429,6 +429,34 @@ class PaperTradingControlCenter:
         Returns ``None`` when no live runner is attached. Read-only.
         """
         return self._runners.get(session_id)
+
+    def update_deployment_market_price(
+        self,
+        deployment_id: str,
+        symbol: str,
+        price: float,
+    ) -> bool:
+        """Set the current market price for a symbol on a deployment's PaperBroker.
+
+        Used by Phase 8C to feed the exact option premium into the paper broker
+        so that fills and mark-to-market use the option's LTP, not the
+        underlying spot.
+
+        Returns True if a live broker was found and updated, False otherwise.
+        """
+        if price is None or price <= 0:
+            return False
+        sid = self.find_session_for_deployment(deployment_id)
+        if sid is None:
+            return False
+        runner = self.get_runner(sid)
+        if runner is None:
+            return False
+        try:
+            runner.broker.update_market_price(symbol, price)
+            return True
+        except Exception:
+            return False
 
     def list_sessions(
         self,
@@ -951,26 +979,30 @@ class PaperTradingControlCenter:
             if persisted is not None and persisted.result_json:
                 import json
                 cached = json.loads(persisted.result_json)
-                return OrderResult(
-                    order_id=cached["order_id"],
-                    client_order_id=cached.get("client_order_id"),
-                    symbol=cached["symbol"],
-                    side=cached["side"],
-                    quantity=cached["quantity"],
-                    order_type=cached["order_type"],
-                    limit_price=cached.get("limit_price"),
-                    status=cached["status"],
-                    filled_quantity=cached["filled_quantity"],
-                    avg_fill_price=cached["avg_fill_price"],
-                    fills=cached["fills"],
-                    cash_after=cached.get("cash_after"),
-                    equity_after=cached.get("equity_after"),
-                    realized_pnl_after=cached.get("realized_pnl_after"),
-                    unrealized_pnl_after=cached.get("unrealized_pnl_after"),
-                    position_qty_after=cached.get("position_qty_after"),
-                    reject_reason=cached.get("reject_reason", ""),
-                    is_idempotent_replay=True,
-                )
+            return OrderResult(
+                order_id=cached["order_id"],
+                client_order_id=cached.get("client_order_id"),
+                symbol=cached["symbol"],
+                side=cached["side"],
+                quantity=cached["quantity"],
+                order_type=cached["order_type"],
+                limit_price=cached.get("limit_price"),
+                status=cached["status"],
+                filled_quantity=cached["filled_quantity"],
+                avg_fill_price=cached["avg_fill_price"],
+                fills=cached["fills"],
+                cash_after=cached.get("cash_after"),
+                equity_after=cached.get("equity_after"),
+                realized_pnl_after=cached.get("realized_pnl_after"),
+                unrealized_pnl_after=cached.get("unrealized_pnl_after"),
+                position_qty_after=cached.get("position_qty_after"),
+                reject_reason=cached.get("reject_reason", ""),
+                is_idempotent_replay=True,
+                options_contract_id=cached.get("options_contract_id"),
+                strike=cached.get("strike"),
+                expiry=cached.get("expiry"),
+                option_type=cached.get("option_type"),
+            )
 
         # --- 6. Validate inputs against broker rules ---
         broker = runner.broker
@@ -983,6 +1015,10 @@ class PaperTradingControlCenter:
                 order_type=intent.order_type,
                 limit_price=intent.limit_price,
                 current_price=intent.current_price,
+                options_contract_id=intent.options_contract_id,
+                strike=intent.strike,
+                expiry=intent.expiry,
+                option_type=intent.option_type,
             )
         except BrokerError as exc:
             result = OrderResult(
@@ -1003,6 +1039,10 @@ class PaperTradingControlCenter:
                 unrealized_pnl_after=None,
                 position_qty_after=None,
                 reject_reason=str(exc),
+                options_contract_id=intent.options_contract_id,
+                strike=intent.strike,
+                expiry=intent.expiry,
+                option_type=intent.option_type,
             )
             self._emit_external_event(
                 runner, "order_intent_rejected",
@@ -1046,6 +1086,10 @@ class PaperTradingControlCenter:
             realized_pnl_after=float(account.realized_pnl),
             unrealized_pnl_after=float(account.unrealized_pnl),
             position_qty_after=(pos.qty if pos is not None else 0.0),
+            options_contract_id=order.options_contract_id,
+            strike=order.strike,
+            expiry=order.expiry,
+            option_type=order.option_type,
         )
 
         # --- 8. Event log ---
@@ -1084,6 +1128,11 @@ class PaperTradingControlCenter:
             "unrealized_pnl_after": result.unrealized_pnl_after,
             "position_qty_after": result.position_qty_after,
             "reject_reason": result.reject_reason,
+            "is_idempotent_replay": result.is_idempotent_replay,
+            "options_contract_id": result.options_contract_id,
+            "strike": result.strike,
+            "expiry": result.expiry,
+            "option_type": result.option_type,
         }
         self.session_store.record_order(
             session_id=session_id,

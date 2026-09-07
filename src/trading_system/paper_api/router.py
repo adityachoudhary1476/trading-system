@@ -16,9 +16,12 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+if TYPE_CHECKING:
+    from ..autonomous.controller import AutonomousController
 
 from ..paper.control import PaperTradingControlCenter, ControlCenterError
 from ..paper.dashboard import (
@@ -40,6 +43,12 @@ from .errors import (
 )
 from .models import (
     AccountResponse,
+    AutonomousBotResponse,
+    AutonomousDecideResponse,
+    AutonomousDeploymentsResponse,
+    AutonomousEventsResponse,
+    AutonomousLifecycleResponse,
+    AutonomousScanResponse,
     CheckpointRequest,
     CircuitBreakerResponse,
     DeploymentCreateRequest,
@@ -153,10 +162,25 @@ def _bounded_int(
 class PaperAPIRouter:
     """Pure routing layer over :class:`PaperTradingControlCenter`."""
 
-    def __init__(self, center: PaperTradingControlCenter) -> None:
+    def __init__(
+        self,
+        center: PaperTradingControlCenter,
+        controller: Optional["AutonomousController"] = None,
+    ) -> None:
         self.center = center
+        self._controller: Optional["AutonomousController"] = controller
         self._routes: list[tuple[re.Pattern, frozenset[str], RouteHandler]] = []
         self._register_routes()
+
+    def _require_controller(self) -> "AutonomousController":
+        """Return the autonomous controller or raise if not configured."""
+        if self._controller is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="autonomous controller not configured",
+                status=501,
+            )
+        return self._controller
 
     def _register_routes(self) -> None:
         self._add(r"^/health$", frozenset({"GET"}), self._route_health)
@@ -201,6 +225,17 @@ class PaperAPIRouter:
                   frozenset({"POST"}), self._route_restore)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/orders$",
                   frozenset({"POST"}), self._route_submit_order)
+
+        # Phase 6 — Autonomous Trading Operations Center
+        self._add(r"^/autonomous/bot$", frozenset({"GET"}), self._route_autonomous_bot)
+        self._add(r"^/autonomous/bot/(?P<action>start|pause|resume|stop)$",
+                  frozenset({"POST"}), self._route_autonomous_lifecycle)
+        self._add(r"^/autonomous/scan$", frozenset({"GET"}), self._route_autonomous_scan)
+        self._add(r"^/autonomous/decide$", frozenset({"POST"}), self._route_autonomous_decide)
+        self._add(r"^/autonomous/deployments$", frozenset({"GET"}), self._route_autonomous_deployments)
+        self._add(r"^/autonomous/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/stop$",
+                  frozenset({"POST"}), self._route_autonomous_stop_deployment)
+        self._add(r"^/autonomous/events$", frozenset({"GET"}), self._route_autonomous_events)
 
         # Phase 22 - Adaptive Multi-Strategy Market Intelligence
         self._add(r"^/regime$", frozenset({"GET"}), self._route_regime)
@@ -719,6 +754,10 @@ class PaperAPIRouter:
             limit_price=req.limit_price,
             client_order_id=req.client_order_id,
             current_price=req.current_price,
+            options_contract_id=req.options_contract_id,
+            strike=req.strike,
+            expiry=req.expiry,
+            option_type=req.option_type,
         )
         try:
             result = self.center.submit_order_intent(session_id=sid, intent=intent)
@@ -761,6 +800,10 @@ class PaperAPIRouter:
             position_qty_after=result.position_qty_after,
             reject_reason=result.reject_reason,
             idempotent=result.is_idempotent_replay,
+            options_contract_id=result.options_contract_id,
+            strike=result.strike,
+            expiry=result.expiry,
+            option_type=result.option_type,
         )
         # A rejected broker validation is reported as a 400; otherwise 201.
         status_code = 201
@@ -959,3 +1002,118 @@ class PaperAPIRouter:
             ],
         }
         return ResponseEnvelope(status=200, body=body)
+
+    # ------------------------------------------------------------------ #
+    # Phase 6 — Autonomous Trading Operations Center routes
+    # ------------------------------------------------------------------ #
+
+    def _route_autonomous_bot(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /autonomous/bot — inspect the autonomous bot state."""
+        controller = self._require_controller()
+        inspect_dict = controller.inspect()
+        body = AutonomousBotResponse(bot=inspect_dict)
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_autonomous_lifecycle(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /autonomous/bot/{action} — manage bot lifecycle."""
+        controller = self._require_controller()
+        action = ctx.params["action"]
+        dispatch = {
+            "start": controller.start_bot,
+            "pause": controller.pause_bot,
+            "resume": controller.resume_bot,
+            "stop": controller.stop_bot,
+        }
+        fn = dispatch[action]
+        success, message = fn()
+        body = AutonomousLifecycleResponse(
+            success=success,
+            message=message,
+            bot=controller.inspect(),
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_autonomous_scan(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /autonomous/scan — run a market scan and rank candidates."""
+        controller = self._require_controller()
+        try:
+            scan = controller.scan_market()
+            ranking = controller.rank_candidates(scan)
+        except Exception as exc:  # noqa: BLE001
+            return self._error_response(
+                APIErrorException(
+                    code=APIErrorCode.INTERNAL_ERROR,
+                    message=f"autonomous scan failed: {exc}",
+                    status=500,
+                )
+            )
+        scan_dict = json.loads(
+            scan.model_dump_json(), parse_constant=_strict_constant
+        )
+        ranking_dict = (
+            json.loads(ranking.model_dump_json(), parse_constant=_strict_constant)
+            if ranking is not None
+            else None
+        )
+        body = AutonomousScanResponse(scan=scan_dict, ranking=ranking_dict)
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_autonomous_decide(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /autonomous/decide — produce structured trading decisions."""
+        controller = self._require_controller()
+        scan = controller.scan_market()
+        ranking = controller.rank_candidates(scan)
+        compatibility = controller.evaluate_strategy_compatibility(ranking)
+        result = controller.generate_strategy_decisions(compatibility)
+        body = AutonomousDecideResponse(
+            result_id=result.result_id,
+            scan_id=result.scan_id,
+            ranking_id=result.ranking_id,
+            evaluated_at=result.evaluated_at,
+            decisions=[d.to_dict() for d in result.decisions],
+            valid_count=result.valid_count,
+            rejected_count=result.rejected_count,
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_autonomous_deployments(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /autonomous/deployments — list autonomous deployments."""
+        controller = self._require_controller()
+        deps = controller.list_autonomous_deployments()
+        body = AutonomousDeploymentsResponse(
+            deployments=[build_deployment_summary(d) for d in deps],
+            count=len(deps),
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_autonomous_stop_deployment(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /autonomous/deployments/{id}/stop — stop an autonomous deployment."""
+        controller = self._require_controller()
+        deployment_id = ctx.params["deployment_id"]
+        result, message = controller.stop_autonomous_deployment(deployment_id)
+        status = result.value
+        return ResponseEnvelope(
+            status=200,
+            body=json.loads(
+                json.dumps({"status": status, "message": message}),
+                parse_constant=_strict_constant,
+            ),
+        )
+
+    def _route_autonomous_events(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /autonomous/events — list autonomous events."""
+        controller = self._require_controller()
+        events = controller.event_log.events
+        event_type = _single(ctx.query, "event_type")
+        if event_type:
+            events = [e for e in events if e.event_type.value == event_type]
+        try:
+            limit = _bounded_int(ctx.query, "limit", default=100, lo=1, hi=1000)
+        except APIErrorException as exc:
+            return self._error_response(exc)
+        events = events[:limit]
+        body = AutonomousEventsResponse(
+            events=[e.model_dump() for e in events],
+            count=len(events),
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))

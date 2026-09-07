@@ -38,6 +38,8 @@ class DeploymentCreationResult(str, Enum):
     DUPLICATE_DEPLOYMENT = "duplicate_deployment"
     DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
     FAILURE = "failure"
+    HALTED = "halted"
+    SAFETY_BLOCKED = "safety_blocked"
 
 
 class AutonomousDeploymentCoordinator:

@@ -12,6 +12,8 @@ No LLM-generated prose is used in event messages.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import Enum
 from typing import Any, Optional
 from pydantic import BaseModel
@@ -24,6 +26,7 @@ class AutonomousEventType(str, Enum):
     BOT_STOPPED = "bot_stopped"
     BOT_PAUSED = "bot_paused"
     BOT_RESUMED = "bot_resumed"
+    BOT_HALTED = "bot_halted"
     BOT_ERROR = "bot_error"
     SCAN_STARTED = "scan_started"
     SCAN_COMPLETED = "scan_completed"
@@ -48,9 +51,6 @@ def make_autonomous_event_id(
     Same pattern as the existing PaperOperationEvent.make_event_id in
     src/trading_system/paper/events.py, so the identity system is consistent.
     """
-    import hashlib
-    import json
-
     payload = {
         "deployment_id": deployment_id,
         "sequence": int(sequence),
@@ -115,9 +115,6 @@ class AutonomousEventLog:
         payload = payload if payload is not None else {}
         seq = self._seq
         self._seq += 1
-
-        import hashlib
-        import json
 
         ev = AutonomousEvent(
             event_id=make_autonomous_event_id(

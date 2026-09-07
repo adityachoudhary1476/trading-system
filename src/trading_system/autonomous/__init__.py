@@ -89,6 +89,34 @@ from .decision import (
     StrategyDecisionEngine,
     TradingDecision,
 )
+from .options_contract import (
+    DEFAULT_OPTIONS_CONFIG,
+    InMemoryOptionsChainProvider,
+    OptionContractResolver,
+    OptionLeg,
+    OptionsChain,
+    OptionsChainProvider,
+    OptionsInstrument,
+    OptionsStructureBuilder,
+    OptionsStrategy,
+    OptionsTradeConfig,
+    OptionsTradePlan,
+    OptionQuote,
+    OptionStyle,
+    ResolveResult,
+    StrategyMapping,
+)
+from .safety import (
+    IdempotencyGuard,
+    KillSwitch,
+    KillSwitchReason,
+    KillSwitchState,
+    Phase7Config,
+    Phase7SafetyLayer,
+    SafetyCheck,
+    SafetyResult,
+    SafetyValidator,
+)
 
 __all__ = [
     # Configuration
@@ -155,4 +183,30 @@ __all__ = [
     "SelectedConfiguration",
     "StrategyDecisionEngine",
     "TradingDecision",
+    # Phase 7 — Safety, Kill-Switch, and Recovery Layer
+    "KillSwitch",
+    "KillSwitchState",
+    "KillSwitchReason",
+    "SafetyValidator",
+    "SafetyResult",
+    "SafetyCheck",
+    "IdempotencyGuard",
+    "Phase7Config",
+    "Phase7SafetyLayer",
+    # Phase 8 — Options Contract Selection Layer
+    "OptionStyle",
+    "OptionsStrategy",
+    "OptionQuote",
+    "OptionsChain",
+    "OptionsInstrument",
+    "OptionLeg",
+    "OptionsTradePlan",
+    "StrategyMapping",
+    "OptionsTradeConfig",
+    "OptionsChainProvider",
+    "InMemoryOptionsChainProvider",
+    "OptionContractResolver",
+    "ResolveResult",
+    "OptionsStructureBuilder",
+    "DEFAULT_OPTIONS_CONFIG",
 ]

@@ -57,6 +57,8 @@ export interface DashboardDeploymentSummary {
   updated_at: string;
   notes: string;
   schema_version: number;
+  options_enabled: boolean;
+  allowed_option_types: string[];
 }
 
 export interface DashboardStrategySummary {
@@ -98,6 +100,19 @@ export interface DashboardPositionsBlock {
     position_value: number;
   } | null;
   is_flat: boolean;
+  options_position: {
+    symbol: string;
+    quantity: number;
+    side: string;
+    avg_entry_price: number;
+    current_price: number;
+    realized_pnl: number;
+    options_contract_id: string | null;
+    strike: number | null;
+    expiry: string | null;
+    option_type: "CE" | "PE" | null;
+    contract_size: number;
+  } | null;
 }
 
 export interface DashboardPerformanceBlock {
@@ -339,6 +354,10 @@ export interface PaperOrderIntent {
   limit_price?: number;
   client_order_id?: string;
   current_price?: number;
+  options_contract_id?: string | null;
+  strike?: number | null;
+  expiry?: string | null;
+  option_type?: "CE" | "PE" | null;
 }
 
 export interface OrderIntentFill {
@@ -370,6 +389,10 @@ export interface OrderIntentResponse {
   reject_reason: string;
   idempotent: boolean;
   schema_version: number;
+  options_contract_id?: string | null;
+  strike?: number | null;
+  expiry?: string | null;
+  option_type?: "CE" | "PE" | null;
 }
 
 export interface ApiError {
@@ -448,4 +471,161 @@ export interface AllocationResponse {
   timestamp_ms: number;
   selected_strategies: AllocationStrategyWeight[];
   schema_version?: number;
+}
+
+// Phase 6 — Autonomous Trading Operations Center
+export type AutonomousBotStatus = "stopped" | "running" | "paused" | "error"
+
+export interface AutonomousBotConfigSummary {
+  bot_id: string
+  name: string
+  mode: string
+  trading_mode: string
+  enabled: boolean
+  source: string
+  constraints: {
+    allowed_symbols: string[]
+    allowed_timeframes: string[]
+    allowed_strategy_ids: string[]
+    max_simultaneous_positions: number
+  }
+}
+
+export interface AutonomousBot {
+  bot_id: string
+  name: string
+  status: AutonomousBotStatus
+  config: AutonomousBotConfigSummary
+  current_scan: string | null
+  current_ranking: string | null
+  current_decisions: string | null
+  deployments: AutonomousDeploymentSummary[]
+  deployment_count: number
+  policies: Record<string, unknown>
+  event_count: number
+  last_event_type: string | null
+  last_event_timestamp: string | null
+  uptime_seconds: number
+  started_at: string | null
+  stopped_at: string | null
+  is_ready: boolean
+  is_active: boolean
+}
+
+export interface AutonomousBotResponse {
+  bot: AutonomousBot
+  schema_version: number
+}
+
+export interface AutonomousLifecycleResponse {
+  success: boolean
+  message: string
+  bot: AutonomousBot
+  schema_version: number
+}
+
+export interface AutonomousSignal {
+  symbol: string
+  timeframe: string
+  action: string
+  confidence: number
+  strategy_id: string
+  signal_timestamp: string
+}
+
+export interface AutonomousScan {
+  scan_id: string
+  timestamp: string
+  signals: AutonomousSignal[]
+  scan_metadata: Record<string, unknown>
+  total_symbols: number
+  total_signals: number
+  elapsed_ms: number
+}
+
+export interface AutonomousCandidateSignal {
+  symbol: string
+  strategy_id: string
+  timeframe: string
+  confidence: number
+  rank_score: number
+  signal_action: string
+  signal_timestamp: string
+}
+
+export interface AutonomousRanking {
+  candidates: AutonomousCandidateSignal[]
+  ranking_id: string
+  elapsed_ms: number
+  timestamp: string
+}
+
+export interface AutonomousScanResponse {
+  scan: AutonomousScan
+  ranking: AutonomousRanking | null
+  schema_version: number
+}
+
+export interface TradingDecision {
+  decision_id: string
+  symbol: string
+  strategy_id: string
+  timeframe: string
+  action: "BUY" | "SELL" | "HOLD" | "SKIP"
+  confidence: number
+  is_valid: boolean
+  status: string
+  signal_action?: string
+  selected_strategy_id?: string
+  selected_timeframe?: string
+  evaluation_error?: string
+  exclusion_reason?: string
+  exclusion_detail?: string
+  decision_timestamp: string
+  signal_timestamp: string
+  bot_id?: string
+  scan_id?: string
+  ranking_id?: string
+  result_id?: string
+  policy_violations?: unknown[]
+  evidence?: Record<string, unknown>
+  constraints_eval?: Record<string, unknown>
+  signal: AutonomousSignal
+}
+
+export interface AutonomousDecideResponse {
+  result_id: string
+  scan_id: string | null
+  ranking_id: string | null
+  evaluated_at: string
+  decisions: TradingDecision[]
+  valid_count: number
+  rejected_count: number
+  schema_version: number
+}
+
+export interface AutonomousEvent {
+  event_id: string
+  bot_id: string
+  event_type: string
+  timestamp: string
+  deployment_id: string | null
+  symbol: string | null
+  timeframe: string | null
+  message: string
+  payload: Record<string, unknown>
+}
+
+export interface AutonomousEventsResponse {
+  events: AutonomousEvent[]
+  count: number
+  schema_version: number
+}
+
+export type AutonomousDeploymentSummary = DashboardDeploymentSummary
+
+export interface AutonomousDeploymentsResponse {
+  deployments: AutonomousDeploymentSummary[]
+  count: number
+  schema_version: number
 }

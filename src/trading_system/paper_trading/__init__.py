@@ -25,6 +25,13 @@ class Position:
     realized_pnl: float = 0.0
     current_price: float = 0.0
 
+    # --- Phase 8: Options contract metadata (optional) ---
+    options_contract_id: Optional[str] = None
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+    option_type: Optional[str] = None
+    contract_size: int = 1  # number of shares per option contract (default 1 for equities)
+
     # -- views ----------------------------------------------------------------
     @property
     def is_open(self) -> bool:
@@ -49,7 +56,7 @@ class Position:
         return (self.current_price - self.avg_entry_price) * self.qty
 
     def as_dict(self) -> dict:
-        return {
+        d = {
             "symbol": self.symbol,
             "qty": self.qty,
             "side": self.side,
@@ -59,6 +66,13 @@ class Position:
             "unrealized_pnl": round(self.unrealized_pnl, 2),
             "market_value": round(self.market_value, 2),
         }
+        if self.options_contract_id is not None:
+            d["options_contract_id"] = self.options_contract_id
+            d["strike"] = self.strike
+            d["expiry"] = self.expiry
+            d["option_type"] = self.option_type
+            d["contract_size"] = self.contract_size
+        return d
 
 
 @dataclass

@@ -1,6 +1,8 @@
 import { useEffect } from "react";
+import { lazy, Suspense } from "react";
 import { Routes, Route, useNavigate } from "react-router-dom";
 import { Header, Sidebar } from "@/components/layout/Sidebar";
+import { Loading } from "@/components/ui";
 import { DashboardPage } from "@/pages/Dashboard";
 import { MarketsPage } from "@/pages/Markets";
 import { SignalsPage } from "@/pages/Signals";
@@ -17,6 +19,8 @@ import { PaperEvents } from "@/pages/paper/PaperEvents";
 import { PaperRiskHealth } from "@/pages/paper/PaperRiskHealth";
 import { PaperReports } from "@/pages/paper/PaperReports";
 import { PaperResearch } from "@/pages/paper/PaperResearch";
+
+const AutonomousCenter = lazy(() => import("@/pages/paper/AutonomousCenter"));
 
 const KEYS: Record<string, string> = {
   "1": "/",
@@ -73,6 +77,14 @@ export function App() {
             <Route path="reports" element={<PaperReports />} />
             <Route path="reports/:deploymentId" element={<PaperReports />} />
             <Route path="research" element={<PaperResearch />} />
+            <Route
+              path="autonomous"
+              element={
+                <Suspense fallback={<Loading label="Loading autonomous console…" />}>
+                  <AutonomousCenter />
+                </Suspense>
+              }
+            />
           </Route>
           <Route path="*" element={<DashboardPage />} />
         </Routes>

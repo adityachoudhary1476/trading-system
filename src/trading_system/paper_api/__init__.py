@@ -28,6 +28,12 @@ from .checkpoint_policy import (
 )
 from .errors import APIError, APIErrorCode, APIErrorException
 from .models import (
+    AutonomousBotResponse,
+    AutonomousDecideResponse,
+    AutonomousDeploymentsResponse,
+    AutonomousEventsResponse,
+    AutonomousLifecycleResponse,
+    AutonomousScanResponse,
     CheckpointRequest,
     DeploymentListResponse,
     DeploymentResponse,
@@ -46,6 +52,12 @@ __all__ = [
     "APIError",
     "APIErrorCode",
     "APIErrorException",
+    "AutonomousBotResponse",
+    "AutonomousDecideResponse",
+    "AutonomousDeploymentsResponse",
+    "AutonomousEventsResponse",
+    "AutonomousLifecycleResponse",
+    "AutonomousScanResponse",
     "CheckpointDecision",
     "CheckpointPolicy",
     "CheckpointRequest",

@@ -1225,6 +1225,14 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
         EvidenceFreshnessConfig,
         EvidenceRequirement,
     )
+    from trading_system.autonomous.bot_config import (
+        AutonomousBotConfig,
+        BotMode,
+        TradingMode,
+        Source,
+        UserConstraints,
+    )
+    from trading_system.autonomous.controller import AutonomousController
 
     engine = create_engine(
         settings.storage.db_url,
@@ -1247,10 +1255,82 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
     )
     freshness = EvidenceFreshnessConfig(max_age_days=180)
 
+    # --- Market data provider (read-only; never places orders) ---
+    # Reads Upstox credentials from env. If absent, the callable fails closed
+    # (returns None) so the scanner rejects every symbol as MISSING_MARKET_DATA
+    # rather than fabricating data.
+    from trading_system.india.upstox import UpstoxMarketDataProvider
+
+    md_provider = UpstoxMarketDataProvider()
+
+    def market_data_callable(symbol: str, timeframe: str):
+        if not md_provider.is_authenticated:
+            return None
+        try:
+            return md_provider.get_historical(symbol, timeframe, limit=250)
+        except Exception:
+            return None
+
     center = PaperTradingControlCenter.from_engine(
-        engine, requirement=requirement, freshness_config=freshness
+        engine,
+        requirement=requirement,
+        freshness_config=freshness,
+        market_data_provider=market_data_callable,
     )
-    router = PaperAPIRouter(center)
+
+    # Phase 6 — Autonomous Trading Operations Center (paper-only)
+    bot_config = AutonomousBotConfig(
+        bot_id="bot-paper-default",
+        name="Paper Autonomous Bot",
+        mode=BotMode.AUTONOMOUS,
+        trading_mode=TradingMode.PAPER,
+        enabled=True,
+        user_constraints=UserConstraints(
+            allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
+            allowed_strategy_ids=frozenset(),
+            allowed_timeframes=frozenset({"1m", "5m", "15m", "30m", "1h", "4h", "1d"}),
+        ),
+        max_simultaneous_positions=5,
+        source=Source.AUTONOMOUS,
+    )
+    controller = AutonomousController(config=bot_config, control_center=center)
+
+    # --- Instrument repository + current-market option discoverer (Phase 8B) ---
+    # Builds the instrument universe from the Upstox option-chain endpoint
+    # (data-only, read-only). If credentials are missing this is a no-op —
+    # discover_options_contract will return None, never fabricated contracts.
+    from trading_system.india.instrument_repository import InstrumentRepository
+    from trading_system.india.upstox_discovery import UpstoxInstrumentDiscovery
+    from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
+
+    repo = None
+    discoverer = None
+    if md_provider.is_authenticated:
+        repo = InstrumentRepository()
+        discoverer = CurrentOptionDiscoverer(
+            repository=repo,
+            market_data_provider=market_data_callable,
+        )
+        # Pre-populate the repository with the option universe from Upstox
+        for underlying in ("NIFTY", "BANKNIFTY", "FINNIFTY", "NIFTY50"):
+            UpstoxInstrumentDiscovery(md_provider, repo).discover_options(underlying)
+
+    if discoverer is not None and repo is not None:
+        controller.set_option_discoverer(discoverer, repository=repo)
+    # Phase 8C: attach the real Upstox current-option-quote provider so the
+    # autonomous execution path can fetch exact option premiums without manual
+    # price injection.  Only attached when Upstox credentials are present.
+    if md_provider.is_authenticated:
+        from trading_system.india.option_quotes import CurrentOptionQuoteProvider
+        controller.set_quote_provider(CurrentOptionQuoteProvider(md_provider))
+    # Phase 8A synthetic chain provider is intentionally NOT attached in
+    # production.  resolve_options_plan will fail-closed (return None) rather
+    # than ever silently feed a synthetic premium into PaperBroker.  The real
+    # autonomous path uses execute_option_order() which fetches live Upstox
+    # quotes for the exact discovered contract.
+    controller.set_chain_provider(None)
+
+    router = PaperAPIRouter(center, controller=controller)
 
     host = args.host
     port = args.port

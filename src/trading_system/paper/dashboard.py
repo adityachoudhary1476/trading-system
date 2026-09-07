@@ -48,6 +48,10 @@ class DashboardDeploymentSummary(BaseModel):
     notes: str = ""
     schema_version: int = 1
 
+    # Phase 8: Options support
+    options_enabled: bool = False
+    allowed_option_types: list[str] = Field(default_factory=lambda: ["CE", "PE"])
+
 
 class DashboardStrategySummary(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -86,6 +90,9 @@ class DashboardPositionsBlock(BaseModel):
 
     open_position: Optional[dict] = None
     is_flat: bool = True
+
+    # Phase 8: Options position metadata (optional)
+    options_position: Optional[dict] = None
 
 
 class DashboardPerformanceBlock(BaseModel):
@@ -201,6 +208,8 @@ def build_deployment_summary(deployment: PaperDeployment) -> DashboardDeployment
         activated_at=deployment.activated_at,
         updated_at=deployment.updated_at or "",
         notes=deployment.notes or "",
+        options_enabled=deployment.config.options_enabled,
+        allowed_option_types=deployment.config.allowed_option_types,
     )
 
 

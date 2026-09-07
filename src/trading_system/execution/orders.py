@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 
 class Side(str, Enum):
@@ -101,6 +101,12 @@ class Order:
     updated_at: datetime = field(default_factory=_now)
     reject_reason: str = ""
 
+    # --- Phase 8: Options contract metadata (optional) ---
+    options_contract_id: Optional[str] = None
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+    option_type: Optional[str] = None
+
     def __post_init__(self) -> None:
         if self.quantity <= 0:
             raise ValueError("order quantity must be positive")
@@ -180,6 +186,12 @@ class OrderIntent:
     client_order_id: Optional[str] = None   # idempotency key
     current_price: Optional[float] = None   # reference price for MARKET fills
 
+    # --- Phase 8: Options contract metadata (optional) ---
+    options_contract_id: Optional[str] = None
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+    option_type: Optional[str] = None
+
 
 @dataclass
 class OrderResult:
@@ -208,3 +220,35 @@ class OrderResult:
     position_qty_after: Optional[float]
     reject_reason: str = ""
     is_idempotent_replay: bool = False
+
+    # --- Phase 8: Options contract metadata (optional) ---
+    options_contract_id: Optional[str] = None
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+    option_type: Optional[str] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "order_id": self.order_id,
+            "client_order_id": self.client_order_id,
+            "symbol": self.symbol,
+            "side": self.side.value,
+            "quantity": self.quantity,
+            "order_type": self.order_type.value,
+            "limit_price": self.limit_price,
+            "status": self.status.value,
+            "filled_quantity": self.filled_quantity,
+            "avg_fill_price": self.avg_fill_price,
+            "fills": self.fills,
+            "cash_after": self.cash_after,
+            "equity_after": self.equity_after,
+            "realized_pnl_after": self.realized_pnl_after,
+            "unrealized_pnl_after": self.unrealized_pnl_after,
+            "position_qty_after": self.position_qty_after,
+            "reject_reason": self.reject_reason,
+            "is_idempotent_replay": self.is_idempotent_replay,
+            "options_contract_id": self.options_contract_id,
+            "strike": self.strike,
+            "expiry": self.expiry,
+            "option_type": self.option_type,
+        }

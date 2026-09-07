@@ -20,9 +20,10 @@ from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import Column, DateTime, String, Text
+from sqlalchemy import Boolean, Column, DateTime, Integer, String, Text
 
 from ..research.evidence import Base
+from ..india.instruments import OptionType
 
 
 def _now_iso() -> str:
@@ -73,12 +74,28 @@ class PaperDeploymentConfig(BaseModel):
     # (indicator warm-up). Same semantics as the backtester warm-up window.
     warmup_bars: int = Field(default=0, ge=0)
 
+    # --- Phase 8: Options support ---
+    # When True, StrategySignals may carry an ``options_selection`` and the
+    # deployment may open/flatten option positions. When False (default, backward
+    # compatible), any options_selection on a signal is rejected by the gate.
+    options_enabled: bool = Field(default=False)
+
+    # Restrict which option rights may be selected. Empty list = both allowed.
+    allowed_option_types: list[str] = Field(default_factory=lambda: ["CE", "PE"])
+
+    # Cap on contracts per single order (0 or None = no cap).
+    max_options_contracts_per_trade: Optional[int] = Field(default=None, ge=0)
+
     @model_validator(mode="after")
     def _paper_only(self) -> "PaperDeploymentConfig":
         if self.execution_mode != "paper":
             raise ValueError(
                 f"execution_mode must be 'paper'; got {self.execution_mode!r}"
             )
+        if self.options_enabled:
+            for ot in self.allowed_option_types:
+                if ot not in ("CE", "PE"):
+                    raise ValueError(f"allowed_option_types must be CE/PE, got {ot!r}")
         return self
 
 
@@ -109,6 +126,19 @@ class PaperDeployment(BaseModel):
     updated_at: str = ""
     notes: str = ""
 
+    # Convenience accessors for Phase 8 options fields.
+    @property
+    def options_enabled(self) -> bool:
+        return self.config.options_enabled
+
+    @property
+    def allowed_option_types(self) -> list[str]:
+        return self.config.allowed_option_types
+
+    @property
+    def max_options_contracts_per_trade(self) -> Optional[int]:
+        return self.config.max_options_contracts_per_trade
+
     def as_record(self) -> "PaperDeploymentRecord":
         return PaperDeploymentRecord(
             deployment_id=self.deployment_id,
@@ -124,6 +154,29 @@ class PaperDeployment(BaseModel):
             activated_at=_parse_dt(self.activated_at) if self.activated_at else None,
             updated_at=_parse_dt(self.updated_at or _now_iso()),
             notes=self.notes or "",
+            options_enabled=self.config.options_enabled,
+            allowed_option_types_json=json.dumps(self.config.allowed_option_types),
+            max_options_contracts_per_trade=self.config.max_options_contracts_per_trade,
+        )
+
+    @classmethod
+    def _rec_to_deployment(cls, rec: "PaperDeploymentRecord") -> "PaperDeployment":
+        """Build a PaperDeployment from a SQLAlchemy record."""
+        config_data = json.loads(rec.config_json or "{}")
+        return cls(
+            deployment_id=rec.deployment_id,
+            strategy_id=rec.strategy_id,
+            strategy_spec_hash=rec.strategy_spec_hash,
+            symbol=rec.symbol,
+            timeframe=rec.timeframe,
+            dataset_id=rec.dataset_id,
+            config=PaperDeploymentConfig(**config_data),
+            status=PaperDeploymentStatus(rec.status),
+            evidence_ids=list(json.loads(rec.evidence_ids_json or "[]")),
+            created_at=rec.created_at.isoformat() if rec.created_at else "",
+            activated_at=rec.activated_at.isoformat() if rec.activated_at else None,
+            updated_at=rec.updated_at.isoformat() if rec.updated_at else "",
+            notes=rec.notes or "",
         )
 
 
@@ -145,6 +198,9 @@ class PaperDeploymentRecord(Base):
     activated_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
     notes = Column(Text, nullable=False, default="")
+    options_enabled = Column(Boolean, nullable=False, default=False)
+    allowed_option_types_json = Column(Text, nullable=False, default='["CE","PE"]')
+    max_options_contracts_per_trade = Column(Integer, nullable=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -190,19 +246,6 @@ def _parse_dt(value: Any) -> datetime:
     raise ValueError(f"cannot parse datetime from {value!r}")
 
 
-def _rec_to_deployment(rec: PaperDeploymentRecord) -> PaperDeployment:
-    return PaperDeployment(
-        deployment_id=rec.deployment_id,
-        strategy_id=rec.strategy_id,
-        strategy_spec_hash=rec.strategy_spec_hash,
-        symbol=rec.symbol,
-        timeframe=rec.timeframe,
-        dataset_id=rec.dataset_id,
-        config=PaperDeploymentConfig.model_validate_json(rec.config_json),
-        status=PaperDeploymentStatus(rec.status),
-        evidence_ids=list(json.loads(rec.evidence_ids_json or "[]")),
-        created_at=rec.created_at.isoformat() if rec.created_at else "",
-        activated_at=rec.activated_at.isoformat() if rec.activated_at else None,
-        updated_at=rec.updated_at.isoformat() if rec.updated_at else "",
-        notes=rec.notes or "",
-    )
+def rec_to_deployment(rec: PaperDeploymentRecord) -> PaperDeployment:
+    """Convert a SQLAlchemy record to a PaperDeployment model."""
+    return PaperDeployment._rec_to_deployment(rec)

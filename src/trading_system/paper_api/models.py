@@ -244,6 +244,12 @@ __all__ = [
     "EvidenceResponse",
     "OrderIntentRequest",
     "OrderIntentResponse",
+    "AutonomousBotResponse",
+    "AutonomousLifecycleResponse",
+    "AutonomousScanResponse",
+    "AutonomousDecideResponse",
+    "AutonomousDeploymentsResponse",
+    "AutonomousEventsResponse",
 ]
 
 
@@ -279,6 +285,14 @@ class OrderIntentRequest(BaseModel):
                     "deployment has no live price feed.",
     )
 
+    # --- Phase 8: Options contract metadata (optional) ---
+    options_contract_id: Optional[str] = Field(
+        default=None, description="Resolved options contract identifier (e.g. instrument.contract_id)"
+    )
+    strike: Optional[float] = Field(default=None, gt=0, description="Strike price of the option")
+    expiry: Optional[str] = Field(default=None, description="ISO date expiry YYYY-MM-DD")
+    option_type: Optional[str] = Field(default=None, description="Option right: 'CE' or 'PE'")
+
 
 class OrderIntentResponse(BaseModel):
     """Response body for ``POST /deployments/{id}/orders``.
@@ -306,5 +320,80 @@ class OrderIntentResponse(BaseModel):
     unrealized_pnl_after: Optional[float]
     position_qty_after: Optional[float]
     reject_reason: str = ""
+    is_idempotent_replay: bool = False
+
+    # --- Phase 8: Options contract metadata (optional) ---
+    options_contract_id: Optional[str] = None
+    strike: Optional[float] = None
+    expiry: Optional[str] = None
+    option_type: Optional[str] = None
     idempotent: bool = False
+    schema_version: int = 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 6 — Autonomous Trading Operations Center response models
+# --------------------------------------------------------------------------- #
+class AutonomousBotResponse(BaseModel):
+    """Response for ``GET /autonomous/bot``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    bot: dict[str, Any]
+    schema_version: int = 1
+
+
+class AutonomousLifecycleResponse(BaseModel):
+    """Response for ``POST /autonomous/bot/{action}``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    success: bool
+    message: str
+    bot: dict[str, Any]
+    schema_version: int = 1
+
+
+class AutonomousScanResponse(BaseModel):
+    """Response for ``GET /autonomous/scan``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scan: dict[str, Any]
+    ranking: Optional[dict[str, Any]] = None
+    schema_version: int = 1
+
+
+class AutonomousDecideResponse(BaseModel):
+    """Response for ``POST /autonomous/decide``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result_id: str
+    scan_id: Optional[str] = None
+    ranking_id: Optional[str] = None
+    evaluated_at: str
+    decisions: list[dict]
+    valid_count: int
+    rejected_count: int
+    schema_version: int = 1
+
+
+class AutonomousDeploymentsResponse(BaseModel):
+    """Response for ``GET /autonomous/deployments``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    deployments: list[DashboardDeploymentSummary]
+    count: int
+    schema_version: int = 1
+
+
+class AutonomousEventsResponse(BaseModel):
+    """Response for ``GET /autonomous/events``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    events: list[dict]
+    count: int
     schema_version: int = 1

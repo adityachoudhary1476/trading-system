@@ -210,8 +210,8 @@ class TestDeploymentLifecycle:
             s.commit()
         with store._Session() as s:
             loaded = s.get(PaperDeploymentRecord, deployment.deployment_id)
-            from trading_system.paper.deployment import _rec_to_deployment
-            restored = _rec_to_deployment(loaded)
+            from trading_system.paper.deployment import rec_to_deployment
+            restored = rec_to_deployment(loaded)
         assert restored.deployment_id == deployment.deployment_id
         assert restored.strategy_spec_hash == deployment.strategy_spec_hash
         assert restored.config == deployment.config

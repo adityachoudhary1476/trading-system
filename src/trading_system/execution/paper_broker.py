@@ -141,6 +141,10 @@ class PaperBroker(Broker):
         order_type: OrderType | str = OrderType.MARKET,
         limit_price: Optional[float] = None,
         current_price: Optional[float] = None,
+        options_contract_id: Optional[str] = None,
+        strike: Optional[float] = None,
+        expiry: Optional[str] = None,
+        option_type: Optional[str] = None,
     ) -> Order:
         side = Side(side) if not isinstance(side, Side) else side
         order_type = OrderType(order_type) if not isinstance(order_type, OrderType) else order_type
@@ -163,6 +167,10 @@ class PaperBroker(Broker):
             quantity=float(quantity),
             order_type=order_type,
             limit_price=(float(limit_price) if limit_price is not None else None),
+            options_contract_id=options_contract_id,
+            strike=strike,
+            expiry=expiry,
+            option_type=option_type,
         )
         # PENDING -> OPEN
         order.transition_to(OrderStatus.OPEN)
@@ -237,7 +245,7 @@ class PaperBroker(Broker):
             prev = order.avg_fill_price * (order.filled_quantity - fill_qty)
             order.avg_fill_price = (prev + exec_price * fill_qty) / order.filled_quantity
 
-        self._apply_fill_to_book(order.symbol, order.side, fill_qty, exec_price, fee)
+        self._apply_fill_to_book(order, fill_qty, exec_price, fee)
 
         # Order status transition
         if order.remaining_quantity <= 1e-12:
@@ -246,11 +254,19 @@ class PaperBroker(Broker):
             order.transition_to(OrderStatus.PARTIALLY_FILLED)
 
     def _apply_fill_to_book(
-        self, symbol: str, side: Side, qty: float, price: float, fee: float
+        self, order: OrderIntent, qty: float, price: float, fee: float
     ) -> None:
         """Update cash + position with one fill. Signed qty: BUY +, SELL -."""
+        symbol = order.symbol
+        side = order.side
         signed = qty if side == Side.BUY else -qty
         pos = self._position(symbol)
+
+        if order.options_contract_id is not None:
+            pos.options_contract_id = order.options_contract_id
+            pos.strike = order.strike
+            pos.expiry = order.expiry
+            pos.option_type = order.option_type
 
         # Cash effect: buying spends cash + fee; selling receives cash - fee.
         cash_delta = -signed * price - (fee if side == Side.BUY else fee)

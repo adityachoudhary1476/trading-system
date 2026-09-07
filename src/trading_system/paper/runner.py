@@ -225,6 +225,10 @@ class PaperStrategyRunner:
                         order_type=order["order_type"],
                         limit_price=order["limit_price"],
                         current_price=order["current_price"],
+                        options_contract_id=order.get("options_contract_id"),
+                        strike=order.get("strike"),
+                        expiry=order.get("expiry"),
+                        option_type=order.get("option_type"),
                     )
                     self._orders_submitted += 1
                     self._fills_received += sum(1 for f in submitted.fills)
@@ -484,7 +488,9 @@ class PaperStrategyRunner:
     # Order construction + validation (unchanged from Phase 18)
     # ------------------------------------------------------------------ #
     def _build_order(
-        self, signal: SignalType, ts: pd.Timestamp, price: float
+        self, signal: SignalType, ts: pd.Timestamp, price: float,
+        *,
+        options_selection: Optional[dict] = None,
     ) -> Optional[dict]:
         """Build + validate the order dict. Returns None on rejection."""
         if signal == SignalType.LONG_ENTRY:
@@ -525,6 +531,7 @@ class PaperStrategyRunner:
             "order_type": "MARKET",
             "limit_price": None,
             "current_price": float(price),
+            **(options_selection or {}),
         }
 
     def _compute_quantity(self, price: float) -> Optional[float]:

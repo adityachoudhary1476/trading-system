@@ -54,6 +54,7 @@ from .history_chunking import (
 from .instrument_repository import InstrumentRepository
 from .derivatives import DerivativeRequest, to_fyers_derivative_symbol, from_fyers_derivative_symbol
 from .instrument_discovery import FyersInstrumentDiscovery
+from .upstox_discovery import UpstoxInstrumentDiscovery
 from .event_bus import EventBus, EventConsumer
 from .closed_candle_pipeline import (
     ClosedCandlePipeline,
@@ -112,6 +113,7 @@ __all__ = [
     "to_fyers_derivative_symbol",
     "from_fyers_derivative_symbol",
     "FyersInstrumentDiscovery",
+    "UpstoxInstrumentDiscovery",
     "EventBus",
     "EventConsumer",
     "ClosedCandlePipeline",

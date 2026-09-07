@@ -3,6 +3,12 @@ import type {
   AllocationResponse,
   ApiError,
   ApiResult,
+  AutonomousBotResponse,
+  AutonomousDecideResponse,
+  AutonomousDeploymentsResponse,
+  AutonomousEventsResponse,
+  AutonomousLifecycleResponse,
+  AutonomousScanResponse,
   CircuitBreakerResponse,
   DashboardSnapshotResponse,
   DeploymentCreateResponse,
@@ -277,5 +283,61 @@ export const paperApi = {
     if (params?.limit) qs.set("limit", String(params.limit));
     const q = qs.toString();
     return get<AllocationResponse>(`/allocation${q ? `?${q}` : ""}`);
+  },
+
+  async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const result = await request<T>(path, init);
+    if (!result.ok) throw new Error(result.error.message);
+    return result.data;
+  },
+
+  // Phase 6 — Autonomous Trading Operations Center
+  async getAutonomousBot(): Promise<AutonomousBotResponse> {
+    return this.request<AutonomousBotResponse>("/autonomous/bot")
+  },
+
+  async setAutonomousBotLifecycle(
+    action: "start" | "pause" | "resume" | "stop"
+  ): Promise<AutonomousLifecycleResponse> {
+    return this.request<AutonomousLifecycleResponse>(
+      `/autonomous/bot/${action}`,
+      { method: "POST" }
+    )
+  },
+
+  async getAutonomousScan(): Promise<AutonomousScanResponse> {
+    return this.request<AutonomousScanResponse>("/autonomous/scan")
+  },
+
+  async getAutonomousDecisions(): Promise<AutonomousDecideResponse> {
+    return this.request<AutonomousDecideResponse>("/autonomous/decide")
+  },
+
+  async getAutonomousDeployments(): Promise<AutonomousDeploymentsResponse> {
+    return this.request<AutonomousDeploymentsResponse>("/autonomous/deployments")
+  },
+
+  async stopAutonomousDeployment(deploymentId: string): Promise<{
+    status: string
+    message: string
+    schema_version?: number
+  }> {
+    return this.request<{ status: string; message: string; schema_version?: number }>(
+      `/autonomous/deployments/${deploymentId}/stop`,
+      { method: "POST" }
+    )
+  },
+
+  async getAutonomousEvents(params?: {
+    eventType?: string
+    limit?: number
+  }): Promise<AutonomousEventsResponse> {
+    const query = new URLSearchParams()
+    if (params?.eventType) query.set("event_type", params.eventType)
+    if (params?.limit) query.set("limit", String(params.limit))
+    const qs = query.toString()
+    return this.request<AutonomousEventsResponse>(
+      `/autonomous/events${qs ? `?${qs}` : ""}`
+    )
   },
 };

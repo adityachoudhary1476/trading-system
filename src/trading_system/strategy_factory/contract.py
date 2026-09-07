@@ -23,7 +23,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -32,6 +32,9 @@ from ..research.strategies import Signal as SignalDirection
 from ..research.strategy_lab.spec import assert_no_code_payload
 from .metadata import StrategyMetadata
 from .parameters import ParameterSchema
+
+if TYPE_CHECKING:
+    from ..autonomous.options.model import OptionsContractSelection
 
 _REQUIRED_BARS_COLUMNS = {"open", "high", "low", "close", "volume"}
 
@@ -159,6 +162,7 @@ class StrategySignal:
     target_position: Optional[int] = None
     metadata: dict = field(default_factory=dict)
     version: str = ""
+    options_selection: "Optional[OptionsContractSelection]" = None
 
     def __post_init__(self) -> None:
         if self.reference_price <= 0:
@@ -178,7 +182,7 @@ class StrategySignal:
         assert_no_code_payload(self.reason, "reason") if self.reason else None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d = {
             "action": self.action.value,
             "strategy_id": self.strategy_id,
             "timestamp": self.timestamp.isoformat(),
@@ -190,6 +194,9 @@ class StrategySignal:
             "metadata": self.metadata,
             "version": self.version,
         }
+        if self.options_selection is not None:
+            d["options_selection"] = self.options_selection.to_dict()
+        return d
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return (
