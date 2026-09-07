@@ -22,17 +22,99 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/paper", tags=["paper"])
 
 _api_router: Optional[object] = None
+_controller: Optional[object] = None
+
+
+def _build_market_data_callable():
+    from trading_system.india.upstox import UpstoxMarketDataProvider
+
+    settings = get_settings()
+    md_provider = UpstoxMarketDataProvider(
+        access_token=settings.upstox_service_account_token or None
+    )
+
+    def market_data_callable(symbol: str, timeframe: str):
+        if not md_provider.is_authenticated:
+            return None
+        try:
+            return md_provider.get_historical(symbol, timeframe, limit=250)
+        except Exception:
+            return None
+
+    return md_provider, market_data_callable
+
+
+def _build_controller(center, settings, md_provider, market_data_callable):
+    from trading_system.autonomous.bot_config import (
+        AutonomousBotConfig,
+        BotMode,
+        TradingMode,
+        Source,
+        UserConstraints,
+    )
+    from trading_system.autonomous.controller import AutonomousController
+
+    bot_config = AutonomousBotConfig(
+        bot_id="bot-paper-default",
+        name="Paper Autonomous Bot",
+        mode=BotMode.AUTONOMOUS,
+        trading_mode=TradingMode.PAPER,
+        enabled=True,
+        user_constraints=UserConstraints(
+            allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
+            allowed_strategy_ids=frozenset(),
+            allowed_timeframes=frozenset({"1m", "5m", "15m", "30m", "1h", "4h", "1d"}),
+        ),
+        max_simultaneous_positions=5,
+        source=Source.AUTONOMOUS,
+    )
+    controller = AutonomousController(config=bot_config, control_center=center)
+
+    if md_provider.is_authenticated:
+        try:
+            from trading_system.autonomous.options.discovery import (
+                CurrentOptionDiscoverer,
+            )
+            from trading_system.india.instrument_repository import (
+                InstrumentRepository,
+            )
+            from trading_system.india.upstox_discovery import (
+                UpstoxInstrumentDiscovery,
+            )
+
+            repo = InstrumentRepository()
+            discoverer = CurrentOptionDiscoverer(
+                repository=repo,
+                market_data_provider=market_data_callable,
+            )
+            for underlying in ("NIFTY", "BANKNIFTY", "FINNIFTY", "NIFTY50"):
+                UpstoxInstrumentDiscovery(md_provider, repo).discover_options(
+                    underlying
+                )
+            controller.set_option_discoverer(discoverer, repository=repo)
+        except Exception as exc:
+            logger.warning(
+                "Autonomous option discoverer not attached: %s", exc
+            )
+
+        try:
+            from trading_system.india.option_quotes import (
+                CurrentOptionQuoteProvider,
+            )
+
+            controller.set_quote_provider(CurrentOptionQuoteProvider(md_provider))
+        except Exception as exc:
+            logger.warning(
+                "Autonomous option quote provider not attached: %s", exc
+            )
+
+    controller.set_chain_provider(None)
+
+    return controller
 
 
 def _get_api_router():
-    """Lazily initialise the PaperAPIRouter singleton.
-
-    Mirrors the CLI startup in ``trading_system.__main__._cmd_serve_paper_api``:
-    creates a SQLAlchemy engine from the backend's ``market_data_db_url``
-    setting, builds a ``PaperTradingControlCenter`` with relaxed evidence
-    requirements, and wraps it in a ``PaperAPIRouter``.
-    """
-    global _api_router
+    global _api_router, _controller
     if _api_router is not None:
         return _api_router
 
@@ -49,8 +131,6 @@ def _get_api_router():
 
     connect_args: dict = {}
     if settings.market_data_db_url.startswith("sqlite"):
-        # SQLite-only: ensure the parent directory exists so create_all() can
-        # open the database file. Mirrors MarketStore._ensure_dir() behaviour.
         from pathlib import Path
 
         if settings.market_data_db_url.startswith("sqlite:///"):
@@ -64,9 +144,6 @@ def _get_api_router():
         connect_args=connect_args,
     )
 
-    # Relaxed evidence requirements — paper-only dev mode.
-    # The gate still enforces: paper-only mode, spec identity binding,
-    # symbol/timeframe match, and non-retired/non-rejected strategy status.
     requirement = EvidenceRequirement(
         require_walk_forward=False,
         require_validation=False,
@@ -75,16 +152,36 @@ def _get_api_router():
     )
     freshness = EvidenceFreshnessConfig(max_age_days=180)
 
+    md_provider, market_data_callable = _build_market_data_callable()
+
     center = PaperTradingControlCenter.from_engine(
-        engine, requirement=requirement, freshness_config=freshness
+        engine,
+        requirement=requirement,
+        freshness_config=freshness,
+        market_data_provider=market_data_callable,
     )
-    _api_router = PaperAPIRouter(center)
+
+    controller = None
+    try:
+        controller = _build_controller(
+            center, settings, md_provider, market_data_callable
+        )
+    except Exception as exc:
+        logger.warning(
+            "Autonomous controller not constructed for FastAPI paper API: %s",
+            exc,
+        )
+        controller = None
+
+    _controller = controller
+    _api_router = PaperAPIRouter(center, controller=controller)
 
     db_kind = "postgresql" if settings.market_data_db_url.startswith("postgresql") else "sqlite"
     logger.info(
-        "Paper API router initialised (db_kind=%s, routes=%d)",
+        "Paper API router initialised (db_kind=%s, routes=%d, autonomous=%s)",
         db_kind,
         len(_api_router.routes()),
+        "wired" if controller is not None else "unwired",
     )
     return _api_router
 

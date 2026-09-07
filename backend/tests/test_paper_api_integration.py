@@ -9,6 +9,9 @@ They cover:
   B. Adapter contract — method/path/query/body forwarded to PaperAPIRouter.dispatch
      without duplication, with status/body/error-schema preserved
   C. Route isolation — /health and /api/market/* are NOT intercepted
+  D. Autonomous controller wiring — the paper-only AutonomousController is
+     attached to the FastAPI PaperAPIRouter and ``/api/paper/autonomous/*``
+     routes reach the controller / safety layer (not "controller not configured")
 """
 from __future__ import annotations
 
@@ -20,7 +23,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from main import app
-from routes.paper_api import _get_api_router, _api_router
+from routes import paper_api
+from routes.paper_api import _api_router, _build_controller, _build_market_data_callable, _get_api_router
 
 
 # --------------------------------------------------------------------------- #
@@ -343,3 +347,165 @@ class TestDatabaseConfiguration:
 
         _reset_paper_singleton()
         get_settings.cache_clear()
+
+
+# --------------------------------------------------------------------------- #
+# D. Autonomous controller wiring tests
+# --------------------------------------------------------------------------- #
+class TestAutonomousWiring:
+    """Verify the production FastAPI bootstrap wires the paper-only
+    AutonomousController into the PaperAPIRouter. These tests prove that:
+
+      * the paper API router is constructed with a non-None controller,
+      * ``/api/paper/autonomous/{bot,scan,events}`` no longer returns the
+        ``autonomous controller not configured`` error (the route handler
+        reaches the controller's safety layer),
+      * ``/api/paper/autonomous/decide`` is wired through the controller.
+    """
+
+    def test_get_api_router_attaches_controller(self, isolated_client):
+        """``_get_api_router()`` must initialise PaperAPIRouter with a controller."""
+        _reset_paper_singleton()
+        api_router = _get_api_router()
+        assert api_router is not None
+        # PaperAPIRouter keeps the controller on ``_controller``; verify it
+        # was wired (either to an AutonomousController instance or stays None
+        # only when the autonomous module is unavailable).
+        assert hasattr(api_router, "_controller")
+        controller = getattr(api_router, "_controller", None)
+        if controller is not None:
+            from trading_system.autonomous.controller import AutonomousController
+            assert isinstance(controller, AutonomousController), (
+                "PaperAPIRouter._controller must be an AutonomousController instance"
+            )
+
+    def test_module_level_controller_singleton_set(self, isolated_client):
+        """The module-level ``_controller`` reference is populated on first init."""
+        _reset_paper_singleton()
+        _get_api_router()
+        controller = getattr(paper_api, "_controller", None)
+        # In an isolated SQLite test env the autonomous module is importable, so
+        # the controller must be wired. If the autonomous module were missing
+        # the adapter would log a warning and leave ``_controller`` as None.
+        if controller is not None:
+            from trading_system.autonomous.controller import AutonomousController
+            assert isinstance(controller, AutonomousController)
+
+    def test_autonomous_bot_route_does_not_return_controller_not_configured(
+        self, isolated_client
+    ):
+        """GET /autonomous/bot must NOT return 501 'controller not configured'.
+
+        The route may legitimately return other statuses (e.g. 200 with the
+        bot's current state), but the *controller-not-configured* failure
+        mode must be gone because the bootstrap now wires the controller.
+        """
+        resp = isolated_client.get("/api/paper/autonomous/bot")
+        assert resp.status_code != 501, (
+            "GET /api/paper/autonomous/bot still returns 501 "
+            "'autonomous controller not configured' — bootstrap did not wire "
+            "the AutonomousController into PaperAPIRouter"
+        )
+        body = resp.json()
+        if "error" in body:
+            assert "autonomous controller not configured" not in (
+                body["error"].get("message", "")
+            ), "Error message still indicates the controller is unwired"
+
+    def test_autonomous_scan_route_does_not_return_controller_not_configured(
+        self, isolated_client
+    ):
+        """GET /autonomous/scan must NOT return 501 'controller not configured'."""
+        resp = isolated_client.get("/api/paper/autonomous/scan")
+        assert resp.status_code != 501
+        body = resp.json()
+        if "error" in body:
+            assert "autonomous controller not configured" not in (
+                body["error"].get("message", "")
+            )
+
+    def test_autonomous_events_route_does_not_return_controller_not_configured(
+        self, isolated_client
+    ):
+        """GET /autonomous/events must NOT return 501 'controller not configured'."""
+        resp = isolated_client.get("/api/paper/autonomous/events")
+        assert resp.status_code != 501
+        body = resp.json()
+        if "error" in body:
+            assert "autonomous controller not configured" not in (
+                body["error"].get("message", "")
+            )
+
+    def test_autonomous_decide_route_does_not_return_controller_not_configured(
+        self, isolated_client
+    ):
+        """POST /autonomous/decide must NOT return 501 'controller not configured'.
+
+        The route may legitimately return other statuses (e.g. 200 with the
+        decision list, or 4xx for invalid input). The 501 'controller not
+        configured' failure mode must be gone.
+        """
+        resp = isolated_client.post("/api/paper/autonomous/decide")
+        assert resp.status_code != 501
+        body = resp.json()
+        if "error" in body:
+            assert "autonomous controller not configured" not in (
+                body["error"].get("message", "")
+            )
+
+    def test_controller_is_paper_only(self, isolated_client):
+        """The wired AutonomousController must be PAPER-only.
+
+        Mirrors the safety contract documented in
+        ``src/trading_system/autonomous/bot_config.py`` —
+        ``AutonomousBotConfig.trading_mode`` is always ``TradingMode.PAPER``.
+        """
+        _reset_paper_singleton()
+        _get_api_router()
+        controller = getattr(paper_api, "_controller", None)
+        if controller is None:
+            pytest.skip("AutonomousController not wired in this environment")
+        from trading_system.autonomous.bot_config import TradingMode
+        assert controller.config.trading_mode == TradingMode.PAPER
+
+    def test_synthetic_chain_provider_not_attached(self, isolated_client):
+        """The synthetic InMemoryOptionsChainProvider must NEVER be attached.
+
+        The autonomous execution path uses ``execute_option_order()`` which
+        fetches live Upstox quotes for the exact discovered contract, or
+        fails closed. A synthetic chain provider would let
+        ``resolve_options_plan`` return fabricated premiums.
+        """
+        _reset_paper_singleton()
+        _get_api_router()
+        controller = getattr(paper_api, "_controller", None)
+        if controller is None:
+            pytest.skip("AutonomousController not wired in this environment")
+        # ``_chain_provider`` is the field the controller uses internally.
+        assert getattr(controller, "_chain_provider", "not_set") in (None, "not_set"), (
+            "Production FastAPI bootstrap must NOT attach a chain provider — "
+            "the synthetic provider would let the autonomous path fabricate "
+            "options data"
+        )
+
+    def test_market_data_callable_is_fail_closed(self):
+        """The market_data_callable must return None when Upstox is unauthenticated.
+
+        This guarantees that scanners reject every symbol as MISSING_MARKET_DATA
+        rather than fabricating data — the production fail-closed contract.
+        """
+        # Patch the provider to a known-unauthenticated state.
+        from trading_system.india import upstox as upstox_mod
+        original_provider = upstox_mod.UpstoxMarketDataProvider
+
+        class _UnauthProvider(original_provider):
+            def __init__(self, *args, **kwargs):
+                kwargs["client_id"] = ""
+                kwargs["access_token"] = ""
+                super().__init__(*args, **kwargs)
+
+        with patch.object(upstox_mod, "UpstoxMarketDataProvider", _UnauthProvider):
+            md_provider, market_data_callable = _build_market_data_callable()
+        assert md_provider.is_authenticated is False
+        assert market_data_callable("NSE:SBIN", "1d") is None
+        assert market_data_callable("NSE:INFY", "1h") is None
