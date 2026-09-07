@@ -11,6 +11,7 @@ vi.mock("@/lib/paperApi", () => ({
     getAutonomousEvents: vi.fn(),
     getAutonomousDeployments: vi.fn(),
     setAutonomousBotLifecycle: vi.fn(),
+    getOptionsCapability: vi.fn(),
   },
 }));
 
@@ -104,6 +105,21 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({ decisions: [] });
     vi.mocked(paperApi.getAutonomousEvents).mockResolvedValue({ events: [], count: 0, schema_version: 1 });
     vi.mocked(paperApi.getAutonomousDeployments).mockResolvedValue({ deployments: [], count: 0, schema_version: 1 });
+    vi.mocked(paperApi.getOptionsCapability).mockResolvedValue({
+      enabled: false,
+      allowed_option_types: [],
+      max_contracts_per_trade: null,
+      providers: {
+        discoverer: { status: "not_configured", detail: "" },
+        quote: { status: "not_configured", detail: "" },
+        chain: { status: "not_configured", detail: "" },
+      },
+      capable: false,
+      execution_phase: "single_leg_capability_surface",
+      autonomous_execution_active: false,
+      last_error: null,
+      schema_version: 1,
+    });
     vi.mocked(paperApi.setAutonomousBotLifecycle).mockResolvedValue({
       success: true,
       message: "ok",
@@ -529,5 +545,174 @@ describe("AutonomousCenter — regression: shape drift tolerance", () => {
       expect(screen.getByText("ACTIVE")).toBeDefined();
     });
     expect(screen.getByText(/0 recent events/i)).toBeDefined();
+  });
+});
+
+// --------------------------------------------------------------------------- //
+// Phase A — Options capability surface tests                                  //
+// --------------------------------------------------------------------------- //
+// These tests verify that the AutonomousCenter renders the options capability
+// panel based on the backend's actual response — and that the UI never
+// claims autonomous option execution is active in Phase A.
+describe("AutonomousCenter — options capability surface (Phase A)", () => {
+  const mockDeployment = {
+    deployment_id: "dep-1",
+    strategy_id: "tf1",
+    strategy_spec_hash: "abc123",
+    symbol: "NSE:SBIN",
+    timeframe: "1d",
+    execution_mode: "paper",
+    dataset_id: "ds-1",
+    status: "active",
+    created_at: "2025-01-01T00:00:00Z",
+    activated_at: "2025-01-01T00:00:00Z",
+    updated_at: "2025-01-01T00:00:00Z",
+    notes: "",
+    schema_version: 1,
+    options_enabled: true,
+    allowed_option_types: ["CE", "PE"],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("running") });
+    vi.mocked(paperApi.getAutonomousScan).mockResolvedValue({ scan: mockScan([]), ranking: null });
+    vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({ decisions: [] });
+    vi.mocked(paperApi.getAutonomousEvents).mockResolvedValue({ events: [], count: 0, schema_version: 1 });
+    vi.mocked(paperApi.getAutonomousDeployments).mockResolvedValue({
+      deployments: [mockDeployment],
+      count: 1,
+      schema_version: 1,
+    });
+    vi.mocked(paperApi.setAutonomousBotLifecycle).mockResolvedValue({
+      success: true,
+      message: "ok",
+      bot: mockBot("running"),
+      schema_version: 1,
+    });
+  });
+
+  it("renders the disabled state when options_enabled is false", async () => {
+    vi.mocked(paperApi.getOptionsCapability).mockResolvedValue({
+      enabled: false,
+      allowed_option_types: ["CE", "PE"],
+      max_contracts_per_trade: null,
+      providers: {
+        discoverer: { status: "disabled", detail: "not attached" },
+        quote: { status: "disabled", detail: "not attached" },
+        chain: { status: "disabled", detail: "not attached" },
+      },
+      capable: false,
+      execution_phase: "single_leg_capability_surface",
+      autonomous_execution_active: false,
+      last_error: null,
+      schema_version: 1,
+    });
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("Options trading is disabled for this deployment.")).toBeDefined();
+    });
+    expect(screen.queryByText(/autonomous option execution is active/i)).toBeNull();
+  });
+
+  it("renders the enabled+unavailable state when providers are not available", async () => {
+    vi.mocked(paperApi.getOptionsCapability).mockResolvedValue({
+      enabled: true,
+      allowed_option_types: ["CE", "PE"],
+      max_contracts_per_trade: null,
+      providers: {
+        discoverer: { status: "disabled", detail: "no controller" },
+        quote: { status: "unavailable", detail: "not authenticated" },
+        chain: { status: "disabled", detail: "no chain" },
+      },
+      capable: false,
+      execution_phase: "single_leg_capability_surface",
+      autonomous_execution_active: false,
+      last_error: null,
+      schema_version: 1,
+    });
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          "Options are enabled, but required providers are unavailable."
+        )
+      ).toBeDefined();
+    });
+    expect(screen.queryByText(/autonomous option execution is active/i)).toBeNull();
+  });
+
+  it("renders the enabled+capable state and explicitly says execution is NOT enabled", async () => {
+    vi.mocked(paperApi.getOptionsCapability).mockResolvedValue({
+      enabled: true,
+      allowed_option_types: ["CE"],
+      max_contracts_per_trade: 3,
+      providers: {
+        discoverer: { status: "available", detail: "ok" },
+        quote: { status: "available", detail: "ok" },
+        chain: { status: "disabled", detail: "phase 8a" },
+      },
+      capable: true,
+      execution_phase: "single_leg_capability_surface",
+      autonomous_execution_active: false,
+      last_error: null,
+      schema_version: 1,
+    });
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("Options capability available")).toBeDefined();
+    });
+    // Must show CE only (not PE) since allowed_option_types = ["CE"].
+    expect(screen.getByText("CE")).toBeDefined();
+    // Must show the configured max contracts.
+    expect(screen.getByText("3")).toBeDefined();
+    // The body text MUST say execution is NOT enabled.
+    expect(
+      screen.getByText(/Autonomous option execution is not enabled in this phase/i)
+    ).toBeDefined();
+    expect(screen.queryByText(/autonomous option execution is active/i)).toBeNull();
+  });
+
+  it("renders an error state when the capability probe fails", async () => {
+    vi.mocked(paperApi.getOptionsCapability).mockRejectedValue(
+      new Error("500 internal")
+    );
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("Options capability unavailable")).toBeDefined();
+    });
+    // The rest of the dashboard still renders.
+    expect(screen.queryAllByText("ACTIVE").length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does NOT display Greeks / OI / IV / multi-leg availability claims", async () => {
+    vi.mocked(paperApi.getOptionsCapability).mockResolvedValue({
+      enabled: true,
+      allowed_option_types: ["CE", "PE"],
+      max_contracts_per_trade: 1,
+      providers: {
+        discoverer: { status: "available", detail: "" },
+        quote: { status: "available", detail: "" },
+        chain: { status: "disabled", detail: "" },
+      },
+      capable: true,
+      execution_phase: "single_leg_capability_surface",
+      autonomous_execution_active: false,
+      last_error: null,
+      schema_version: 1,
+    });
+    render(<AutonomousCenter />);
+    await waitFor(() => {
+      expect(screen.getByText("Options capability available")).toBeDefined();
+    });
+    // These capability labels must NOT appear because the backend
+    // does not provide them today.
+    expect(screen.queryByText(/Greeks available/i)).toBeNull();
+    expect(screen.queryByText(/OI available/i)).toBeNull();
+    expect(screen.queryByText(/IV available/i)).toBeNull();
+    expect(screen.queryByText(/Multi-leg P&L available/i)).toBeNull();
+    // The "Not yet enabled" section MUST list them honestly.
+    expect(screen.getByText(/Multi-leg strategies/)).toBeDefined();
+    expect(screen.getByText(/Greeks \/ OI \/ IV analytics/)).toBeDefined();
   });
 });

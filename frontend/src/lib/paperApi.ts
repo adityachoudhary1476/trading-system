@@ -20,6 +20,7 @@ import type {
   HealthEndpointResponse,
   HealthResponse,
   OrderIntentResponse,
+  OptionsCapabilityResponse,
   PaperOrderIntent,
   PerformanceResponse,
   Phase22StrategySpec,
@@ -341,6 +342,14 @@ export const paperApi = {
     const qs = query.toString()
     return this.request<AutonomousEventsResponse>(
       `/autonomous/events${qs ? `?${qs}` : ""}`
+    )
+  },
+
+  async getOptionsCapability(
+    deploymentId: string
+  ): Promise<OptionsCapabilityResponse> {
+    return this.request<OptionsCapabilityResponse>(
+      `/deployments/${encodeURIComponent(deploymentId)}/options-capability`
     )
   },
 };

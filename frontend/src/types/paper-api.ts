@@ -665,3 +665,36 @@ export interface AutonomousDeploymentsResponse {
   count: number
   schema_version: number
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8 — Options capability surface (Phase A, observational only).
+// These types describe what the backend reports for the deployment's option
+// stack. They do NOT imply that autonomous option execution is active.
+// ---------------------------------------------------------------------------
+
+export type OptionsProviderStatusValue =
+  | "available"
+  | "unavailable"
+  | "not_configured"
+  | "disabled";
+
+export interface OptionsProviderStatus {
+  status: OptionsProviderStatusValue;
+  detail: string;
+}
+
+export interface OptionsCapabilityResponse {
+  enabled: boolean;
+  allowed_option_types: string[];
+  max_contracts_per_trade: number | null;
+  providers: {
+    discoverer: OptionsProviderStatus;
+    quote: OptionsProviderStatus;
+    chain: OptionsProviderStatus;
+  };
+  capable: boolean;
+  execution_phase: string;
+  autonomous_execution_active: false;
+  last_error: string | null;
+  schema_version: number;
+}

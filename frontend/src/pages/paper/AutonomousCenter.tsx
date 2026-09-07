@@ -9,6 +9,8 @@ import type {
   AutonomousDeploymentsResponse,
   AutonomousDeploymentSummary,
   AutonomousEventsResponse,
+  OptionsCapabilityResponse,
+  OptionsProviderStatus,
   TradingDecision,
 } from "@/types/paper-api";
 import {
@@ -35,6 +37,9 @@ export default function AutonomousCenter() {
   const [events, setEvents] = useState<AutonomousEventsResponse["events"]>([]);
   const [deployments, setDeployments] = useState<
     SectionState<AutonomousDeploymentSummary[]>
+  >({ status: "idle" });
+  const [optionsCapability, setOptionsCapability] = useState<
+    SectionState<OptionsCapabilityResponse>
   >({ status: "idle" });
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -96,10 +101,44 @@ export default function AutonomousCenter() {
     }
   };
 
+  const fetchOptionsCapability = async (
+    deploymentList: AutonomousDeploymentSummary[]
+  ) => {
+    if (!deploymentList || deploymentList.length === 0) {
+      setOptionsCapability({ status: "idle" });
+      return;
+    }
+    const target = deploymentList[0];
+    setOptionsCapability({ status: "loading" });
+    try {
+      const res = await paperApi.getOptionsCapability(target.deployment_id);
+      setOptionsCapability({ status: "ok", data: res });
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Failed to load options capability";
+      setOptionsCapability({ status: "error", message });
+    }
+  };
+
   const fetchAll = async () => {
     setLoading(true);
     setError(null);
-    await Promise.allSettled([fetchBot(), fetchScan(), fetchEvents(), fetchDeployments()]);
+    const results = await Promise.allSettled([
+      fetchBot(),
+      fetchScan(),
+      fetchEvents(),
+      fetchDeployments(),
+    ]);
+    // After deployments are populated, fetch capability for the first one.
+    setDeployments((prev) => {
+      if (prev.status === "ok" && Array.isArray(prev.data)) {
+        void fetchOptionsCapability(prev.data);
+      }
+      return prev;
+    });
+    void results;
     setLoading(false);
   };
 
@@ -421,12 +460,32 @@ export default function AutonomousCenter() {
         </Panel>
       )}
 
-      {/* Options-specific unavailability banner */}
-      <Panel title="Options Data">
-        <p className="muted">
-          Options-specific data (CE/PE legs, strike, expiry, Greeks, multi-leg P&L) is{" "}
-          <strong>Unavailable</strong> — the autonomous pipeline is equity-only.
-        </p>
+      {/* Options capability surface (Phase A — observational only). */}
+      <Panel title="Options Capability">
+        {optionsCapability.status === "idle" && (
+          <EmptyState
+            title="Options capability not yet probed"
+            hint={
+              deployments.status === "ok" &&
+              Array.isArray(deployments.data) &&
+              deployments.data.length === 0
+                ? "No deployments available to probe for options capability."
+                : "Waiting for deployment data to probe options capability."
+            }
+          />
+        )}
+        {optionsCapability.status === "loading" && (
+          <Loading label="Probing options capability…" />
+        )}
+        {optionsCapability.status === "error" && (
+          <EmptyState
+            title="Options capability unavailable"
+            hint={`Could not probe options capability: ${optionsCapability.message}. The autonomous bot remains operational; this section will refresh automatically.`}
+          />
+        )}
+        {optionsCapability.status === "ok" && (
+          <OptionsCapabilityView data={optionsCapability.data} />
+        )}
       </Panel>
 
       {/* Current Scan Results — never crashes if scan fails or returns partial data */}
@@ -620,6 +679,155 @@ export default function AutonomousCenter() {
           );
         })()}
       </Panel>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Options capability surface renderer (Phase A — observational only)
+//
+// IMPORTANT: this view MUST NOT imply that autonomous option execution is
+// active. It only describes what the backend has wired up. The autonomous
+// scheduler remains equity-only in Phase A.
+// ---------------------------------------------------------------------------
+function OptionsCapabilityView({
+  data,
+}: {
+  data: OptionsCapabilityResponse;
+}) {
+  const enabled = data.enabled;
+  const capable = data.capable;
+  const allowed = data.allowed_option_types ?? [];
+  const maxContracts = data.max_contracts_per_trade;
+  const providers = data.providers ?? {
+    discoverer: { status: "not_configured", detail: "" },
+    quote: { status: "not_configured", detail: "" },
+    chain: { status: "not_configured", detail: "" },
+  };
+
+  // Compose a deterministic phase summary that NEVER claims autonomous
+  // execution is active.
+  const phase: "disabled" | "enabled_unavailable" | "enabled_capable" =
+    !enabled
+      ? "disabled"
+      : capable
+        ? "enabled_capable"
+        : "enabled_unavailable";
+
+  const headline: Record<typeof phase, { title: string; body: string }> = {
+    disabled: {
+      title: "Options trading is disabled for this deployment.",
+      body: "The deployment's configuration does not permit option contracts. Autonomous option execution is not enabled.",
+    },
+    enabled_unavailable: {
+      title: "Options are enabled, but required providers are unavailable.",
+      body: "The deployment allows option contracts, but the backend's option-data providers are not currently available. Autonomous option execution is not enabled.",
+    },
+    enabled_capable: {
+      title: "Options capability available",
+      body: "Option contract discovery and premium data are available. Autonomous option execution is not enabled in this phase.",
+    },
+  };
+
+  return (
+    <div>
+      <p style={{ marginTop: 0 }}>
+        <strong>{headline[phase].title}</strong>
+      </p>
+      <p className="muted">{headline[phase].body}</p>
+
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+          gap: 12,
+          marginTop: 12,
+        }}
+      >
+        <MetricItem label="Deployment options_enabled" value={enabled ? "true" : "false"} />
+        <MetricItem
+          label="Allowed option types"
+          value={allowed.length === 0 ? "—" : allowed.join(" / ")}
+        />
+        <MetricItem
+          label="Max contracts / trade"
+          value={maxContracts === null || maxContracts === undefined ? "—" : String(maxContracts)}
+        />
+        <MetricItem label="Backend capable" value={capable ? "true" : "false"} />
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <p className="muted" style={{ marginBottom: 4 }}>
+          Provider status
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <ProviderStatusRow name="discoverer" provider={providers.discoverer} />
+          <ProviderStatusRow name="quote" provider={providers.quote} />
+          <ProviderStatusRow name="chain" provider={providers.chain} />
+        </div>
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <p className="muted" style={{ marginBottom: 4 }}>
+          Single-leg capability surface
+        </p>
+        <ul style={{ margin: 0, paddingLeft: 18 }}>
+          <li>CE/PE contract discovery (deployment-permitted types only)</li>
+          <li>Live option premium quote support</li>
+          <li>Paper order metadata support</li>
+        </ul>
+      </div>
+
+      <div style={{ marginTop: 16 }}>
+        <p className="muted" style={{ marginBottom: 4 }}>
+          Not yet enabled
+        </p>
+        <ul style={{ margin: 0, paddingLeft: 18 }}>
+          <li>Autonomous option execution</li>
+          <li>Multi-leg strategies</li>
+          <li>Greeks / OI / IV analytics</li>
+          <li>Lot-size-correct option accounting</li>
+        </ul>
+      </div>
+
+      {data.last_error ? (
+        <p className="muted" style={{ marginTop: 12 }}>
+          Last error: {data.last_error}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function ProviderStatusRow({
+  name,
+  provider,
+}: {
+  name: string;
+  provider: OptionsProviderStatus;
+}) {
+  const tone =
+    provider.status === "available"
+      ? "pos"
+      : provider.status === "disabled"
+        ? undefined
+        : "warn";
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 10,
+        alignItems: "center",
+        padding: "4px 0",
+      }}
+    >
+      <Pill tone={tone}>{provider.status}</Pill>
+      <span style={{ minWidth: 90 }}>
+        <strong>{name}</strong>
+      </span>
+      <span className="muted" style={{ fontSize: 12 }}>
+        {provider.detail || "—"}
+      </span>
     </div>
   );
 }

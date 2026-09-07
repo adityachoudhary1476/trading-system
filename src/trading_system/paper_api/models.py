@@ -397,3 +397,76 @@ class AutonomousEventsResponse(BaseModel):
     events: list[dict]
     count: int
     schema_version: int = 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 8 — Options capability surface (Phase A, observational only)
+# --------------------------------------------------------------------------- #
+# Possible provider states. The string values are part of the public API
+# contract — clients may branch on them.
+PROVIDER_STATUS_AVAILABLE = "available"
+PROVIDER_STATUS_UNAVAILABLE = "unavailable"
+PROVIDER_STATUS_NOT_CONFIGURED = "not_configured"
+PROVIDER_STATUS_DISABLED = "disabled"
+
+# Single-leg capability phase is supported in the controller's option
+# execution path; multi-leg requires additional phases and is reported
+# separately.
+OPTIONS_EXECUTION_PHASE = "single_leg_capability_surface"
+
+
+class OptionsProviderStatus(BaseModel):
+    """Status of a single option-data provider dependency.
+
+    ``status`` is one of the ``PROVIDER_STATUS_*`` constants. ``detail``
+    is a short, safe, human-readable explanation that never includes
+    credentials, tokens, internal paths, or stack traces.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str
+    detail: str = ""
+
+
+class OptionsCapabilityResponse(BaseModel):
+    """Capability surface for the deployment's options stack.
+
+    This endpoint is strictly observational in Phase A. It does NOT
+    place orders, does NOT enable autonomous execution, and does NOT
+    register providers. It inspects the existing
+    ``AutonomousController`` + ``PaperDeploymentConfig`` to report:
+
+    * ``enabled`` — whether the deployment's configuration permits
+      options (``PaperDeploymentConfig.options_enabled``).
+    * ``allowed_option_types`` — the deployment's configured rights
+      (verbatim from ``PaperDeploymentConfig.allowed_option_types``).
+    * ``max_contracts_per_trade`` — the deployment's configured cap
+      (verbatim from
+      ``PaperDeploymentConfig.max_options_contracts_per_trade``).
+    * ``providers`` — per-dependency status (``discoverer``,
+      ``quote``, ``chain``). The synthetic
+      ``InMemoryOptionsChainProvider`` is NEVER reported as production
+      capability.
+    * ``capable`` — whether the production option components required
+      for single-leg capability reporting are present. This is a
+      capability probe, NOT an indication that autonomous option
+      execution is active.
+    * ``last_error`` — last observed safe error string, if any.
+
+    Wording matters: ``capable`` means *the backend has the components
+    required to expose options data*; it does NOT mean *autonomous
+    options trading is enabled*. The UI must keep this distinction.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool
+    allowed_option_types: list[str] = Field(default_factory=list)
+    max_contracts_per_trade: Optional[int] = None
+    providers: dict[str, "OptionsProviderStatus"] = Field(default_factory=dict)
+    capable: bool
+    execution_phase: str = OPTIONS_EXECUTION_PHASE
+    autonomous_execution_active: bool = False
+    last_error: Optional[str] = None
+    schema_version: int = 1

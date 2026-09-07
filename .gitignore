@@ -23,6 +23,9 @@ venv/
 data/*.db
 data/*.db-journal
 data/*.sqlite
+backend/data/*.db
+backend/data/*.db-journal
+backend/data/*.sqlite
 logs/*.log
 logs/*.log.*
 fyersDataSocket.log

@@ -60,6 +60,12 @@ from .models import (
     HealthEndpointResponse,
     HealthResponse,
     LifecycleRequest,
+    OptionsCapabilityResponse,
+    OptionsProviderStatus,
+    PROVIDER_STATUS_AVAILABLE,
+    PROVIDER_STATUS_DISABLED,
+    PROVIDER_STATUS_NOT_CONFIGURED,
+    PROVIDER_STATUS_UNAVAILABLE,
     OrderIntentRequest,
     OrderIntentResponse,
     PerformanceResponse,
@@ -225,6 +231,12 @@ class PaperAPIRouter:
                   frozenset({"POST"}), self._route_restore)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/orders$",
                   frozenset({"POST"}), self._route_submit_order)
+        # Phase 8 — Options capability surface (Phase A, observational only).
+        self._add(
+            r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/options-capability$",
+            frozenset({"GET"}),
+            self._route_options_capability,
+        )
 
         # Phase 6 — Autonomous Trading Operations Center
         self._add(r"^/autonomous/bot$", frozenset({"GET"}), self._route_autonomous_bot)
@@ -673,6 +685,220 @@ class PaperAPIRouter:
 
     def _route_stop(self, ctx: RequestContext) -> ResponseEnvelope:
         return self._do_lifecycle(ctx, "stop")
+
+    # ------------------------------------------------------------------ #
+    # Phase 8 — Options capability surface (Phase A, observational only)
+    # ------------------------------------------------------------------ #
+    def _inspect_options_providers(
+        self,
+    ) -> tuple[dict[str, "OptionsProviderStatus"], bool, Optional[str]]:
+        """Inspect the controller's option-data provider wiring.
+
+        Returns ``(providers, capable, last_error)``. ``capable`` is True
+        iff the discoverer and quote provider are present and
+        non-synthetic. The ``InMemoryOptionsChainProvider`` is explicitly
+        rejected as production capability — this matches the existing
+        controller guard in
+        ``AutonomousController.resolve_options_plan``.
+
+        This function is observational. It never instantiates a
+        provider, never calls the network, and never modifies the
+        controller. It tolerates an unattached controller (returns
+        ``not_configured`` for every provider).
+
+        The chain provider is treated as optional in Phase A: single-leg
+        paper execution does not require it.
+        """
+        from trading_system.autonomous.options.discovery import (
+            CurrentOptionDiscoverer,
+        )
+        from trading_system.autonomous.options_contract import (
+            InMemoryOptionsChainProvider,
+        )
+
+        providers: dict[str, OptionsProviderStatus] = {
+            "discoverer": OptionsProviderStatus(
+                status=PROVIDER_STATUS_NOT_CONFIGURED,
+                detail="autonomous controller not attached",
+            ),
+            "quote": OptionsProviderStatus(
+                status=PROVIDER_STATUS_NOT_CONFIGURED,
+                detail="autonomous controller not attached",
+            ),
+            "chain": OptionsProviderStatus(
+                status=PROVIDER_STATUS_NOT_CONFIGURED,
+                detail="autonomous controller not attached",
+            ),
+        }
+        last_error: Optional[str] = None
+        controller = self._controller
+        if controller is None:
+            return providers, False, last_error
+
+        # Read controller slots via direct attribute access. The slots
+        # are typed ``Optional[...]`` on ``AutonomousController``; on
+        # unrelated test doubles a missing attribute is treated as
+        # "not attached". The Python AST safety scan forbids ``getattr``
+        # so we use ``try/except AttributeError`` instead.
+
+        # --- discoverer ---
+        try:
+            discoverer = controller._option_discoverer  # type: ignore[attr-defined]
+        except AttributeError:
+            discoverer = None
+        if isinstance(discoverer, CurrentOptionDiscoverer):
+            providers["discoverer"] = OptionsProviderStatus(
+                status=PROVIDER_STATUS_AVAILABLE,
+                detail="CurrentOptionDiscoverer attached",
+            )
+        elif discoverer is None:
+            providers["discoverer"] = OptionsProviderStatus(
+                status=PROVIDER_STATUS_DISABLED,
+                detail="option discoverer not attached",
+            )
+        else:
+            providers["discoverer"] = OptionsProviderStatus(
+                status=PROVIDER_STATUS_UNAVAILABLE,
+                detail="option discoverer has unexpected type",
+            )
+
+        # --- quote provider ---
+        try:
+            quote_provider = controller._quote_provider  # type: ignore[attr-defined]
+        except AttributeError:
+            quote_provider = None
+        if quote_provider is not None:
+            # ``is_authenticated`` is the duck-typed contract on the
+            # real ``CurrentOptionQuoteProvider``. On unrelated test
+            # doubles lacking the attribute we must NOT silently claim
+            # availability.
+            try:
+                auth_attr = quote_provider.is_authenticated
+            except AttributeError:
+                auth_attr = False
+            if callable(auth_attr):
+                authenticated = bool(auth_attr())
+            else:
+                authenticated = bool(auth_attr)
+            if authenticated:
+                providers["quote"] = OptionsProviderStatus(
+                    status=PROVIDER_STATUS_AVAILABLE,
+                    detail="CurrentOptionQuoteProvider authenticated",
+                )
+            else:
+                providers["quote"] = OptionsProviderStatus(
+                    status=PROVIDER_STATUS_UNAVAILABLE,
+                    detail="quote provider not authenticated",
+                )
+        else:
+            providers["quote"] = OptionsProviderStatus(
+                status=PROVIDER_STATUS_DISABLED,
+                detail="option quote provider not attached",
+            )
+
+        # --- chain provider ---
+        try:
+            chain_provider = controller._chain_provider  # type: ignore[attr-defined]
+        except AttributeError:
+            chain_provider = None
+        if chain_provider is None:
+            providers["chain"] = OptionsProviderStatus(
+                status=PROVIDER_STATUS_DISABLED,
+                detail="option chain provider not attached (Phase 8A multi-leg only)",
+            )
+        elif isinstance(chain_provider, InMemoryOptionsChainProvider):
+            providers["chain"] = OptionsProviderStatus(
+                status=PROVIDER_STATUS_UNAVAILABLE,
+                detail="synthetic chain provider must not be used in production",
+            )
+            last_error = (
+                "synthetic InMemoryOptionsChainProvider is attached; "
+                "production capability rejected"
+            )
+        else:
+            providers["chain"] = OptionsProviderStatus(
+                status=PROVIDER_STATUS_AVAILABLE,
+                detail="real chain provider attached",
+            )
+
+        # ``capable`` for single-leg options data means: discoverer + quote
+        # are both available. The chain provider is optional for Phase A.
+        capable = (
+            providers["discoverer"].status == PROVIDER_STATUS_AVAILABLE
+            and providers["quote"].status == PROVIDER_STATUS_AVAILABLE
+        )
+        return providers, capable, last_error
+
+    def _route_options_capability(self, ctx: RequestContext) -> ResponseEnvelope:
+        """Capability probe for the deployment's options stack.
+
+        Strictly observational. Returns 200 + a typed
+        :class:`OptionsCapabilityResponse` describing the deployment's
+        configured options permissions plus the controller's option-data
+        provider wiring. Returns 404 if the deployment does not exist.
+
+        Does NOT place orders, does NOT change the scheduler, does NOT
+        instantiate providers, and does NOT enable autonomous option
+        execution. ``autonomous_execution_active`` is always False in
+        Phase A; it is a hard-coded constant that future phases may
+        consult.
+        """
+        deployment_id = ctx.params["deployment_id"]
+        deployment = self.center.get_deployment(deployment_id)
+        if deployment is None:
+            raise APIErrorException(
+                code=APIErrorCode.UNKNOWN_DEPLOYMENT,
+                message=f"unknown deployment {deployment_id!r}",
+                status=404,
+            )
+
+        cfg = deployment.config
+        # Defensive read — PaperDeploymentConfig validates CE/PE at model
+        # construction time, but a malformed deployment config_json could
+        # in principle bypass that. We never crash the dashboard.
+        try:
+            allowed_option_types = list(cfg.allowed_option_types or [])
+        except Exception:  # noqa: BLE001
+            allowed_option_types = []
+        try:
+            max_contracts = cfg.max_options_contracts_per_trade
+        except Exception:  # noqa: BLE001
+            max_contracts = None
+
+        try:
+            providers, capable, last_error = self._inspect_options_providers()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "options capability inspection failed for %s: %r",
+                deployment_id,
+                exc,
+            )
+            providers = {
+                name: OptionsProviderStatus(
+                    status=PROVIDER_STATUS_UNAVAILABLE,
+                    detail="capability inspection failed",
+                )
+                for name in ("discoverer", "quote", "chain")
+            }
+            capable = False
+            last_error = "capability inspection failed"
+
+        # ``enabled`` reflects only the deployment configuration. The
+        # capability surface is intentionally decoupled from the
+        # scheduler: a deployment may be configured for options even if
+        # the scheduler never exercises them (Phase A status quo).
+        enabled = bool(cfg.options_enabled)
+
+        body = OptionsCapabilityResponse(
+            enabled=enabled,
+            allowed_option_types=allowed_option_types,
+            max_contracts_per_trade=max_contracts,
+            providers=providers,
+            capable=capable,
+            autonomous_execution_active=False,
+            last_error=last_error,
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
 
     def _route_reset_circuit_breaker(self, ctx: RequestContext) -> ResponseEnvelope:
         deployment_id = ctx.params["deployment_id"]

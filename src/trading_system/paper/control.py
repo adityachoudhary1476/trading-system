@@ -979,30 +979,30 @@ class PaperTradingControlCenter:
             if persisted is not None and persisted.result_json:
                 import json
                 cached = json.loads(persisted.result_json)
-            return OrderResult(
-                order_id=cached["order_id"],
-                client_order_id=cached.get("client_order_id"),
-                symbol=cached["symbol"],
-                side=cached["side"],
-                quantity=cached["quantity"],
-                order_type=cached["order_type"],
-                limit_price=cached.get("limit_price"),
-                status=cached["status"],
-                filled_quantity=cached["filled_quantity"],
-                avg_fill_price=cached["avg_fill_price"],
-                fills=cached["fills"],
-                cash_after=cached.get("cash_after"),
-                equity_after=cached.get("equity_after"),
-                realized_pnl_after=cached.get("realized_pnl_after"),
-                unrealized_pnl_after=cached.get("unrealized_pnl_after"),
-                position_qty_after=cached.get("position_qty_after"),
-                reject_reason=cached.get("reject_reason", ""),
-                is_idempotent_replay=True,
-                options_contract_id=cached.get("options_contract_id"),
-                strike=cached.get("strike"),
-                expiry=cached.get("expiry"),
-                option_type=cached.get("option_type"),
-            )
+                return OrderResult(
+                    order_id=cached["order_id"],
+                    client_order_id=cached.get("client_order_id"),
+                    symbol=cached["symbol"],
+                    side=cached["side"],
+                    quantity=cached["quantity"],
+                    order_type=cached["order_type"],
+                    limit_price=cached.get("limit_price"),
+                    status=cached["status"],
+                    filled_quantity=cached["filled_quantity"],
+                    avg_fill_price=cached["avg_fill_price"],
+                    fills=cached["fills"],
+                    cash_after=cached.get("cash_after"),
+                    equity_after=cached.get("equity_after"),
+                    realized_pnl_after=cached.get("realized_pnl_after"),
+                    unrealized_pnl_after=cached.get("unrealized_pnl_after"),
+                    position_qty_after=cached.get("position_qty_after"),
+                    reject_reason=cached.get("reject_reason", ""),
+                    is_idempotent_replay=True,
+                    options_contract_id=cached.get("options_contract_id"),
+                    strike=cached.get("strike"),
+                    expiry=cached.get("expiry"),
+                    option_type=cached.get("option_type"),
+                )
 
         # --- 6. Validate inputs against broker rules ---
         broker = runner.broker
