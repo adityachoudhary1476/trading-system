@@ -1,0 +1,43 @@
+# Trading System Autonomous Scheduler Worker Dockerfile
+# Build context: repository root
+FROM python:3.11-slim
+
+# Set environment variables
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app/src:/app/backend
+
+# Create non-root user
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+
+# Set work directory
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy application code
+COPY backend/ ./backend/
+COPY src/ ./src/
+
+# Ensure the data directory exists for SQLite fallback
+RUN mkdir -p /app/data
+
+# Change ownership to non-root user
+RUN chown -R appuser:appuser /app
+
+# Switch to non-root user
+USER appuser
+
+# Health check - worker is healthy if process is running
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD pgrep -f "autonomous_scheduler" > /dev/null || exit 1
+
+# Run the autonomous scheduler worker
+CMD ["python", "-m", "backend.autonomous_scheduler"]

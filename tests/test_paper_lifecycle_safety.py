@@ -504,6 +504,8 @@ class TestPhase18Safety:
                 "operations.py",
                 "risk.py",
                 "snapshot.py",
+                # Phase 23: liveness computation - pure heartbeat logic, no broker.
+                "liveness.py",
             ), f"{path.name} does not reference PaperBroker"
             # The runner MUST NOT import FyersBroker / UpstoxBroker etc.
             for live in ("FyersBroker", "UpstoxBroker", "ZerodhaBroker", "LiveBroker"):

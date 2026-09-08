@@ -1,0 +1,44 @@
+# Railway Worker Service Configuration for Autonomous Scheduler
+# This is a separate service from the FastAPI backend
+
+[service]
+name = "finova-autonomous-scheduler"
+description = "Autonomous paper-trading scheduler worker"
+
+[build]
+builder = "docker"
+dockerfilePath = "Dockerfile.worker"
+
+[deploy]
+# Run as a background worker, not a web service
+# Railway will not route HTTP traffic to this service
+restartPolicyType = "always"
+# No health check endpoint needed - this is a worker
+
+[env]
+# REQUIRED: Enable the autonomous scheduler
+AUTONOMOUS_SCHEDULER_ENABLED = "true"
+
+# REQUIRED: Persistent PostgreSQL database (same as FastAPI backend)
+# Use Railway's PostgreSQL or Supabase
+# MARKET_DATA_DB_URL = "postgresql://user:pass@host:5432/db"
+
+# Scheduler configuration
+AUTONOMOUS_SCAN_INTERVAL_SECONDS = "60"
+AUTONOMOUS_BOT_ID = "bot-paper-default"
+
+# Market data credentials (dedicated Upstox account for market data feed)
+UPSTOX_CLIENT_ID = "your_upstox_client_id"
+UPSTOX_SERVICE_ACCOUNT_TOKEN = "your_upstox_service_account_token"
+
+# Optional: Option underlyings for Phase 8 options trading
+# AUTONOMOUS_OPTION_UNDERLYINGS = "NIFTY,BANKNIFTY,FINNIFTY"
+
+# Optional: Max option quote age
+# AUTONOMOUS_MAX_OPTION_QUOTE_AGE_SECONDS = "300"
+
+# Logging
+LOG_LEVEL = "INFO"
+
+# Python path
+PYTHONPATH = "/app/src:/app/backend"

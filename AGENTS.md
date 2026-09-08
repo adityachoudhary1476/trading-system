@@ -128,6 +128,19 @@ python -m pytest tests/ -q
 python -m pytest tests/test_intelligence_v3.py tests/test_news_intelligence.py tests/test_pattern_engine.py tests/test_v4_integration.py tests/test_v5_*.py -q
 ```
 
+## ECC Integration
+
+This project integrates selected features from [ECC](https://github.com/affaan-m/ECC)
+(agent harness performance optimization system) under `.ecc/`. Key imports:
+
+- **Rules**: `.ecc/rules/` — coding standards (TypeScript, Python, React, common), security checklist, code review standards
+- **Skills**: `.ecc/skills/` — TDD workflow, security review, trading-agent security, Python/React testing patterns
+- **Agents**: `.kilo/agents/` — `security-reviewer`, `typescript-reviewer`, `python-reviewer`, `fastapi-reviewer`
+- **Security skill**: `.ecc/skills/finova-security/SKILL.md` — Finova-specific invariants (paper-only, causal snapshots, API contracts, Railway persistence)
+
+Use the Finova security skill for security-sensitive changes:
+`Use skill: .ecc/skills/finova-security/SKILL.md`
+
 ## Notes / gotchas
 
 - The paper API server is loopback-only by default; it does **not** contact any

@@ -666,7 +666,7 @@ class EvidenceStore:
             s.commit()
 
     # --- schema migration (Phase 17) ---
-    CURRENT_SCHEMA_VERSION = 3
+    CURRENT_SCHEMA_VERSION = 4
 
     def ensure_schema_current(self) -> int:
         """Idempotent forward migration. Returns the resulting schema version.
@@ -681,6 +681,10 @@ class EvidenceStore:
           * v3 — Phase 8 added three columns to ``paper_deployments``
             (``options_enabled``, ``allowed_option_types_json``,
             ``max_options_contracts_per_trade``) for paper-options support.
+          * v4 — Phase 23 added scheduler heartbeat columns to ``paper_deployments``
+            (``last_tick_at``, ``last_successful_tick_at``, ``last_market_data_at``,
+            ``last_decision_at``, ``last_execution_at``, ``worker_id``,
+            ``worker_version``).
 
         All migrations are additive only: existing tables/columns are
         untouched, so Phase 16/17 records remain readable. Safe to call on
@@ -722,6 +726,21 @@ class EvidenceStore:
                         "ALTER TABLE paper_deployments "
                         "ADD COLUMN max_options_contracts_per_trade INTEGER"
                     ))
+
+            if current < 4 and inspector.has_table("paper_deployments"):
+                existing = {c["name"] for c in inspector.get_columns("paper_deployments")}
+                phase23_cols = {
+                    "last_tick_at": "ALTER TABLE paper_deployments ADD COLUMN last_tick_at DATETIME",
+                    "last_successful_tick_at": "ALTER TABLE paper_deployments ADD COLUMN last_successful_tick_at DATETIME",
+                    "last_market_data_at": "ALTER TABLE paper_deployments ADD COLUMN last_market_data_at DATETIME",
+                    "last_decision_at": "ALTER TABLE paper_deployments ADD COLUMN last_decision_at DATETIME",
+                    "last_execution_at": "ALTER TABLE paper_deployments ADD COLUMN last_execution_at DATETIME",
+                    "worker_id": "ALTER TABLE paper_deployments ADD COLUMN worker_id VARCHAR(64)",
+                    "worker_version": "ALTER TABLE paper_deployments ADD COLUMN worker_version VARCHAR(32)",
+                }
+                for col, ddl in phase23_cols.items():
+                    if col not in existing:
+                        conn.execute(_text(ddl))
 
         self._set_schema_version(self.CURRENT_SCHEMA_VERSION)
         return self.CURRENT_SCHEMA_VERSION

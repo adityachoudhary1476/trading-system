@@ -1005,6 +1005,8 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
     unexpected controller-level error is logged and the worker keeps
     running.
     """
+    from trading_system.paper.deployment import PaperDeploymentStatus
+
     tick_id = uuid.uuid4().hex[:12]
     bot_id = controller.config.bot_id
     started_at = datetime.now(UTC)
@@ -1020,6 +1022,15 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
 
     # --- 2. Regular session ---
     if not _is_regular_session(started_at):
+        # Update heartbeat: market closed
+        center = controller.control_center
+        for d in center.list_deployments():
+            if d.notes and d.notes.startswith(f"bot:{bot_id}") and d.status == PaperDeploymentStatus.ACTIVE:
+                center.update_scheduler_heartbeat(
+                    d.deployment_id,
+                    last_tick_at=started_at.isoformat(),
+                    last_market_data_at=started_at.isoformat(),
+                )
         return {**base, "result": "skip", "reason": "market_closed"}
 
     # --- 3. Fresh data for at least one allowed symbol ---
@@ -1030,6 +1041,14 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         if _has_fresh_data(controller.control_center, s, timeframe)
     ]
     if not fresh_symbols:
+        # Update heartbeat: data stale
+        center = controller.control_center
+        for d in center.list_deployments():
+            if d.notes and d.notes.startswith(f"bot:{bot_id}") and d.status == PaperDeploymentStatus.ACTIVE:
+                center.update_scheduler_heartbeat(
+                    d.deployment_id,
+                    last_tick_at=started_at.isoformat(),
+                )
         return {**base, "result": "skip", "reason": "no_fresh_market_data"}
 
     # --- 4. Run scan -> rank -> compatibility -> decisions ---
@@ -1043,6 +1062,15 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
             "error_category": "transient_infrastructure",
         }
     if not scan.candidates:
+        # Update heartbeat: no candidates
+        center = controller.control_center
+        for d in center.list_deployments():
+            if d.notes and d.notes.startswith(f"bot:{bot_id}") and d.status == PaperDeploymentStatus.ACTIVE:
+                center.update_scheduler_heartbeat(
+                    d.deployment_id,
+                    last_tick_at=started_at.isoformat(),
+                    last_market_data_at=started_at.isoformat(),
+                )
         return {**base, "result": "skip", "reason": "no_candidates"}
     try:
         ranking = controller.rank_candidates(scan)
@@ -1050,6 +1078,15 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         decisions = controller.generate_strategy_decisions(compat)
     except Exception as exc:  # noqa: BLE001
         logger.exception("decision pipeline raised")
+        # Update heartbeat: decision error
+        center = controller.control_center
+        for d in center.list_deployments():
+            if d.notes and d.notes.startswith(f"bot:{bot_id}") and d.status == PaperDeploymentStatus.ACTIVE:
+                center.update_scheduler_heartbeat(
+                    d.deployment_id,
+                    last_tick_at=started_at.isoformat(),
+                    last_market_data_at=started_at.isoformat(),
+                )
         return {
             **base, "result": "error",
             "reason": f"decision_error:{type(exc).__name__}",
@@ -1064,6 +1101,16 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         and d.selected_configuration is not None
     ]
     if not eligible:
+        # Update heartbeat: no eligible decisions
+        center = controller.control_center
+        for d in center.list_deployments():
+            if d.notes and d.notes.startswith(f"bot:{bot_id}") and d.status == PaperDeploymentStatus.ACTIVE:
+                center.update_scheduler_heartbeat(
+                    d.deployment_id,
+                    last_tick_at=started_at.isoformat(),
+                    last_market_data_at=started_at.isoformat(),
+                    last_decision_at=started_at.isoformat(),
+                )
         return {
             **base, "result": "skip", "reason": "no_eligible_decisions",
             "decision_count": len(decisions.decisions),
@@ -1072,6 +1119,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
     # --- 5. Per-decision execution with isolation ---
     submissions = []
     seen: set[tuple[str, str, str]] = set()
+    execution_happened = False
     for decision in eligible:
         identity = (
             decision.opportunity_symbol,
@@ -1102,7 +1150,23 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
                 }
             )
             continue
+        if result.get("result") in ("submitted", "already_executed"):
+            execution_happened = True
         submissions.append(result)
+
+    # Update heartbeat for all bot deployments after tick completes
+    center = controller.control_center
+    tick_completed_at = datetime.now(UTC).isoformat()
+    for d in center.list_deployments():
+        if d.notes and d.notes.startswith(f"bot:{bot_id}") and d.status == PaperDeploymentStatus.ACTIVE:
+            center.update_scheduler_heartbeat(
+                d.deployment_id,
+                last_tick_at=tick_completed_at,
+                last_successful_tick_at=tick_completed_at,
+                last_market_data_at=started_at.isoformat(),
+                last_decision_at=tick_completed_at if eligible else None,
+                last_execution_at=tick_completed_at if execution_happened else None,
+            )
 
     return {
         **base,

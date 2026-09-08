@@ -24,6 +24,7 @@ from .circuit_breaker import CircuitState
 from .deployment import PaperDeployment, PaperDeploymentStatus
 from .operations import HealthStatus
 from .session import PaperSession, SESSION_SCHEMA_VERSION
+from .liveness import SchedulerLiveness
 
 
 # --------------------------------------------------------------------------- #
@@ -51,6 +52,16 @@ class DashboardDeploymentSummary(BaseModel):
     # Phase 8: Options support
     options_enabled: bool = False
     allowed_option_types: list[str] = Field(default_factory=lambda: ["CE", "PE"])
+
+    # Phase 23: Scheduler liveness
+    liveness: str = SchedulerLiveness.DISABLED.value
+    last_tick_at: Optional[str] = None
+    last_successful_tick_at: Optional[str] = None
+    last_market_data_at: Optional[str] = None
+    last_decision_at: Optional[str] = None
+    last_execution_at: Optional[str] = None
+    worker_id: Optional[str] = None
+    worker_version: Optional[str] = None
 
 
 class DashboardStrategySummary(BaseModel):
@@ -195,6 +206,8 @@ class PaperControlCenterSnapshot(BaseModel):
 # Builders
 # --------------------------------------------------------------------------- #
 def build_deployment_summary(deployment: PaperDeployment) -> DashboardDeploymentSummary:
+    from .control import compute_scheduler_liveness
+    liveness = compute_scheduler_liveness(deployment)
     return DashboardDeploymentSummary(
         deployment_id=deployment.deployment_id,
         strategy_id=deployment.strategy_id,
@@ -210,6 +223,14 @@ def build_deployment_summary(deployment: PaperDeployment) -> DashboardDeployment
         notes=deployment.notes or "",
         options_enabled=deployment.config.options_enabled,
         allowed_option_types=deployment.config.allowed_option_types,
+        liveness=liveness.value,
+        last_tick_at=deployment.last_tick_at,
+        last_successful_tick_at=deployment.last_successful_tick_at,
+        last_market_data_at=deployment.last_market_data_at,
+        last_decision_at=deployment.last_decision_at,
+        last_execution_at=deployment.last_execution_at,
+        worker_id=deployment.worker_id,
+        worker_version=deployment.worker_version,
     )
 
 

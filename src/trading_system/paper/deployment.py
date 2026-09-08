@@ -126,6 +126,17 @@ class PaperDeployment(BaseModel):
     updated_at: str = ""
     notes: str = ""
 
+    # --- Scheduler heartbeat fields (Phase 23) ---
+    # These track the autonomous scheduler worker liveness, separate from
+    # the passive PaperStrategyRunner. They are persisted in PostgreSQL.
+    last_tick_at: Optional[str] = None
+    last_successful_tick_at: Optional[str] = None
+    last_market_data_at: Optional[str] = None
+    last_decision_at: Optional[str] = None
+    last_execution_at: Optional[str] = None
+    worker_id: Optional[str] = None
+    worker_version: Optional[str] = None
+
     # Convenience accessors for Phase 8 options fields.
     @property
     def options_enabled(self) -> bool:
@@ -157,6 +168,13 @@ class PaperDeployment(BaseModel):
             options_enabled=self.config.options_enabled,
             allowed_option_types_json=json.dumps(self.config.allowed_option_types),
             max_options_contracts_per_trade=self.config.max_options_contracts_per_trade,
+            last_tick_at=_parse_dt(self.last_tick_at) if self.last_tick_at else None,
+            last_successful_tick_at=_parse_dt(self.last_successful_tick_at) if self.last_successful_tick_at else None,
+            last_market_data_at=_parse_dt(self.last_market_data_at) if self.last_market_data_at else None,
+            last_decision_at=_parse_dt(self.last_decision_at) if self.last_decision_at else None,
+            last_execution_at=_parse_dt(self.last_execution_at) if self.last_execution_at else None,
+            worker_id=self.worker_id,
+            worker_version=self.worker_version,
         )
 
     @classmethod
@@ -177,6 +195,13 @@ class PaperDeployment(BaseModel):
             activated_at=rec.activated_at.isoformat() if rec.activated_at else None,
             updated_at=rec.updated_at.isoformat() if rec.updated_at else "",
             notes=rec.notes or "",
+            last_tick_at=rec.last_tick_at.isoformat() if rec.last_tick_at else None,
+            last_successful_tick_at=rec.last_successful_tick_at.isoformat() if rec.last_successful_tick_at else None,
+            last_market_data_at=rec.last_market_data_at.isoformat() if rec.last_market_data_at else None,
+            last_decision_at=rec.last_decision_at.isoformat() if rec.last_decision_at else None,
+            last_execution_at=rec.last_execution_at.isoformat() if rec.last_execution_at else None,
+            worker_id=rec.worker_id,
+            worker_version=rec.worker_version,
         )
 
 
@@ -201,6 +226,15 @@ class PaperDeploymentRecord(Base):
     options_enabled = Column(Boolean, nullable=False, default=False)
     allowed_option_types_json = Column(Text, nullable=False, default='["CE","PE"]')
     max_options_contracts_per_trade = Column(Integer, nullable=True)
+
+    # --- Scheduler heartbeat fields (Phase 23) ---
+    last_tick_at = Column(DateTime(timezone=True), nullable=True)
+    last_successful_tick_at = Column(DateTime(timezone=True), nullable=True)
+    last_market_data_at = Column(DateTime(timezone=True), nullable=True)
+    last_decision_at = Column(DateTime(timezone=True), nullable=True)
+    last_execution_at = Column(DateTime(timezone=True), nullable=True)
+    worker_id = Column(String(64), nullable=True)
+    worker_version = Column(String(32), nullable=True)
 
 
 # --------------------------------------------------------------------------- #

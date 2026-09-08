@@ -32,6 +32,8 @@ logs/*.log
 logs/*.log.*
 fyersDataSocket.log
 *.log
+# Railway worker config may contain real DB URLs / tokens
+railway-worker.toml
 
 # Test / tooling caches
 .pytest_cache/

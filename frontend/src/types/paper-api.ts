@@ -1,3 +1,11 @@
+export type SchedulerLiveness =
+  | "worker_alive"
+  | "worker_stale"
+  | "market_closed"
+  | "data_stale"
+  | "worker_error"
+  | "disabled";
+
 export type DeploymentStatus =
   | "created"
   | "active"
@@ -59,6 +67,15 @@ export interface DashboardDeploymentSummary {
   schema_version: number;
   options_enabled: boolean;
   allowed_option_types: string[];
+  // Phase 23: Scheduler liveness
+  liveness: SchedulerLiveness;
+  last_tick_at: string | null;
+  last_successful_tick_at: string | null;
+  last_market_data_at: string | null;
+  last_decision_at: string | null;
+  last_execution_at: string | null;
+  worker_id: string | null;
+  worker_version: string | null;
 }
 
 export interface DashboardStrategySummary {

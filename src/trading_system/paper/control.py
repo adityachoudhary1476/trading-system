@@ -151,6 +151,16 @@ STATUS_ACCEPTS_ORDERS: frozenset = frozenset({PaperDeploymentStatus.ACTIVE})
 
 
 # --------------------------------------------------------------------------- #
+# Scheduler Liveness (Phase 23) - imported from liveness module
+# --------------------------------------------------------------------------- #
+from .liveness import (
+    SchedulerLiveness,
+    compute_scheduler_liveness,
+    DEFAULT_HEARTBEAT_THRESHOLD_SECONDS,
+)
+
+
+# --------------------------------------------------------------------------- #
 # Control Center
 # --------------------------------------------------------------------------- #
 class PaperTradingControlCenter:
@@ -1164,6 +1174,77 @@ class PaperTradingControlCenter:
             event_type,
             payload,
         )
+
+    # ------------------------------------------------------------------ #
+    # Scheduler heartbeat (Phase 23)
+    # ------------------------------------------------------------------ #
+    def update_scheduler_heartbeat(
+        self,
+        deployment_id: str,
+        *,
+        last_tick_at: Optional[str] = None,
+        last_successful_tick_at: Optional[str] = None,
+        last_market_data_at: Optional[str] = None,
+        last_decision_at: Optional[str] = None,
+        last_execution_at: Optional[str] = None,
+        worker_id: Optional[str] = None,
+        worker_version: Optional[str] = None,
+    ) -> PaperDeployment:
+        """Update the autonomous scheduler heartbeat for a deployment.
+
+        This persists worker liveness to the database so the dashboard can
+        distinguish an actually running scheduler from a stale deployment record.
+        """
+        deployment = self._load_or_cache_deployment(deployment_id)
+        now = _now_iso()
+        if last_tick_at is not None:
+            deployment.last_tick_at = last_tick_at
+        else:
+            deployment.last_tick_at = now
+        if last_successful_tick_at is not None:
+            deployment.last_successful_tick_at = last_successful_tick_at
+        if last_market_data_at is not None:
+            deployment.last_market_data_at = last_market_data_at
+        if last_decision_at is not None:
+            deployment.last_decision_at = last_decision_at
+        if last_execution_at is not None:
+            deployment.last_execution_at = last_execution_at
+        if worker_id is not None:
+            deployment.worker_id = worker_id
+        if worker_version is not None:
+            deployment.worker_version = worker_version
+        deployment.updated_at = now
+        with self.registry.store._Session() as s:
+            rec = s.get(PaperDeploymentRecord, deployment_id)
+            if rec is not None:
+                if last_tick_at is not None:
+                    rec.last_tick_at = _parse_dt(last_tick_at)
+                else:
+                    rec.last_tick_at = _parse_dt(now)
+                if last_successful_tick_at is not None:
+                    rec.last_successful_tick_at = _parse_dt(last_successful_tick_at)
+                if last_market_data_at is not None:
+                    rec.last_market_data_at = _parse_dt(last_market_data_at)
+                if last_decision_at is not None:
+                    rec.last_decision_at = _parse_dt(last_decision_at)
+                if last_execution_at is not None:
+                    rec.last_execution_at = _parse_dt(last_execution_at)
+                if worker_id is not None:
+                    rec.worker_id = worker_id
+                if worker_version is not None:
+                    rec.worker_version = worker_version
+                rec.updated_at = _parse_dt(now)
+                s.commit()
+        return deployment
+
+    def get_scheduler_liveness(self, deployment_id: str) -> SchedulerLiveness:
+        """Get the scheduler liveness state for a deployment.
+
+        This is the authoritative liveness check for the dashboard.
+        """
+        deployment = self._load_or_cache_deployment(deployment_id)
+        return compute_scheduler_liveness(deployment)
+
 
     # ------------------------------------------------------------------ #
     # Internals

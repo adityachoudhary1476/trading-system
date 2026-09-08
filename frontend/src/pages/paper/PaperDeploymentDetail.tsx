@@ -1,10 +1,23 @@
 import { useEffect, useState, useCallback } from "react";
 import { useParams, Link } from "react-router-dom";
 import { paperApi } from "@/lib/paperApi";
-import type { DeploymentResponse, DashboardSnapshotResponse } from "@/types/paper-api";
-import { Panel, EmptyState, Button, StatusIndicator, MetricItem, Feedback, ConfirmDialog } from "@/components/ui";
+import type { DeploymentResponse, DashboardSnapshotResponse, SchedulerLiveness } from "@/types/paper-api";
+import { Panel, EmptyState, Button, StatusIndicator, MetricItem, Feedback, ConfirmDialog, Pill } from "@/components/ui";
 import { fmt } from "@/components/paper/paperShared";
 import { fmtNum } from "@/lib/format";
+
+function LivenessBadge({ liveness }: { liveness: SchedulerLiveness }) {
+  const config: Record<SchedulerLiveness, { label: string; tone: "pos" | "warn" | "neg" | undefined }> = {
+    worker_alive: { label: "WORKER ALIVE", tone: "pos" },
+    worker_stale: { label: "WORKER STALE", tone: "neg" },
+    market_closed: { label: "MARKET CLOSED", tone: undefined },
+    data_stale: { label: "DATA STALE", tone: "warn" },
+    worker_error: { label: "WORKER ERROR", tone: "neg" },
+    disabled: { label: "DISABLED", tone: undefined },
+  };
+  const { label, tone } = config[liveness] || { label: liveness, tone: undefined };
+  return <Pill tone={tone}>{label}</Pill>;
+}
 
 export function PaperDeploymentDetail() {
   const { deploymentId } = useParams<{ deploymentId: string }>();
@@ -75,6 +88,7 @@ export function PaperDeploymentDetail() {
                 <span className="pill">{deployment.deployment.execution_mode.toUpperCase()}</span>
                 <StatusIndicator status={deployment.deployment.status} />
                 <StatusIndicator status={snapshot.session.session_status} />
+                <LivenessBadge liveness={deployment.deployment.liveness} />
               </div>
             </div>
             <div className="dh-metrics">

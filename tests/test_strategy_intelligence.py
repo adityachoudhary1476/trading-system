@@ -719,10 +719,10 @@ class TestPersistence:
         ds = _make_dataset()
         registry.record_evidence(_make_research_evidence(strategy, ds, FRESH_DATE))
         # Lifecycle table added by migration; existing evidence unaffected.
-        # Schema version is 3 after Phase 8's paper_deployments forward
-        # migration (options columns) was added.
+        # Schema version is 4 after Phase 23's paper_deployments forward
+        # migration (scheduler heartbeat columns) was added.
         intel = StrategyIntelligence(registry)
-        assert intel.store._schema_version() == 3
+        assert intel.store._schema_version() == 4
         evs = intel.registry.list_evidence(strategy_id=strategy.strategy_id)
         assert len(evs) == 1
 
@@ -731,7 +731,7 @@ class TestPersistence:
         v1 = intel.store._schema_version()
         intel.store.ensure_schema_current()
         v2 = intel.store._schema_version()
-        assert v1 == v2 == 3
+        assert v1 == v2 == 4
 
 
 # --------------------------------------------------------------------------- #

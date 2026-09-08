@@ -19,6 +19,7 @@ import requests
 from ..data.base import MarketDataProvider
 from .instruments import Instrument, InstrumentRegistry, InstrumentType, InternalSymbol
 from .symbol_map import to_upstox_symbol
+from .upstox_v3_resolver import UpstoxV3InstrumentResolver
 from .events import InternalMarketEvent, EventType
 from ..config import settings, log
 
@@ -66,13 +67,16 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         max_retries: int = 3,
     ) -> None:
         self.client_id = client_id or os.getenv("UPSTOX_CLIENT_ID", "")
-        self.access_token = access_token or os.getenv("UPSTOX_ACCESS_TOKEN", "")
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.registry = registry or InstrumentRegistry()
-        self._ws: Optional[object] = None
-        # V3 resolver is lazily initialised by the V3 WebSocket owner (the
-        # backend runtime) so legacy REST callers don't pay the lookup cost.
+        self.access_token = (
+            access_token
+            or os.getenv("UPSTOX_ACCESS_TOKEN", "")
+            or os.getenv("UPSTOX_SERVICE_ACCOUNT_TOKEN", "")
+        )
+        # V3 resolver for correct instrument keys (ISIN-based for equities)
+        self._v3_resolver = UpstoxV3InstrumentResolver(
+            access_token=self.access_token,
+            timeout=timeout,
+        )
 
     @property
     def is_real_time(self) -> bool:
@@ -93,7 +97,12 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         instr = self._resolve(internal_symbol)
         if instr.provider_symbol:
             return instr.provider_symbol
-        return to_upstox_symbol(instr)
+        # Use V3 resolver for correct instrument keys (ISIN-based for equities)
+        try:
+            return self._v3_resolver.resolve_instrument(instr)
+        except Exception:
+            # Fallback to legacy mapping for derivatives/unsupported instruments
+            return to_upstox_symbol(instr)
 
     def _registry_lookup_internal(self, upstox_symbol: str) -> str:
         """Reverse-map an Upstox wire symbol to an internal key (best effort)."""

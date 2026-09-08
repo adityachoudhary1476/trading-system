@@ -31,7 +31,8 @@ def _build_market_data_callable():
 
     settings = get_settings()
     md_provider = UpstoxMarketDataProvider(
-        access_token=settings.upstox_service_account_token or None
+        client_id=settings.upstox_client_id or None,
+        access_token=settings.upstox_service_account_token or None,
     )
 
     def market_data_callable(symbol: str, timeframe: str):

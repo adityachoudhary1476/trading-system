@@ -1256,12 +1256,15 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
     freshness = EvidenceFreshnessConfig(max_age_days=180)
 
     # --- Market data provider (read-only; never places orders) ---
-    # Reads Upstox credentials from env. If absent, the callable fails closed
-    # (returns None) so the scanner rejects every symbol as MISSING_MARKET_DATA
-    # rather than fabricating data.
+    # Reads Upstox credentials from settings (loaded from backend/.env).
+    # If absent, the callable fails closed (returns None) so the scanner
+    # rejects every symbol as MISSING_MARKET_DATA rather than fabricating data.
     from trading_system.india.upstox import UpstoxMarketDataProvider
 
-    md_provider = UpstoxMarketDataProvider()
+    md_provider = UpstoxMarketDataProvider(
+        client_id=getattr(settings, "upstox_client_id", "") or None,
+        access_token=getattr(settings, "upstox_service_account_token", "") or None,
+    )
 
     def market_data_callable(symbol: str, timeframe: str):
         if not md_provider.is_authenticated:
