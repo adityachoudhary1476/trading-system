@@ -1,4 +1,4 @@
-"""Tests for Upstox market-data adapter (no network, no real credentials)."""
+﻿"""Tests for Upstox market-data adapter (no network, no real credentials)."""
 from __future__ import annotations
 
 from unittest.mock import patch
@@ -39,6 +39,18 @@ def test_upstox_is_a_marketdataprovider():
 
 def test_upstox_historical_normalization_shape(monkeypatch):
     prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
+
+    def search_fn(query):
+        return [
+            {
+                "segment": "NSE_EQ",
+                "trading_symbol": "SBIN",
+                "isin": "INE062A01020",
+                "instrument_key": "NSE_EQ|INE062A01020",
+            }
+        ]
+
+    prov._v3_resolver = type(prov._v3_resolver)(access_token="tok", search_fn=search_fn)
     monkeypatch.setattr(prov, "_get", lambda path, params=None: _upstox_history_response())
     df = prov.get_historical("NSE:SBIN", "1d", 2)
     assert len(df) == 2
@@ -59,10 +71,41 @@ def test_upstox_requires_auth_for_live(monkeypatch):
         prov.connect_live(["NSE:SBIN"], on_event=lambda e: None)
 
 
-def test_upstox_symbol_resolution_without_creds():
+def test_upstox_symbol_resolution_without_creds(monkeypatch):
+    monkeypatch.delenv("UPSTOX_CLIENT_ID", raising=False)
+    monkeypatch.delenv("UPSTOX_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("UPSTOX_SERVICE_ACCOUNT_TOKEN", raising=False)
+
     prov = UpstoxMarketDataProvider()
-    assert prov._upstox_symbol("NSE:SBIN") == "NSE_EQ|SBIN"
-    assert prov._upstox_symbol("NSE:NIFTY50") == "NSE_INDEX|NIFTY50"
+    assert not prov.is_authenticated
+    with pytest.raises(Exception):
+        prov._upstox_symbol("NSE:SBIN")
+
+
+def test_upstox_symbol_resolution_with_creds_uses_isin():
+    """With credentials, equity resolution must return the ISIN-based V3 key."""
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
+
+    def search_fn(query):
+        return [
+            {
+                "segment": "NSE_EQ",
+                "trading_symbol": "SBIN",
+                "isin": "INE062A01020",
+                "instrument_key": "NSE_EQ|INE062A01020",
+            }
+        ]
+
+    prov._v3_resolver = type(prov._v3_resolver)(access_token="tok", search_fn=search_fn)
+    assert prov._upstox_symbol("NSE:SBIN") == "NSE_EQ|INE062A01020"
+
+
+def test_upstox_index_symbol_resolution():
+    """Indices must resolve to the canonical NSE_INDEX / BSE_INDEX keys."""
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
+    assert prov._upstox_symbol("NSE:NIFTY50") == "NSE_INDEX|Nifty 50"
+    assert prov._upstox_symbol("NSE:BANKNIFTY") == "NSE_INDEX|Nifty Bank"
+    assert prov._upstox_symbol("NSE:FINNIFTY") == "NSE_INDEX|Nifty Fin Service"
 
 
 def test_upstox_ws_message_normalization(monkeypatch):

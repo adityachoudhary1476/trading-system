@@ -72,6 +72,9 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             or os.getenv("UPSTOX_ACCESS_TOKEN", "")
             or os.getenv("UPSTOX_SERVICE_ACCOUNT_TOKEN", "")
         )
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.registry = registry or InstrumentRegistry()
         # V3 resolver for correct instrument keys (ISIN-based for equities)
         self._v3_resolver = UpstoxV3InstrumentResolver(
             access_token=self.access_token,
@@ -97,12 +100,11 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         instr = self._resolve(internal_symbol)
         if instr.provider_symbol:
             return instr.provider_symbol
-        # Use V3 resolver for correct instrument keys (ISIN-based for equities)
-        try:
-            return self._v3_resolver.resolve_instrument(instr)
-        except Exception:
-            # Fallback to legacy mapping for derivatives/unsupported instruments
-            return to_upstox_symbol(instr)
+        # Delegate fully to the V3 resolver. For equities/indices it returns
+        # the correct ISIN-based / named key, or raises UnresolvedInstrumentError
+        # if the symbol cannot be resolved (e.g. no credentials). For derivatives
+        # it falls back to the legacy mapping internally.
+        return self._v3_resolver.resolve_instrument(instr)
 
     def _registry_lookup_internal(self, upstox_symbol: str) -> str:
         """Reverse-map an Upstox wire symbol to an internal key (best effort)."""

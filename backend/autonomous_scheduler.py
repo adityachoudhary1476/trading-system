@@ -1118,13 +1118,15 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
 
     # --- 5. Per-decision execution with isolation ---
     submissions = []
-    seen: set[tuple[str, str, str]] = set()
+    seen: set[tuple[str, str, str, str]] = set()
     execution_happened = False
     for decision in eligible:
+        option_intent = getattr(decision.signal, "option_intent", None)
         identity = (
             decision.opportunity_symbol,
             decision.selected_configuration.strategy_id,
             decision.selected_configuration.timeframe,
+            option_intent or "",
         )
         if identity in seen:
             submissions.append(
@@ -1136,7 +1138,14 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
             continue
         seen.add(identity)
         try:
-            result = _execute_one_decision(controller, decision, target_qty)
+            if option_intent in ("CE", "PE"):
+                result = _execute_one_option_decision(
+                    controller, decision,
+                    spot_price=float(decision.signal.reference_price),
+                    target_qty=target_qty,
+                )
+            else:
+                result = _execute_one_decision(controller, decision, target_qty)
         except Exception as exc:  # noqa: BLE001
             logger.exception(
                 "per-decision execution raised; isolating",

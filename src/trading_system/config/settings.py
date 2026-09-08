@@ -17,6 +17,11 @@ from dotenv import load_dotenv
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 load_dotenv(_PROJECT_ROOT / ".env")
 
+# Also load backend/.env for secrets such as Upstox credentials.
+_BACKEND_ENV = _PROJECT_ROOT / "backend" / ".env"
+if _BACKEND_ENV.is_file():
+    load_dotenv(_BACKEND_ENV)
+
 
 def _get_bool(key: str, default: bool = False) -> bool:
     val = os.getenv(key)

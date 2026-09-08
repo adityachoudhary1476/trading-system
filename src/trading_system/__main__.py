@@ -18,6 +18,12 @@ import time
 
 import pandas as pd
 
+from pathlib import Path
+from dotenv import load_dotenv
+_BACKEND_ENV = Path(__file__).resolve().parents[2] / "backend" / ".env"
+if _BACKEND_ENV.is_file():
+    load_dotenv(_BACKEND_ENV)
+
 from .config import settings, configure_logging
 from .data.pipeline import IngestionPipeline
 from .analysis.pipeline import analyze
@@ -1256,14 +1262,14 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
     freshness = EvidenceFreshnessConfig(max_age_days=180)
 
     # --- Market data provider (read-only; never places orders) ---
-    # Reads Upstox credentials from settings (loaded from backend/.env).
+    # Reads Upstox credentials from environment variables / backend/.env.
     # If absent, the callable fails closed (returns None) so the scanner
     # rejects every symbol as MISSING_MARKET_DATA rather than fabricating data.
     from trading_system.india.upstox import UpstoxMarketDataProvider
 
     md_provider = UpstoxMarketDataProvider(
-        client_id=getattr(settings, "upstox_client_id", "") or None,
-        access_token=getattr(settings, "upstox_service_account_token", "") or None,
+        client_id=os.getenv("UPSTOX_CLIENT_ID") or None,
+        access_token=os.getenv("UPSTOX_SERVICE_ACCOUNT_TOKEN") or os.getenv("UPSTOX_ACCESS_TOKEN") or None,
     )
 
     def market_data_callable(symbol: str, timeframe: str):
@@ -1328,8 +1334,20 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
             repository=repo,
             market_data_provider=market_data_callable,
         )
-        # Pre-populate the repository with the option universe from Upstox
-        for underlying in ("NIFTY", "BANKNIFTY", "FINNIFTY", "NIFTY50"):
+        # Pre-populate the repository with the option universe from Upstox.
+        # Uses the bot's configured allowed_option_underlyings first, then
+        # falls back to AUTONOMOUS_OPTION_UNDERLYINGS env var. If neither
+        # is set, no underlyings are pre-populated; option discovery will
+        # still work lazily when execute_option_order is called.
+        option_underlyings = (
+            bot_config.user_constraints.allowed_option_underlyings
+            or frozenset(
+                part.strip().upper()
+                for part in os.environ.get("AUTONOMOUS_OPTION_UNDERLYINGS", "").split(",")
+                if part.strip()
+            )
+        )
+        for underlying in option_underlyings:
             UpstoxInstrumentDiscovery(md_provider, repo).discover_options(underlying)
 
     if discoverer is not None and repo is not None:
