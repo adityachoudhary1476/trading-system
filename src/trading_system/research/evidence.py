@@ -729,12 +729,19 @@ class EvidenceStore:
 
             if current < 4 and inspector.has_table("paper_deployments"):
                 existing = {c["name"] for c in inspector.get_columns("paper_deployments")}
+                # Use dialect-appropriate timestamp type: TIMESTAMPTZ for PostgreSQL
+                # (matches SQLAlchemy DateTime(timezone=True)), DATETIME for SQLite.
+                dialect = self.engine.dialect.name
+                if dialect == "postgresql":
+                    ts_type = "TIMESTAMPTZ"
+                else:
+                    ts_type = "DATETIME"
                 phase23_cols = {
-                    "last_tick_at": "ALTER TABLE paper_deployments ADD COLUMN last_tick_at DATETIME",
-                    "last_successful_tick_at": "ALTER TABLE paper_deployments ADD COLUMN last_successful_tick_at DATETIME",
-                    "last_market_data_at": "ALTER TABLE paper_deployments ADD COLUMN last_market_data_at DATETIME",
-                    "last_decision_at": "ALTER TABLE paper_deployments ADD COLUMN last_decision_at DATETIME",
-                    "last_execution_at": "ALTER TABLE paper_deployments ADD COLUMN last_execution_at DATETIME",
+                    "last_tick_at": f"ALTER TABLE paper_deployments ADD COLUMN last_tick_at {ts_type}",
+                    "last_successful_tick_at": f"ALTER TABLE paper_deployments ADD COLUMN last_successful_tick_at {ts_type}",
+                    "last_market_data_at": f"ALTER TABLE paper_deployments ADD COLUMN last_market_data_at {ts_type}",
+                    "last_decision_at": f"ALTER TABLE paper_deployments ADD COLUMN last_decision_at {ts_type}",
+                    "last_execution_at": f"ALTER TABLE paper_deployments ADD COLUMN last_execution_at {ts_type}",
                     "worker_id": "ALTER TABLE paper_deployments ADD COLUMN worker_id VARCHAR(64)",
                     "worker_version": "ALTER TABLE paper_deployments ADD COLUMN worker_version VARCHAR(32)",
                 }

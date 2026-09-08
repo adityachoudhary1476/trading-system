@@ -98,7 +98,12 @@ def legacy_db(tmp_path):
 
 
 class TestPaperDeploymentMigration:
-    """Phase 8 forward-migration regression tests for ``paper_deployments``."""
+    """Phase 8 forward-migration regression tests for ``paper_deployments``.
+
+    Note: The test fixture creates a legacy DB at schema version 2 (pre-Phase 8).
+    Since Phase 23 (schema v4) is now also present, ``ensure_schema_current``
+    runs both v2→v3 and v3→v4 migrations in one call, returning version 4.
+    """
 
     def test_create_all_does_not_add_missing_columns(self, legacy_db):
         """Documents the documented limitation: ``Base.metadata.create_all``
@@ -116,28 +121,40 @@ class TestPaperDeploymentMigration:
         )
 
     def test_ensure_schema_current_adds_missing_columns(self, legacy_db):
-        """The v2→v3 migration step adds the 3 missing columns."""
+        """The v2→v3 migration step adds the 3 missing Phase 8 columns,
+        and v3→v4 adds the 7 Phase 23 heartbeat columns."""
         from trading_system.research.evidence import EvidenceStore
         version = EvidenceStore(legacy_db).ensure_schema_current()
-        assert version == 3
+        # Both migrations run; final version is 4 (Phase 23).
+        assert version == 4
         inspector = inspect(legacy_db)
         cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
+        # Phase 8 columns
         assert "options_enabled" in cols
         assert "allowed_option_types_json" in cols
         assert "max_options_contracts_per_trade" in cols
+        # Phase 23 heartbeat columns
+        assert "last_tick_at" in cols
+        assert "last_successful_tick_at" in cols
+        assert "last_market_data_at" in cols
+        assert "last_decision_at" in cols
+        assert "last_execution_at" in cols
+        assert "worker_id" in cols
+        assert "worker_version" in cols
 
     def test_ensure_schema_current_is_idempotent(self, legacy_db):
         """A second call must be a safe no-op (no error, columns preserved)."""
         from trading_system.research.evidence import EvidenceStore
         store = EvidenceStore(legacy_db)
         first = store.ensure_schema_current()
-        assert first == 3
+        assert first == 4
         # Second call: must not raise.
         second = store.ensure_schema_current()
-        assert second == 3
+        assert second == 4
         inspector = inspect(legacy_db)
         cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
         assert "options_enabled" in cols
+        assert "last_tick_at" in cols
 
     def test_legacy_rows_remain_readable_post_migration(self, legacy_db):
         """A row written *before* the migration must round-trip with
