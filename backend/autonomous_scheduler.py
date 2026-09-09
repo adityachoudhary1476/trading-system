@@ -471,12 +471,19 @@ def _check_sl_tp_for_position(runner, position, ts):
     return None
 
 
-def _flatten_positions(runner, ts):
-    """Flatten all open positions (emergency/circuit-breaker)."""
-    if runner is None:
+def _flatten_positions(runner, center, session_id, ts, decision_id=None):
+    """Flatten all open positions through the centralized order-intent boundary.
+
+    Uses ``center.submit_order_intent(emergency=True)`` so that flattening
+    still produces auditable OrderResults, idempotency records, and event
+    log entries, while bypassing the circuit-breaker and risk-guard checks
+    that would otherwise reject orders during an emergency.
+    """
+    if runner is None or center is None or session_id is None:
         return
     try:
-        from trading_system.execution.orders import Side
+        from trading_system.execution.orders import OrderIntent, OrderType, Side
+
         positions = runner.broker.positions()
         for symbol, pos in list(positions.items()):
             if not pos.is_open:
@@ -485,17 +492,31 @@ def _flatten_positions(runner, ts):
             if qty <= 0:
                 continue
             side = Side.SELL if pos.qty > 0 else Side.BUY
-            runner.broker.submit_order(
+            client_order_id = (
+                f"emergency-flatten-{decision_id}-{symbol}"
+                if decision_id
+                else f"emergency-flatten-{symbol}-{ts.isoformat()}"
+            )
+            intent = OrderIntent(
                 symbol=symbol,
                 side=side,
                 quantity=qty,
-                order_type="MARKET",
+                order_type=OrderType.MARKET,
+                client_order_id=client_order_id,
                 current_price=pos.current_price,
                 options_contract_id=pos.options_contract_id,
                 strike=pos.strike,
                 expiry=pos.expiry,
                 option_type=pos.option_type,
             )
+            try:
+                center.submit_order_intent(
+                    session_id=session_id,
+                    intent=intent,
+                    emergency=True,
+                )
+            except Exception:  # noqa: BLE001
+                continue
     except Exception:  # noqa: BLE001
         pass
 
@@ -846,7 +867,7 @@ def _execute_one_option_decision(
         # --- Circuit breaker: flatten if open ---
         cb = runner.circuit_breaker
         if cb is not None and cb.is_open:
-            _flatten_positions(runner, datetime.now(timezone.utc))
+            _flatten_positions(runner, controller.control_center, sid, datetime.now(timezone.utc), decision_id=getattr(decision, "decision_id", None))
             return {
                 "result": "circuit_breaker_open",
                 "detail": cb.reason,
@@ -1184,7 +1205,7 @@ def _execute_one_decision(
     # --- Circuit breaker: flatten if open ---
     cb = runner.circuit_breaker
     if cb is not None and cb.is_open:
-        _flatten_positions(runner, datetime.now(timezone.utc))
+        _flatten_positions(runner, center, sid, datetime.now(timezone.utc), decision_id=signal_id)
         return {
             "symbol": symbol,
             "strategy_id": strategy_id,

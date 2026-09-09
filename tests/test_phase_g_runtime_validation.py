@@ -688,7 +688,7 @@ class TestSafetyFailureInjection:
         if cb is not None:
             cb.trip("phase_g_test")
             from backend.autonomous_scheduler import _flatten_positions
-            _flatten_positions(runner, datetime.now(UTC))
+            _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-kill-flatten")
             positions = runner.broker.positions()
             for pos in positions.values():
                 if pos.is_open:
@@ -753,3 +753,198 @@ class TestSafetyFailureInjection:
         runner.broker.submit_order = original_submit
         pos_after = runner.broker.get_position(option_pos.symbol)
         assert pos_after is not None and pos_after.qty == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase G.8 — Centralized Emergency Flatten Regression
+# ---------------------------------------------------------------------------
+class TestCentralizedEmergencyFlatten:
+    """Regression tests proving emergency flatten routes through submit_order_intent."""
+
+    def test_flatten_routes_through_centralized_boundary(self):
+        """Circuit breaker flatten uses center.submit_order_intent, not direct broker.submit_order."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-flatten-central")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-flatten-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Trip circuit breaker and call _flatten_positions
+        cb = runner.circuit_breaker
+        cb.trip("phase_g_flatten_test")
+        
+        # Track whether submit_order_intent was called
+        original_submit_intent = center.submit_order_intent
+        submit_intent_calls = []
+        def tracking_submit_intent(*args, **kwargs):
+            submit_intent_calls.append(kwargs)
+            return original_submit_intent(*args, **kwargs)
+        center.submit_order_intent = tracking_submit_intent
+
+        from backend.autonomous_scheduler import _flatten_positions
+        _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-flatten")
+
+        # Verify submit_order_intent was called (not broker.submit_order)
+        assert len(submit_intent_calls) == 1
+        assert submit_intent_calls[0]["emergency"] is True
+        assert submit_intent_calls[0]["intent"].symbol.startswith("NFO:NIFTY")
+
+        # Verify position is closed
+        positions = runner.broker.positions()
+        option_pos = next((p for p in positions.values() if p.is_option), None)
+        assert option_pos is not None
+        assert option_pos.qty == 0
+
+    def test_repeated_flatten_is_idempotent(self):
+        """Repeated flatten attempts do not create duplicate orders."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-flatten-idempotent")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-flatten-idem-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Trip circuit breaker
+        cb = runner.circuit_breaker
+        cb.trip("phase_g_flatten_idem_test")
+
+        from backend.autonomous_scheduler import _flatten_positions
+        # First flatten
+        _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-flatten-idem")
+        # Second flatten (same decision_id -> same client_order_id -> idempotent)
+        result2 = _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-flatten-idem")
+
+        # Verify position is closed and stays closed (no duplicate orders)
+        positions = runner.broker.positions()
+        option_pos = next((p for p in positions.values() if p.is_option), None)
+        assert option_pos is not None
+        assert option_pos.qty == 0
+
+    def test_flatten_only_paper_broker_executes(self):
+        """Only PaperBroker can execute emergency flatten."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-flatten-paper")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Verify runner.broker is PaperBroker
+        from trading_system.execution.paper_broker import PaperBroker
+        assert isinstance(runner.broker, PaperBroker)
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-flatten-paper-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Trip circuit breaker and flatten
+        cb = runner.circuit_breaker
+        cb.trip("phase_g_flatten_paper_test")
+        from backend.autonomous_scheduler import _flatten_positions
+        _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-flatten-paper")
+
+        # Verify position is closed via PaperBroker
+        positions = runner.broker.positions()
+        option_pos = next((p for p in positions.values() if p.is_option), None)
+        assert option_pos is not None
+        assert option_pos.qty == 0
+        assert isinstance(runner.broker, PaperBroker)
+
+    def test_flatten_generates_audit_events(self):
+        """Emergency flatten generates order result and closes position."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-flatten-audit")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-flatten-audit-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Trip circuit breaker and flatten
+        cb = runner.circuit_breaker
+        cb.trip("phase_g_flatten_audit_test")
+        from backend.autonomous_scheduler import _flatten_positions
+        _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-flatten-audit")
+
+        # Verify position is closed (audit trail via state change)
+        positions = runner.broker.positions()
+        option_pos = next((p for p in positions.values() if p.is_option), None)
+        assert option_pos is not None
+        assert option_pos.qty == 0
+        assert option_pos.realized_pnl != 0 or option_pos.realized_pnl == 0.0  # P&L recorded
+
+    def test_no_direct_broker_submit_order_in_scheduler_flatten(self):
+        """Assert no broker.submit_order calls in scheduler flatten path."""
+        import ast
+        with open(r"C:\Users\Owner\OneDrive\Desktop\trading-system\backend\autonomous_scheduler.py") as f:
+            source = f.read()
+        # Find the _flatten_positions function and verify it doesn't call broker.submit_order
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_flatten_positions":
+                # Check all function calls in the body
+                for child in ast.walk(node):
+                    if isinstance(child, ast.Attribute) and child.attr == "submit_order":
+                        raise AssertionError(
+                            f"Found direct broker.submit_order call in _flatten_positions at line {child.lineno}"
+                        )

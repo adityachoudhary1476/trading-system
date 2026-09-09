@@ -891,6 +891,8 @@ class PaperTradingControlCenter:
         self,
         session_id: str,
         intent: OrderIntent,
+        *,
+        emergency: bool = False,
     ) -> OrderResult:
         """Submit a single external order intent through the full safety stack.
 
@@ -906,6 +908,10 @@ class PaperTradingControlCenter:
         ``client_order_id`` provides idempotency: when it is set, a retry with
         the same key returns the previously persisted result instead of
         creating a duplicate order/fill.
+
+        When ``emergency=True``, the circuit-breaker and risk-guard checks
+        are skipped so that emergency flattening can close positions even
+        when those safety layers would otherwise reject new orders.
         """
         runner = self._runners.get(session_id)
         if runner is None:
@@ -914,7 +920,9 @@ class PaperTradingControlCenter:
         deployment = runner.deployment
 
         # --- 1. Lifecycle: only ACTIVE deployments accept external orders ---
-        if deployment.status not in STATUS_ACCEPTS_ORDERS:
+        # Emergency flattening is allowed even when the deployment is not ACTIVE
+        # so that the circuit breaker can close positions during a halt.
+        if not emergency and deployment.status not in STATUS_ACCEPTS_ORDERS:
             self._emit_external_event(
                 runner, "order_intent_rejected",
                 symbol=intent.symbol, client_order_id=intent.client_order_id,
@@ -925,40 +933,42 @@ class PaperTradingControlCenter:
                 f"(status={deployment.status.value}); orders are not accepted"
             )
 
-        # --- 2. Circuit breaker: OPEN means halt ---
-        cb = runner.circuit_breaker
-        if cb is not None and cb.is_open:
-            self._emit_external_event(
-                runner, "order_intent_rejected",
-                symbol=intent.symbol, client_order_id=intent.client_order_id,
-                reason=f"circuit_breaker_open:{cb.reason}",
-            )
-            raise ControlCenterError(
-                f"circuit breaker is open for deployment {deployment.deployment_id}; "
-                f"reason={cb.reason}"
-            )
-
-        # --- 3. Risk guard ---
-        risk = runner._risk_guard
-        if risk is not None:
-            account = runner.broker.account()
-            position = runner.broker.get_position(intent.symbol)
-            decision, reason = risk.check(
-                max_drawdown=runner._max_drawdown,
-                equity=account.equity,
-                position=position,
-                rejected_orders=runner._rejected_orders,
-                consecutive_errors=runner._consecutive_errors,
-            )
-            if decision == RiskDecision.HALT:
+        # --- 2. Circuit breaker: OPEN means halt (skipped for emergency) ---
+        if not emergency:
+            cb = runner.circuit_breaker
+            if cb is not None and cb.is_open:
                 self._emit_external_event(
                     runner, "order_intent_rejected",
                     symbol=intent.symbol, client_order_id=intent.client_order_id,
-                    reason=f"risk_halt:{reason}",
+                    reason=f"circuit_breaker_open:{cb.reason}",
                 )
                 raise ControlCenterError(
-                    f"risk guard halted; reason={reason}"
+                    f"circuit breaker is open for deployment {deployment.deployment_id}; "
+                    f"reason={cb.reason}"
                 )
+
+        # --- 3. Risk guard (skipped for emergency) ---
+        if not emergency:
+            risk = runner._risk_guard
+            if risk is not None:
+                account = runner.broker.account()
+                position = runner.broker.get_position(intent.symbol)
+                decision, reason = risk.check(
+                    max_drawdown=runner._max_drawdown,
+                    equity=account.equity,
+                    position=position,
+                    rejected_orders=runner._rejected_orders,
+                    consecutive_errors=runner._consecutive_errors,
+                )
+                if decision == RiskDecision.HALT:
+                    self._emit_external_event(
+                        runner, "order_intent_rejected",
+                        symbol=intent.symbol, client_order_id=intent.client_order_id,
+                        reason=f"risk_halt:{reason}",
+                    )
+                    raise ControlCenterError(
+                        f"risk guard halted; reason={reason}"
+                    )
 
         # --- 4. Short-selling policy ---
         if intent.side == Side.SELL and not deployment.config.allow_short:
