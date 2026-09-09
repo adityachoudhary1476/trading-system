@@ -483,6 +483,7 @@ def _flatten_positions(runner, center, session_id, ts, decision_id=None):
         return
     try:
         from trading_system.execution.orders import OrderIntent, OrderType, Side
+        from trading_system.paper.control import EmergencyAuthorization
 
         positions = runner.broker.positions()
         for symbol, pos in list(positions.items()):
@@ -509,11 +510,17 @@ def _flatten_positions(runner, center, session_id, ts, decision_id=None):
                 expiry=pos.expiry,
                 option_type=pos.option_type,
             )
+            auth = EmergencyAuthorization(
+                caller="autonomous_scheduler",
+                reason=f"circuit_breaker_flatten:{decision_id or 'unknown'}",
+                timestamp=ts,
+            )
             try:
                 center.submit_order_intent(
                     session_id=session_id,
                     intent=intent,
                     emergency=True,
+                    emergency_authorization=auth,
                 )
             except Exception:  # noqa: BLE001
                 continue

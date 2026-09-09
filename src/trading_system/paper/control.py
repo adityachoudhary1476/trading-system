@@ -145,6 +145,24 @@ class NotPaperModeError(ControlCenterError):
     """Raised when the underlying deployment's execution_mode is not paper."""
 
 
+class EmergencyAuthorization:
+    """Authorizes an emergency order intent.
+
+    Only explicitly authorized callers may pass ``emergency=True`` to
+    :meth:`PaperTradingControlCenter.submit_order_intent`. This prevents
+    arbitrary code from bypassing the circuit-breaker and risk-guard safety
+    layers.
+    """
+
+    def __init__(self, caller: str, reason: str, timestamp: Optional[datetime] = None):
+        self.caller = caller
+        self.reason = reason
+        self.timestamp = timestamp or datetime.now(timezone.utc)
+
+    def __repr__(self) -> str:
+        return f"EmergencyAuthorization(caller={self.caller!r}, reason={self.reason!r}, ts={self.timestamp.isoformat()})"
+
+
 # Deployment statuses in which the control center accepts external
 # (agent-driven) order intents. Only ACTIVE deployments are tradable.
 STATUS_ACCEPTS_ORDERS: frozenset = frozenset({PaperDeploymentStatus.ACTIVE})
@@ -893,6 +911,7 @@ class PaperTradingControlCenter:
         intent: OrderIntent,
         *,
         emergency: bool = False,
+        emergency_authorization: Optional[EmergencyAuthorization] = None,
     ) -> OrderResult:
         """Submit a single external order intent through the full safety stack.
 
@@ -911,13 +930,107 @@ class PaperTradingControlCenter:
 
         When ``emergency=True``, the circuit-breaker and risk-guard checks
         are skipped so that emergency flattening can close positions even
-        when those safety layers would otherwise reject new orders.
+        when those safety layers would otherwise reject new orders. However,
+        emergency orders are subject to strict exposure invariants:
+
+        * Cannot increase absolute market exposure.
+        * Cannot reverse a position (long→short or short→long).
+        * Cannot open a position from flat.
+        * Flatten quantity cannot exceed the currently persisted position.
+        * Only explicitly authorized callers may submit emergency orders.
         """
         runner = self._runners.get(session_id)
         if runner is None:
             raise UnknownDeploymentError(session_id)
 
         deployment = runner.deployment
+
+        # --- 0. Emergency authorization ---
+        if emergency:
+            if emergency_authorization is None:
+                raise ControlCenterError(
+                    "emergency order requires EmergencyAuthorization; "
+                    "caller must explicitly authorize emergency=True"
+                )
+            if not isinstance(emergency_authorization, EmergencyAuthorization):
+                raise ControlCenterError(
+                    f"invalid emergency authorization: {type(emergency_authorization).__name__}"
+                )
+
+        # --- 0.5. Emergency exposure invariant ---
+        # Emergency orders must NEVER increase absolute market exposure.
+        if emergency:
+            position = runner.broker.get_position(intent.symbol)
+            pos_qty = position.qty if position is not None else 0.0
+            abs_pos_qty = abs(pos_qty)
+
+            # Cannot open a position from flat.
+            if abs_pos_qty == 0:
+                self._emit_external_event(
+                    runner, "order_intent_rejected",
+                    symbol=intent.symbol, client_order_id=intent.client_order_id,
+                    reason="emergency_cannot_open_from_flat",
+                    emergency=True, emergency_caller=emergency_authorization.caller,
+                    emergency_reason=emergency_authorization.reason,
+                )
+                raise ControlCenterError(
+                    f"emergency order cannot open position from flat for "
+                    f"{intent.symbol}; current position qty={pos_qty}"
+                )
+
+            # Cannot reverse through zero into an opposite position.
+            if intent.side == Side.SELL and pos_qty < 0:
+                self._emit_external_event(
+                    runner, "order_intent_rejected",
+                    symbol=intent.symbol, client_order_id=intent.client_order_id,
+                    reason="emergency_cannot_reverse_short_to_long",
+                    emergency=True, emergency_caller=emergency_authorization.caller,
+                    emergency_reason=emergency_authorization.reason,
+                )
+                raise ControlCenterError(
+                    f"emergency order cannot reverse short position for "
+                    f"{intent.symbol}; current position qty={pos_qty}"
+                )
+            if intent.side == Side.BUY and pos_qty > 0:
+                self._emit_external_event(
+                    runner, "order_intent_rejected",
+                    symbol=intent.symbol, client_order_id=intent.client_order_id,
+                    reason="emergency_cannot_reverse_long_to_short",
+                    emergency=True, emergency_caller=emergency_authorization.caller,
+                    emergency_reason=emergency_authorization.reason,
+                )
+                raise ControlCenterError(
+                    f"emergency order cannot reverse long position for "
+                    f"{intent.symbol}; current position qty={pos_qty}"
+                )
+
+            # Flatten quantity cannot exceed the currently persisted position.
+            if intent.side == Side.SELL and intent.quantity > abs_pos_qty:
+                self._emit_external_event(
+                    runner, "order_intent_rejected",
+                    symbol=intent.symbol, client_order_id=intent.client_order_id,
+                    reason="emergency_quantity_exceeds_position",
+                    emergency=True, emergency_caller=emergency_authorization.caller,
+                    emergency_reason=emergency_authorization.reason,
+                    position_qty=pos_qty, requested_quantity=intent.quantity,
+                )
+                raise ControlCenterError(
+                    f"emergency SELL quantity {intent.quantity} exceeds long "
+                    f"position {abs_pos_qty} for {intent.symbol}"
+                )
+            if intent.side == Side.BUY and intent.quantity > abs_pos_qty:
+                self._emit_external_event(
+                    runner, "order_intent_rejected",
+                    symbol=intent.symbol, client_order_id=intent.client_order_id,
+                    reason="emergency_quantity_exceeds_position",
+                    emergency=True, emergency_caller=emergency_authorization.caller,
+                    emergency_reason=emergency_authorization.reason,
+                    position_qty=pos_qty, requested_quantity=intent.quantity,
+                )
+                raise ControlCenterError(
+                    f"emergency BUY quantity {intent.quantity} exceeds short "
+                    f"position {abs_pos_qty} for {intent.symbol}"
+                )
 
         # --- 1. Lifecycle: only ACTIVE deployments accept external orders ---
         # Emergency flattening is allowed even when the deployment is not ACTIVE
@@ -1123,6 +1236,9 @@ class PaperTradingControlCenter:
             order_id=order.order_id, side=intent.side.value,
             quantity=intent.quantity, status=order.status.value,
             fill_count=len(order.fills),
+            emergency=emergency,
+            emergency_caller=emergency_authorization.caller if emergency_authorization else None,
+            emergency_reason=emergency_authorization.reason if emergency_authorization else None,
         )
 
         # --- 9. Persist idempotency record ---

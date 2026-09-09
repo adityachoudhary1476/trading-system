@@ -948,3 +948,349 @@ class TestCentralizedEmergencyFlatten:
                         raise AssertionError(
                             f"Found direct broker.submit_order call in _flatten_positions at line {child.lineno}"
                         )
+
+
+# ---------------------------------------------------------------------------
+# Phase G.9 — Emergency Exposure Invariants
+# ---------------------------------------------------------------------------
+class TestEmergencyExposureInvariants:
+    """Core invariant tests for emergency order execution."""
+
+    def test_emergency_cannot_open_from_flat(self):
+        """Emergency orders cannot open a position from flat."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-emergency-flat")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # No open position — emergency should be rejected
+        from trading_system.paper.control import EmergencyAuthorization
+        from trading_system.execution.orders import OrderIntent, OrderType, Side
+
+        intent = OrderIntent(
+            symbol="NFO:NIFTY2099123122000CE",
+            side=Side.SELL,
+            quantity=1.0,
+            order_type=OrderType.MARKET,
+            client_order_id="emergency-flat-test",
+            current_price=185.0,
+        )
+        auth = EmergencyAuthorization(
+            caller="test",
+            reason="emergency_cannot_open_from_flat_test",
+            timestamp=datetime.now(UTC),
+        )
+        with pytest.raises(Exception) as exc_info:
+            center.submit_order_intent(
+                session_id=sid,
+                intent=intent,
+                emergency=True,
+                emergency_authorization=auth,
+            )
+        assert "cannot open position from flat" in str(exc_info.value).lower()
+
+    def test_emergency_cannot_reverse_long_to_short(self):
+        """Emergency SELL cannot reverse a long position into short."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-emergency-reverse-l")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Open a long position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-reverse-long-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Attempt emergency BUY (would reverse long to short) — should fail
+        from trading_system.paper.control import EmergencyAuthorization
+        from trading_system.execution.orders import OrderIntent, OrderType, Side
+
+        intent = OrderIntent(
+            symbol="NFO:NIFTY2099123122000CE",
+            side=Side.BUY,
+            quantity=1.0,
+            order_type=OrderType.MARKET,
+            client_order_id="emergency-reverse-long-test",
+            current_price=185.0,
+        )
+        auth = EmergencyAuthorization(
+            caller="test",
+            reason="emergency_cannot_reverse_long_to_short_test",
+            timestamp=datetime.now(UTC),
+        )
+        with pytest.raises(Exception) as exc_info:
+            center.submit_order_intent(
+                session_id=sid,
+                intent=intent,
+                emergency=True,
+                emergency_authorization=auth,
+            )
+        assert "cannot reverse long position" in str(exc_info.value).lower()
+
+    def test_emergency_cannot_reverse_short_to_long(self):
+        """Emergency BUY cannot reverse a short position into long."""
+        from trading_system.execution.orders import Side
+        
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-emergency-reverse-s")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=True, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Open a short position directly via broker
+        runner.broker.submit_order(
+            symbol="NFO:NIFTY2099123122000CE",
+            side=Side.SELL,
+            quantity=1.0,
+            order_type=OrderType.MARKET,
+            current_price=185.0,
+        )
+
+        # Attempt emergency SELL (would reverse short to long) — should fail
+        from trading_system.paper.control import EmergencyAuthorization
+
+        intent = OrderIntent(
+            symbol="NFO:NIFTY2099123122000CE",
+            side=Side.SELL,
+            quantity=1.0,
+            order_type=OrderType.MARKET,
+            client_order_id="emergency-reverse-short-test",
+            current_price=185.0,
+        )
+        auth = EmergencyAuthorization(
+            caller="test",
+            reason="emergency_cannot_reverse_short_to_long_test",
+            timestamp=datetime.now(UTC),
+        )
+        with pytest.raises(Exception) as exc_info:
+            center.submit_order_intent(
+                session_id=sid,
+                intent=intent,
+                emergency=True,
+                emergency_authorization=auth,
+            )
+        assert "cannot reverse short position" in str(exc_info.value).lower()
+
+    def test_emergency_quantity_cannot_exceed_position(self):
+        """Emergency flatten quantity cannot exceed current position."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-emergency-qty")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-emergency-qty-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Attempt emergency SELL with quantity > position — should fail
+        from trading_system.paper.control import EmergencyAuthorization
+        from trading_system.execution.orders import OrderIntent, OrderType, Side
+
+        intent = OrderIntent(
+            symbol="NFO:NIFTY2099123122000CE",
+            side=Side.SELL,
+            quantity=10.0,  # exceeds position of 1
+            order_type=OrderType.MARKET,
+            client_order_id="emergency-qty-test",
+            current_price=185.0,
+        )
+        auth = EmergencyAuthorization(
+            caller="test",
+            reason="emergency_quantity_exceeds_position_test",
+            timestamp=datetime.now(UTC),
+        )
+        with pytest.raises(Exception) as exc_info:
+            center.submit_order_intent(
+                session_id=sid,
+                intent=intent,
+                emergency=True,
+                emergency_authorization=auth,
+            )
+        assert "quantity" in str(exc_info.value).lower() and "exceeds" in str(exc_info.value).lower()
+
+    def test_emergency_requires_authorization(self):
+        """emergency=True is only accepted from explicitly authorized callers."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-emergency-auth")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-emergency-auth-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Attempt emergency without authorization — should fail
+        from trading_system.execution.orders import OrderIntent, OrderType, Side
+
+        intent = OrderIntent(
+            symbol="NFO:NIFTY2099123122000CE",
+            side=Side.SELL,
+            quantity=1.0,
+            order_type=OrderType.MARKET,
+            client_order_id="emergency-no-auth-test",
+            current_price=185.0,
+        )
+        with pytest.raises(Exception) as exc_info:
+            center.submit_order_intent(
+                session_id=sid,
+                intent=intent,
+                emergency=True,
+            )
+        assert "emergencyauthorization" in str(exc_info.value).lower()
+
+    def test_emergency_order_has_audit_classification(self):
+        """Every emergency order receives a distinct audit classification/reason."""
+        from trading_system.paper.events import PaperOperationsEventLog
+        
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-emergency-audit")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        
+        # Attach event log to capture audit events
+        event_log = PaperOperationsEventLog(dep)
+        runner._event_log = event_log
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-emergency-audit-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Trip circuit breaker and flatten
+        cb = runner.circuit_breaker
+        cb.trip("phase_g_emergency_audit_test")
+        from backend.autonomous_scheduler import _flatten_positions
+        _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-emergency-audit")
+
+        # Verify the event log contains emergency classification
+        events = runner.event_log.events if runner.event_log else []
+        assert len(events) > 0
+        # Check that at least one event has emergency=True in payload
+        emergency_events = [e for e in events if e.payload.get("emergency") is True]
+        assert len(emergency_events) > 0
+        # Check that the emergency caller and reason are recorded
+        for e in emergency_events:
+            assert e.payload.get("emergency_caller") == "autonomous_scheduler"
+            assert "circuit_breaker_flatten" in e.payload.get("emergency_reason", "")
+
+    def test_repeated_emergency_flatten_idempotent_across_restarts(self):
+        """Repeated emergency flatten requests remain idempotent."""
+        df = _build_nifty_ohlcv_df(datetime.now(UTC))
+        def provider(symbol, timeframe):
+            return df if symbol == "NSE:NIFTY" else None
+        center, _, _, spec, strategy_id = _build_control_center(provider)
+        controller = _build_nifty_option_bot(center, bot_id="phase-g-emergency-idem")
+        _attach_fake_option_infrastructure(controller)
+        coord = AutonomousDeploymentCoordinator(config=controller.config, control_center=center)
+        result, dep = coord.create_autonomous_deployment(
+            symbol="NSE:NIFTY", strategy_id=strategy_id, timeframe="1d", strategy_spec=spec,
+            deployment_config=PaperDeploymentConfig(execution_mode="paper", initial_cash=100_000.0,
+                                                     allow_short=False, options_enabled=True,
+                                                     allowed_option_types=["CE", "PE"]),
+        )
+        assert result == DeploymentCreationResult.SUCCESS
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+
+        # Open a position
+        decision = _make_option_decision(option_intent="CE", decision_id="phase-g-emergency-idem-entry")
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        entry_result = _execute_one_option_decision(controller, decision, spot_price=22000.0, target_qty=1)
+        assert entry_result["result"] == "submitted"
+
+        # Trip circuit breaker and flatten
+        cb = runner.circuit_breaker
+        cb.trip("phase_g_emergency_idem_test")
+        from backend.autonomous_scheduler import _flatten_positions
+        _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-emergency-idem")
+
+        # Verify position is closed
+        positions = runner.broker.positions()
+        option_pos = next((p for p in positions.values() if p.is_option), None)
+        assert option_pos is not None
+        assert option_pos.qty == 0
+
+        # Second flatten with same decision_id should be idempotent (no new fills)
+        _flatten_positions(runner, center, sid, datetime.now(UTC), decision_id="phase-g-emergency-idem")
+
+        # Verify position stays closed
+        positions_after = runner.broker.positions()
+        option_pos_after = next((p for p in positions_after.values() if p.is_option), None)
+        assert option_pos_after is not None
+        assert option_pos_after.qty == 0
