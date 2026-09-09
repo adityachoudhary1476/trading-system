@@ -16,9 +16,9 @@ without an opt-in):
                                         ``"true"`` to start.
     ``AUTONOMOUS_SCAN_INTERVAL_SECONDS`` default ``60`` — integer seconds
                                         between ticks. Smallest allowed: 10.
-    ``AUTONOMOUS_BOT_ID``               default ``"bot-paper-default"`` —
-                                        matches the bot id used by the API
-                                        (``routes/paper_api.py``).
+``AUTONOMOUS_BOT_ID``               default ``"bot-nifty-options"`` —
+                                         matches the bot id used by the API
+                                         (``routes/paper_api.py``).
     ``MARKET_DATA_DB_URL``              required — same persistent
                                         PostgreSQL database the FastAPI
                                         paper API uses. On SQLite the
@@ -120,7 +120,7 @@ ENV_DB_URL = "MARKET_DATA_DB_URL"
 
 DEFAULT_INTERVAL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 10
-DEFAULT_BOT_ID = "bot-paper-default"
+DEFAULT_BOT_ID = "bot-nifty-options"
 DEFAULT_ORDER_QUANTITY = 1
 
 ADVISORY_LOCK_NAMESPACE = "autonomous-scheduler"
@@ -626,9 +626,9 @@ def _build_controller(
         trading_mode=TradingMode.PAPER,  # ENFORCED by the Pydantic validator
         enabled=True,
         user_constraints=UserConstraints(
-            allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
+            allowed_symbols=frozenset({"NSE:NIFTY"}),
             allowed_strategy_ids=frozenset(),
-            allowed_timeframes=frozenset({"1m", "5m", "15m", "30m", "1h", "4h", "1d"}),
+            allowed_timeframes=frozenset({"1d"}),
             allowed_option_underlyings=option_underlyings,
         ),
         max_simultaneous_positions=5,

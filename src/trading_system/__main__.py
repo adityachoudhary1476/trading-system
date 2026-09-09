@@ -1303,15 +1303,16 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
 
     # Phase 6 — Autonomous Trading Operations Center (paper-only)
     bot_config = AutonomousBotConfig(
-        bot_id="bot-paper-default",
+        bot_id="bot-nifty-options",
         name="Paper Autonomous Bot",
         mode=BotMode.AUTONOMOUS,
         trading_mode=TradingMode.PAPER,
         enabled=True,
         user_constraints=UserConstraints(
-            allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
+            allowed_symbols=frozenset({"NSE:NIFTY"}),
             allowed_strategy_ids=frozenset(),
-            allowed_timeframes=frozenset({"1m", "5m", "15m", "30m", "1h", "4h", "1d"}),
+            allowed_timeframes=frozenset({"1d"}),
+            allowed_option_underlyings=frozenset({"NIFTY"}),
         ),
         max_simultaneous_positions=5,
         source=Source.AUTONOMOUS,

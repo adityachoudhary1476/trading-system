@@ -41,7 +41,7 @@ _VALID_TRANSITIONS: dict[AutonomousBotState, Set[AutonomousBotState]] = {
     AutonomousBotState.RUNNING: {AutonomousBotState.PAUSED, AutonomousBotState.STOPPING},
     AutonomousBotState.PAUSED: {AutonomousBotState.RUNNING, AutonomousBotState.STOPPING},
     AutonomousBotState.STOPPING: {AutonomousBotState.STOPPED},
-    AutonomousBotState.STOPPED: set(),  # terminal — no outgoing transitions
+    AutonomousBotState.STOPPED: {AutonomousBotState.STARTING},
     AutonomousBotState.ERROR: {AutonomousBotState.STOPPED},
 }
 

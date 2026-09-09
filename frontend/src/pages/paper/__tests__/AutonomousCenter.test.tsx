@@ -16,7 +16,7 @@ vi.mock("@/lib/paperApi", () => ({
 }));
 
 const mockBot = (state = "running") => ({
-  bot_id: "bot-paper-default",
+  bot_id: "bot-nifty-options",
   name: "Paper Autonomous Bot",
   state,
   mode: "AUTONOMOUS",
@@ -30,9 +30,9 @@ const mockBot = (state = "running") => ({
   last_event_type: null,
   last_event_timestamp: null,
   source: "AUTONOMOUS",
-  allowed_symbols: ["NSE:SBIN", "NSE:TCS"],
+  allowed_symbols: ["NSE:NIFTY"],
   allowed_strategy_ids: [],
-  allowed_timeframes: ["1d", "1h"],
+  allowed_timeframes: ["1d"],
   max_simultaneous_positions: 5,
   max_position_allocation_pct: 0.25,
   max_exposure_pct: 1.0,
@@ -86,7 +86,7 @@ const mockDecision = (overrides: Record<string, unknown> = {}) => ({
 
 const mockEvent = (overrides: Record<string, unknown> = {}) => ({
   event_id: "evt_123",
-  bot_id: "bot-paper-default",
+  bot_id: "bot-nifty-options",
   event_type: "BOT_STARTED",
   timestamp: "2025-01-01T00:00:00Z",
   deployment_id: null,
@@ -175,7 +175,7 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
   it("does NOT throw when bot API returns undefined bot payload", async () => {
     vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({
       bot: {
-        bot_id: "bot-paper-default",
+        bot_id: "bot-nifty-options",
         name: "Paper Autonomous Bot",
         state: "stopped",
         // intentionally omitting trading_mode / safety / config etc.

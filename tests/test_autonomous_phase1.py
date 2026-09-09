@@ -112,6 +112,7 @@ def _make_controller(
     *,
     config: AutonomousBotConfig | None = None,
     with_control_center: bool = True,
+    create_deployment: bool = True,
 ) -> AutonomousController:
     if config is None:
         config = _make_config()
@@ -140,10 +141,32 @@ def _make_controller(
             intelligence=intelligence,
             gate=gate,
         )
-    return AutonomousController(
+    controller = AutonomousController(
         config=config,
         control_center=control_center,
     )
+    if create_deployment and control_center is not None:
+        # Mock list_deployments to return a deployment linked to this bot
+        # Only use mock if no real deployments exist
+        from trading_system.paper.deployment import PaperDeployment, PaperDeploymentStatus
+        from unittest.mock import MagicMock
+        original_list = control_center.list_deployments
+        mock_deployment = MagicMock(spec=PaperDeployment)
+        mock_deployment.notes = f"bot:{config.bot_id}"
+        mock_deployment.status = PaperDeploymentStatus.ACTIVE
+        mock_deployment.deployment_id = "mock-dep-1"
+        mock_deployment.symbol = "NSE:SBIN"
+        mock_deployment.timeframe = "1d"
+        mock_deployment.strategy_id = "strat-001"
+        
+        def mocked_list(symbol=None, timeframe=None):
+            real_deps = original_list(symbol=symbol, timeframe=timeframe)
+            if real_deps:
+                return real_deps
+            return [mock_deployment]
+        
+        control_center.list_deployments = mocked_list
+    return controller
 
 
 def _register_eligible_evidence(
@@ -752,7 +775,11 @@ class TestAutonomousBotLifecyclePhase1:
         lifecycle.transition_to(AutonomousBotState.RUNNING)
         lifecycle.transition_to(AutonomousBotState.STOPPING)
         lifecycle.transition_to(AutonomousBotState.STOPPED)
+        # STOPPED is no longer terminal; it can transition to STARTING for restart
+        assert is_valid_transition(AutonomousBotState.STOPPED, AutonomousBotState.STARTING) is True
         for target in AutonomousBotState:
+            if target == AutonomousBotState.STARTING:
+                continue
             assert is_valid_transition(AutonomousBotState.STOPPED, target) is False
 
     def test_running_only_allows_pause_or_stop(self):
@@ -796,9 +823,10 @@ class TestAutonomousControllerLifecycle:
         controller = _make_controller()
         controller.start_bot()
         controller.stop_bot()
+        # Restart from STOPPED is now allowed (STOPPED -> STARTING -> RUNNING)
         result, message = controller.start_bot()
-        assert result is False
-        assert controller.lifecycle.state == AutonomousBotState.STOPPED
+        assert result is True
+        assert controller.lifecycle.state == AutonomousBotState.RUNNING
 
     def test_pause_from_created_is_rejected(self):
         controller = _make_controller()

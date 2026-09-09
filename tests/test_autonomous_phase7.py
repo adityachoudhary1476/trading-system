@@ -93,7 +93,12 @@ def _make_controller():
     )
     cc = MagicMock(spec=PaperTradingControlCenter)
     cc.load_market_data = lambda s, tf: None
-    cc.list_deployments.return_value = []
+    # Return a deployment linked to this bot
+    from trading_system.paper.deployment import PaperDeployment, PaperDeploymentStatus
+    mock_deployment = MagicMock(spec=PaperDeployment)
+    mock_deployment.notes = f"bot:{config.bot_id}"
+    mock_deployment.status = PaperDeploymentStatus.ACTIVE
+    cc.list_deployments.return_value = [mock_deployment]
     return AutonomousController(config=config, control_center=cc)
 
 
@@ -653,7 +658,6 @@ class TestControllerPhase7Integration:
 
     def test_resume_bot_clears_kill_switch(self):
         ctrl = _make_controller()
-        ctrl.control_center.list_deployments.return_value = []
         ctrl.start_bot()
         ctrl.halt_bot(KillSwitchReason.MANUAL)
         assert ctrl.is_halted is True
@@ -665,12 +669,12 @@ class TestControllerPhase7Integration:
 
     def test_stop_bot_halts_kill_switch(self):
         ctrl = _make_controller()
-        ctrl.control_center.list_deployments.return_value = []
         ctrl.start_bot()
         ok, msg = ctrl.stop_bot()
         assert ok is True
         assert ctrl.is_halted is True
-        assert ctrl.kill_switch.reason == KillSwitchReason.DEPLOYMENT_ERROR
+        # stop_bot uses NORMAL_STOP (not DEPLOYMENT_ERROR) so restart is allowed
+        assert ctrl.kill_switch.reason == KillSwitchReason.NORMAL_STOP
 
     def test_inspect_includes_safety_state(self):
         ctrl = _make_controller()
@@ -775,7 +779,8 @@ class TestKillSwitchEndToEnd:
         success, message = controller.stop_bot()
         assert success is True
         assert controller.kill_switch.is_halted is True
-        assert controller.kill_switch.reason == KillSwitchReason.DEPLOYMENT_ERROR
+        # stop_bot uses NORMAL_STOP (not DEPLOYMENT_ERROR) so restart is allowed
+        assert controller.kill_switch.reason == KillSwitchReason.NORMAL_STOP
 
     def test_stop_bot_is_resilient_to_list_deployments_failure(self):
         controller = _make_controller()
@@ -923,6 +928,8 @@ class TestAdversarialAudit:
         from trading_system.research.strategy_registry import StrategyRegistry
         from trading_system.research.strategy_intelligence import StrategyIntelligence
         from trading_system.paper.gate import DeploymentGate
+        from trading_system.paper.deployment import PaperDeployment, PaperDeploymentStatus
+        from unittest.mock import MagicMock
 
         engine = create_engine("sqlite://")
         store = EvidenceStore(engine)
@@ -938,6 +945,16 @@ class TestAdversarialAudit:
             intelligence=intelligence,
             gate=gate,
         )
+        # Add mock deployment for bot-audit
+        mock_deployment = MagicMock(spec=PaperDeployment)
+        mock_deployment.notes = "bot:bot-audit"
+        mock_deployment.status = PaperDeploymentStatus.ACTIVE
+        mock_deployment.deployment_id = "mock-dep-audit"
+        mock_deployment.symbol = "NSE:SBIN"
+        mock_deployment.timeframe = "1d"
+        mock_deployment.strategy_id = "test-strategy"
+        original_list = control_center.list_deployments
+        control_center.list_deployments = lambda symbol=None, timeframe=None: [mock_deployment]
         bot_store = AutonomousBotStateStore(engine)
         bot_store.ensure_schema()
 
@@ -999,7 +1016,8 @@ class TestAdversarialAudit:
         assert controller.config.state == AutonomousBotState.STOPPED
         assert controller.config.enabled is False
         assert controller.kill_switch.is_halted is True
-        assert controller.kill_switch.reason == KillSwitchReason.DEPLOYMENT_ERROR
+        # stop_bot uses NORMAL_STOP even when list_deployments fails
+        assert controller.kill_switch.reason == KillSwitchReason.NORMAL_STOP
 
     # ------------------------------------------------------------------ #
     # 3. Restart correctness
@@ -1024,6 +1042,8 @@ class TestAdversarialAudit:
         from trading_system.research.strategy_registry import StrategyRegistry
         from trading_system.research.strategy_intelligence import StrategyIntelligence
         from trading_system.paper.gate import DeploymentGate
+        from trading_system.paper.deployment import PaperDeployment, PaperDeploymentStatus
+        from unittest.mock import MagicMock
 
         engine = create_engine("sqlite://")
         store = EvidenceStore(engine)
@@ -1039,6 +1059,16 @@ class TestAdversarialAudit:
             intelligence=intelligence,
             gate=gate,
         )
+        # Add mock deployment for bot-restart
+        mock_deployment = MagicMock(spec=PaperDeployment)
+        mock_deployment.notes = "bot:bot-restart"
+        mock_deployment.status = PaperDeploymentStatus.ACTIVE
+        mock_deployment.deployment_id = "mock-dep-restart"
+        mock_deployment.symbol = "NSE:SBIN"
+        mock_deployment.timeframe = "1d"
+        mock_deployment.strategy_id = "test-strategy"
+        original_list = control_center.list_deployments
+        control_center.list_deployments = lambda symbol=None, timeframe=None: [mock_deployment]
         bot_store = AutonomousBotStateStore(engine)
         bot_store.ensure_schema()
 

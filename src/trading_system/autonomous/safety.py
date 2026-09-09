@@ -83,6 +83,7 @@ class KillSwitchReason(str, Enum):
     """Structured reasons why the bot-level kill switch was tripped."""
 
     MANUAL = "manual"
+    NORMAL_STOP = "normal_stop"
     CONSECUTIVE_ERRORS = "consecutive_errors"
     EMERGENCY_LOSS = "emergency_loss"
     DATA_STALENESS = "data_staleness"

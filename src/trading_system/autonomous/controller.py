@@ -263,22 +263,70 @@ class AutonomousController(BaseModel):
         """Start the autonomous bot.
 
         Transition graph: CREATED -> STARTING -> RUNNING
+        Also supports restart from STOPPED: STOPPED -> STARTING -> RUNNING
+
+        Startup validates:
+          1. Canonical paper deployment exists and belongs to this bot
+          2. Deployment is valid/healthy (ACTIVE status)
+          3. Kill switch is not latched for an unresolved genuine safety/deployment failure
 
         Returns (success, message). On failure, the bot remains in its
         current state and the error message explains why.
         """
         try:
-            # Transition CREATED -> STARTING
+            # Transition CREATED/STOPPED -> STARTING
             if not self.lifecycle.can_transition_to(AutonomousBotState.STARTING):
                 return False, f"bot cannot transition from {self.lifecycle.state.value} to STARTING"
 
             self.lifecycle.transition_to(AutonomousBotState.STARTING)
             self.config.state = AutonomousBotState.STARTING
 
+            # --- Startup validation ---
+            # 1. Verify canonical paper deployment exists and belongs to this bot
+            bot_deployments = [
+                d for d in self.control_center.list_deployments()
+                if d.notes and d.notes.startswith("bot:") and d.notes.split(":", 1)[1] == self.config.bot_id
+            ]
+            if not bot_deployments:
+                self.lifecycle.transition_to(AutonomousBotState.ERROR)
+                self.config.state = AutonomousBotState.ERROR
+                self._record_event(
+                    AutonomousEventType.ERROR,
+                    message=f"no paper deployment found for bot {self.config.bot_id}",
+                )
+                return False, f"no paper deployment linked to bot {self.config.bot_id}"
+
+            # 2. Verify at least one deployment is ACTIVE and healthy
+            active_deployments = [d for d in bot_deployments if d.status == PaperDeploymentStatus.ACTIVE]
+            if not active_deployments:
+                self.lifecycle.transition_to(AutonomousBotState.ERROR)
+                self.config.state = AutonomousBotState.ERROR
+                self._record_event(
+                    AutonomousEventType.ERROR,
+                    message=f"no ACTIVE paper deployment for bot {self.config.bot_id}",
+                )
+                return False, f"no ACTIVE paper deployment for bot {self.config.bot_id}"
+
+            # 3. Kill-switch gate: only resume if halt was intentional (NORMAL_STOP/MANUAL)
+            ks = self._safety_layer.kill_switch
+            if ks.is_halted:
+                if ks.reason in (KillSwitchReason.NORMAL_STOP, KillSwitchReason.MANUAL):
+                    # Intentional operator stop - safe to resume
+                    ks.resume()
+                else:
+                    # Genuine safety/risk/deployment failure - remain fail-closed
+                    self.lifecycle.transition_to(AutonomousBotState.ERROR)
+                    self.config.state = AutonomousBotState.ERROR
+                    self._record_event(
+                        AutonomousEventType.ERROR,
+                        message=f"start blocked: kill switch halted (reason={ks.reason.value})",
+                    )
+                    return False, f"kill switch halted (reason={ks.reason.value}); manual resume required"
+
             # Transition STARTING -> RUNNING
             if not self.lifecycle.can_transition_to(AutonomousBotState.RUNNING):
-                # This shouldn't happen if the graph is correct, but be safe.
-                self.lifecycle.transition_to(AutonomousBotState.CREATED)
+                self.lifecycle.transition_to(AutonomousBotState.ERROR)
+                self.config.state = AutonomousBotState.ERROR
                 return False, "bot transition STARTING -> RUNNING failed unexpectedly"
 
             self.lifecycle.transition_to(AutonomousBotState.RUNNING)
@@ -298,7 +346,7 @@ class AutonomousController(BaseModel):
 
         except BotTransitionError as exc:
             return False, str(exc)
-        except Exception as exc:  # noqa: BLE001 â€” guard against unexpected errors
+        except Exception as exc:  # noqa: BLE001 — guard against unexpected errors
             # Fail closed: if we can't start, bot stays CREATED or goes to ERROR.
             try:
                 self.lifecycle.transition_to(AutonomousBotState.ERROR)
@@ -354,10 +402,13 @@ class AutonomousController(BaseModel):
             self.config.state = AutonomousBotState.STOPPED
             self.config.enabled = False
 
-            # Phase 7: Halt the kill switch on stop.
+            # Phase 7: Halt the kill switch on normal stop.
+            # Use NORMAL_STOP so that a subsequent start_bot() can safely resume.
+            # Genuine DEPLOYMENT_ERROR / risk halts are set elsewhere and must
+            # remain fail-closed until explicitly cleared.
             self._safety_layer.kill_switch.halt(
-                KillSwitchReason.DEPLOYMENT_ERROR,
-                detail="bot stopped - all trading halted",
+                KillSwitchReason.NORMAL_STOP,
+                detail="bot stopped by operator",
             )
 
             self._record_event(AutonomousEventType.BOT_STOPPED)
