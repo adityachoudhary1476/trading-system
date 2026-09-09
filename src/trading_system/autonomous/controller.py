@@ -160,7 +160,7 @@ class AutonomousController(BaseModel):
     # Construction
     # ------------------------------------------------------------------ #
 
-    def __init__(self, *, config: AutonomousBotConfig, control_center: PaperTradingControlCenter, persistence: Optional[Any] = None) -> None:
+    def __init__(self, *, config: AutonomousBotConfig, control_center: PaperTradingControlCenter, persistence: Optional[Any] = None, phase23_registry: Optional[Any] = None) -> None:
         lifecycle = AutonomousBotLifecycle(
             initial_state=AutonomousBotState.CREATED
         )
@@ -179,6 +179,7 @@ class AutonomousController(BaseModel):
         )
         self._options_builder = OptionsStructureBuilder()
         self._persistence = persistence
+        self._phase23_registry = phase23_registry
 
     @property
     def event_log(self) -> AutonomousEventLog:
@@ -259,6 +260,47 @@ class AutonomousController(BaseModel):
     # Lifecycle transitions
     # ------------------------------------------------------------------ #
 
+    def _ensure_autonomous_deployments(self) -> None:
+        """Auto-create paper deployments from PAPER_APPROVED strategies if none exist."""
+        if self._phase23_registry is None:
+            return
+        try:
+            from trading_system.research.phase23.discovery import Phase23Discovery
+            discovery = Phase23Discovery(self._phase23_registry)
+            approved = discovery.discover(max_candidates=10)
+            if not approved:
+                return
+            existing = [
+                d for d in self.control_center.list_deployments()
+                if d.notes and d.notes.startswith("bot:") and d.notes.split(":", 1)[1] == self.config.bot_id
+            ]
+            if existing:
+                return
+            for item in approved:
+                try:
+                    candidate = None
+                    if hasattr(item, 'candidate_id'):
+                        from trading_system.research.phase23.strategies import get_strategy_candidate
+                        candidate = get_strategy_candidate(item.candidate_id)
+                    if candidate is None:
+                        continue
+                    spec_dict = candidate.spec_builder(item.symbol, item.timeframe)
+                    from trading_system.research.strategy_lab.spec import StrategySpec
+                    spec = StrategySpec.model_validate(spec_dict)
+                    from trading_system.paper.deployment import PaperDeploymentConfig
+                    dep_config = PaperDeploymentConfig()
+                    self.create_autonomous_deployment(
+                        symbol=item.symbol,
+                        strategy_id=item.strategy_id,
+                        timeframe=item.timeframe,
+                        strategy_spec=spec,
+                        deployment_config=dep_config,
+                    )
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     def start_bot(self) -> Tuple[bool, str]:
         """Start the autonomous bot.
 
@@ -280,6 +322,9 @@ class AutonomousController(BaseModel):
 
             self.lifecycle.transition_to(AutonomousBotState.STARTING)
             self.config.state = AutonomousBotState.STARTING
+
+            # --- Auto-provision deployments from PAPER_APPROVED strategies ---
+            self._ensure_autonomous_deployments()
 
             # --- Startup validation ---
             # 1. Verify canonical paper deployment exists and belongs to this bot

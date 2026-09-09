@@ -71,7 +71,22 @@ def _build_controller(center, settings, md_provider, market_data_callable, persi
         max_simultaneous_positions=5,
         source=Source.AUTONOMOUS,
     )
-    controller = AutonomousController(config=bot_config, control_center=center, persistence=persistence)
+
+    phase23_registry = None
+    try:
+        from trading_system.research.strategy_registry import StrategyRegistry
+        from trading_system.research.phase23.registry import Phase23Registry
+        strategy_registry = StrategyRegistry(center.registry.store.engine)
+        phase23_registry = Phase23Registry(strategy_registry)
+    except Exception:
+        pass
+
+    controller = AutonomousController(
+        config=bot_config,
+        control_center=center,
+        persistence=persistence,
+        phase23_registry=phase23_registry,
+    )
 
     if persistence is not None:
         try:

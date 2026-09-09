@@ -10,5 +10,37 @@
     "healthcheckTimeout": 100,
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
-  }
+  },
+  "services": [
+    {
+      "name": "finova-backend",
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile"
+      },
+      "deploy": {
+        "startCommand": "uvicorn backend.main:app --host 0.0.0.0 --port $PORT",
+        "healthcheckPath": "/health",
+        "healthcheckTimeout": 100,
+        "restartPolicyType": "ON_FAILURE",
+        "restartPolicyMaxRetries": 10
+      }
+    },
+    {
+      "name": "finova-autonomous-scheduler",
+      "build": {
+        "builder": "DOCKERFILE",
+        "dockerfilePath": "Dockerfile.worker"
+      },
+      "deploy": {
+        "restartPolicyType": "ALWAYS",
+        "restartPolicyMaxRetries": 10
+      },
+      "env": {
+        "AUTONOMOUS_SCHEDULER_ENABLED": "true",
+        "AUTONOMOUS_SCAN_INTERVAL_SECONDS": "60",
+        "AUTONOMOUS_BOT_ID": "bot-nifty-options"
+      }
+    }
+  ]
 }
