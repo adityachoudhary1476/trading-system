@@ -86,6 +86,12 @@ class PaperDeploymentConfig(BaseModel):
     # Cap on contracts per single order (0 or None = no cap).
     max_options_contracts_per_trade: Optional[int] = Field(default=None, ge=0)
 
+    # --- Strategy parameters (Phase F2) ---
+    strategy_parameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Strategy-specific parameter overrides validated against the strategy's parameter schema.",
+    )
+
     @model_validator(mode="after")
     def _paper_only(self) -> "PaperDeploymentConfig":
         if self.execution_mode != "paper":
@@ -168,6 +174,7 @@ class PaperDeployment(BaseModel):
             options_enabled=self.config.options_enabled,
             allowed_option_types_json=json.dumps(self.config.allowed_option_types),
             max_options_contracts_per_trade=self.config.max_options_contracts_per_trade,
+            strategy_parameters_json=json.dumps(self.config.strategy_parameters),
             last_tick_at=_parse_dt(self.last_tick_at) if self.last_tick_at else None,
             last_successful_tick_at=_parse_dt(self.last_successful_tick_at) if self.last_successful_tick_at else None,
             last_market_data_at=_parse_dt(self.last_market_data_at) if self.last_market_data_at else None,
@@ -226,6 +233,7 @@ class PaperDeploymentRecord(Base):
     options_enabled = Column(Boolean, nullable=False, default=False)
     allowed_option_types_json = Column(Text, nullable=False, default='["CE","PE"]')
     max_options_contracts_per_trade = Column(Integer, nullable=True)
+    strategy_parameters_json = Column(Text, nullable=False, default="{}")
 
     # --- Scheduler heartbeat fields (Phase 23) ---
     last_tick_at = Column(DateTime(timezone=True), nullable=True)

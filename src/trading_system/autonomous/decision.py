@@ -166,6 +166,11 @@ class SelectedConfiguration(BaseModel):
     min_required_bars: int
     selection_factors: list[SelectionFactor] = Field(default_factory=list)
 
+    strategy_parameters: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Validated strategy parameter overrides from the winning configuration.",
+    )
+
 
 # --------------------------------------------------------------------------- #
 # Decision model
@@ -734,7 +739,10 @@ class StrategyDecisionEngine:
 
         # --- Resolve strategy instance from discovery ---
         try:
-            strategy = build_from_discovery(selected.strategy_id)
+            strategy = build_from_discovery(
+                selected.strategy_id,
+                **(selected.strategy_parameters or {}),
+            )
         except KeyError:
             return (
                 None,

@@ -149,11 +149,14 @@ class AutonomousDeploymentCoordinator:
                 self.control_center.activate_deployment(deployment.deployment_id)
 
             # Step 5: Attach a runner + broker so the dashboard has immediate data.
-            from trading_system.execution.paper_broker import PaperBroker
+            from trading_system.execution.paper_broker import PaperBroker, SlippageConfig
             from trading_system.paper.runner import PaperStrategyRunner
             from trading_system.paper import PaperCircuitBreaker
 
-            broker = PaperBroker(initial_cash=deployment.config.initial_cash)
+            broker = PaperBroker(
+                initial_cash=deployment.config.initial_cash,
+                slippage=SlippageConfig(slippage_bps=deployment.config.slippage_bps),
+            )
             circuit_breaker = PaperCircuitBreaker()
             runner = PaperStrategyRunner(
                 deployment=deployment,

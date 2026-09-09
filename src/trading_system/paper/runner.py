@@ -141,21 +141,19 @@ class PaperStrategyRunner:
         if self.deployment.status not in STATUS_ACCEPTS_ORDERS:
             return SignalType.NO_ACTION
 
-        # Explicit circuit breaker: an OPEN circuit forces NO_ACTION.
+        # Explicit circuit breaker: an OPEN circuit forces NO_ACTION after
+        # emergency flattening has already been attempted.
         if self._circuit_breaker is not None and self._circuit_breaker.is_open:
             return SignalType.NO_ACTION
 
         bar_df, ts = _coerce_bar(bar)
         if self._last_processed_bar is not None and ts == self._last_processed_bar:
-            # Same bar processed again — no-op (idempotency).
             return SignalType.NO_ACTION
 
-        # Append to the rolling window.
         self._window = pd.concat([self._window, bar_df])
         self._bar_count += 1
         self._last_processed_bar = ts
 
-        # Initialize operational baseline on the first processed bar.
         if self._starting_equity is None:
             self._starting_equity = float(self.broker.account().equity)
             self._peak_equity = self._starting_equity
@@ -168,10 +166,6 @@ class PaperStrategyRunner:
                     {"bar_index": self._bar_count - 1},
                 )
 
-        # Warm-up gate: do not produce signals until enough bars have been
-        # seen. ``bar_count`` is now 1-indexed (1 after the first bar).
-        # We require ``bar_count > warmup_bars`` so that warmup_bars=20 lets
-        # the 21st bar be the first eligible.
         if self._bar_count <= self.config.warmup_bars:
             self._events.append(RunnerEvent(
                 timestamp=ts, bar_index=self._bar_count - 1,
@@ -180,8 +174,6 @@ class PaperStrategyRunner:
             self._record_bar_processed(ts)
             return SignalType.NO_ACTION
 
-        # Compute target position series via the existing SpecStrategy
-        # interpreter. The interpreter is causal: it only uses bars <= T.
         try:
             target_series = self.strategy.generate(self._window)
         except Exception as exc:
@@ -199,13 +191,18 @@ class PaperStrategyRunner:
             self._finalize_bar(SignalType.NO_ACTION, ts, error=str(exc))
             return SignalType.NO_ACTION
 
-        # The signal we act on is the LATEST bar in the window.
         new_target = int(target_series.iloc[-1])
         if new_target not in (-1, 0, 1):
             new_target = 0
 
         prev_state = self._position_state
         signal = self._map_target_transition(prev_state, new_target)
+
+        # --- SL/TP override (deterministic, evaluated before order) ---
+        sl_tp_signal = self._check_sl_tp(ts)
+        if sl_tp_signal is not None:
+            signal = sl_tp_signal
+
         self._last_signal = signal.value
         if signal != SignalType.NO_ACTION:
             self._generated_signals += 1
@@ -298,8 +295,181 @@ class PaperStrategyRunner:
         return signal
 
     # ------------------------------------------------------------------ #
-    # Signals engine integration (Phase 19+)
+    # SL/TP evaluation (deterministic, evaluated before order submission)
     # ------------------------------------------------------------------ #
+    def _check_sl_tp(self, ts: pd.Timestamp) -> Optional[SignalType]:
+        """Evaluate stop-loss / take-profit against open positions.
+
+        Returns LONG_EXIT / SHORT_EXIT when a threshold is breached,
+        otherwise None. Only evaluates when:
+          - stop_loss_pct or take_profit_pct is configured
+          - position is open
+          - position has a valid current_price (authoritative price available)
+        """
+        if self.config.stop_loss_pct is None and self.config.take_profit_pct is None:
+            return None
+
+        position = self.broker.get_position(self.deployment.symbol)
+        if position is None or not position.is_open:
+            return None
+
+        # For options, require an authoritative current_price (not zero/stale).
+        if position.is_option and position.current_price <= 0:
+            return None
+
+        price = position.current_price
+        avg = position.avg_entry_price
+        if avg <= 0 or price <= 0:
+            return None
+
+        qty = position.qty
+        contract_size = position.contract_size or 1
+        unrealized_pnl = (price - avg) * qty * contract_size
+        cost_basis = abs(qty) * avg * contract_size
+        if cost_basis <= 0:
+            return None
+        unrealized_pnl_pct = unrealized_pnl / cost_basis
+
+        if qty > 0:
+            if self.config.stop_loss_pct is not None and unrealized_pnl_pct <= -float(self.config.stop_loss_pct):
+                self._events.append(RunnerEvent(
+                    timestamp=ts, bar_index=self._bar_count - 1,
+                    event_type="sl_tp_exit",
+                    details={"reason": "stop_loss", "unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                ))
+                self._emit(
+                    PaperOperationEventType.RISK_WARNING,
+                    ts.isoformat(),
+                    "stop-loss triggered",
+                    {"unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                )
+                return SignalType.LONG_EXIT
+            if self.config.take_profit_pct is not None and unrealized_pnl_pct >= float(self.config.take_profit_pct):
+                self._events.append(RunnerEvent(
+                    timestamp=ts, bar_index=self._bar_count - 1,
+                    event_type="sl_tp_exit",
+                    details={"reason": "take_profit", "unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                ))
+                self._emit(
+                    PaperOperationEventType.RISK_WARNING,
+                    ts.isoformat(),
+                    "take-profit triggered",
+                    {"unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                )
+                return SignalType.LONG_EXIT
+        elif qty < 0:
+            if self.config.stop_loss_pct is not None and unrealized_pnl_pct <= -float(self.config.stop_loss_pct):
+                self._events.append(RunnerEvent(
+                    timestamp=ts, bar_index=self._bar_count - 1,
+                    event_type="sl_tp_exit",
+                    details={"reason": "stop_loss", "unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                ))
+                self._emit(
+                    PaperOperationEventType.RISK_WARNING,
+                    ts.isoformat(),
+                    "stop-loss triggered",
+                    {"unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                )
+                return SignalType.SHORT_EXIT
+            if self.config.take_profit_pct is not None and unrealized_pnl_pct >= float(self.config.take_profit_pct):
+                self._events.append(RunnerEvent(
+                    timestamp=ts, bar_index=self._bar_count - 1,
+                    event_type="sl_tp_exit",
+                    details={"reason": "take_profit", "unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                ))
+                self._emit(
+                    PaperOperationEventType.RISK_WARNING,
+                    ts.isoformat(),
+                    "take-profit triggered",
+                    {"unrealized_pnl_pct": round(unrealized_pnl_pct, 6)},
+                )
+                return SignalType.SHORT_EXIT
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Emergency flattening
+    # ------------------------------------------------------------------ #
+    def _flatten_positions(self, ts: pd.Timestamp) -> None:
+        """Submit SELL orders for all open positions (emergency flattening)."""
+        positions = self.broker.positions()
+        for symbol, pos in list(positions.items()):
+            if not pos.is_open:
+                continue
+            qty = abs(pos.qty)
+            if qty <= 0:
+                continue
+            side = Side.SELL
+            try:
+                submitted = self.broker.submit_order(
+                    symbol=symbol,
+                    side=side,
+                    quantity=qty,
+                    order_type="MARKET",
+                    limit_price=None,
+                    current_price=pos.current_price,
+                    options_contract_id=pos.options_contract_id,
+                    strike=pos.strike,
+                    expiry=pos.expiry,
+                    option_type=pos.option_type,
+                )
+                self._orders_submitted += 1
+                self._fills_received += sum(1 for f in submitted.fills)
+                if submitted.fills:
+                    self._last_fill = {
+                        "price": float(submitted.fills[-1].price),
+                        "quantity": float(submitted.fills[-1].quantity),
+                        "side": submitted.fills[-1].side.value,
+                        "fee": float(submitted.fills[-1].fee),
+                    }
+                self._events.append(RunnerEvent(
+                    timestamp=ts, bar_index=self._bar_count - 1,
+                    event_type="flatten_order",
+                    details={
+                        "symbol": symbol,
+                        "side": side.value,
+                        "quantity": qty,
+                        "order_id": submitted.order_id,
+                        "status": submitted.status.value,
+                    },
+                ))
+                self._emit(
+                    PaperOperationEventType.ORDER_SUBMITTED,
+                    ts.isoformat(),
+                    "emergency flatten order submitted",
+                    {
+                        "symbol": symbol,
+                        "side": side.value,
+                        "quantity": qty,
+                        "order_id": submitted.order_id,
+                        "status": submitted.status.value,
+                    },
+                )
+                if submitted.fills:
+                    self._emit(
+                        PaperOperationEventType.ORDER_FILLED,
+                        ts.isoformat(),
+                        "emergency flatten order filled",
+                        dict(self._last_fill),
+                    )
+            except Exception as exc:
+                self._events.append(RunnerEvent(
+                    timestamp=ts, bar_index=self._bar_count - 1,
+                    event_type="flatten_error",
+                    details={"symbol": symbol, "error": str(exc)},
+                ))
+                self._emit(
+                    PaperOperationEventType.ERROR,
+                    ts.isoformat(),
+                    "emergency flatten failed",
+                    {"symbol": symbol, "error": str(exc)},
+                )
+
+        # Update local position state after flattening.
+        for symbol in list(positions.keys()):
+            pos = self.broker.get_position(symbol)
+            self._position_state = (
+                int(pos.qty > 0) - int(pos.qty < 0) if pos is not None else 0
+            )
     def process_signal_bar(
         self,
         bar: Union[dict, pd.Series, pd.DataFrame],
@@ -713,6 +883,7 @@ class PaperStrategyRunner:
                     "circuit breaker tripped (risk)",
                     {"reason": risk_halt},
                 )
+                self._flatten_positions(ts)
             if self._health_monitor is not None and self._halt_reason is not None:
                 self._circuit_breaker.trip(self._halt_reason)
                 self._emit(
@@ -721,6 +892,7 @@ class PaperStrategyRunner:
                     "circuit breaker tripped (health)",
                     {"reason": self._halt_reason},
                 )
+                self._flatten_positions(ts)
 
         # Performance snapshot.
         trade_count, win_rate, profit_factor = _trade_stats(

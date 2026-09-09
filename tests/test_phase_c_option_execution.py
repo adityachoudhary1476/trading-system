@@ -1038,13 +1038,13 @@ class TestSchedulerOptionExecution:
             options_enabled=True, allowed_option_types=["CE", "PE"], max_contracts=1,
         )
         _attach_phase_b(controller)
-        # SELL signal with PE intent: the scheduler rejects because
-        # Phase C supports BUY CE / BUY PE only (no option selling).
+        # SELL signal with PE intent but no existing long position:
+        # scheduler rejects at the position-aware exit check.
         decision = _make_decision(action="sell", option_intent="PE")
         result = _execute_one_option_decision(
             controller, decision, spot_price=25000.0, target_qty=1
         )
-        assert result["result"] == "option_selling_not_supported", result
+        assert result["result"] == "no_long_option_position", result
 
     def test_scheduler_ce_only_deployment_rejects_pe(self):
         from backend.autonomous_scheduler import _execute_one_option_decision

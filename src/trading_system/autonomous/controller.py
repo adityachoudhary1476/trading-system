@@ -160,7 +160,7 @@ class AutonomousController(BaseModel):
     # Construction
     # ------------------------------------------------------------------ #
 
-    def __init__(self, *, config: AutonomousBotConfig, control_center: PaperTradingControlCenter) -> None:
+    def __init__(self, *, config: AutonomousBotConfig, control_center: PaperTradingControlCenter, persistence: Optional[Any] = None) -> None:
         lifecycle = AutonomousBotLifecycle(
             initial_state=AutonomousBotState.CREATED
         )
@@ -178,6 +178,7 @@ class AutonomousController(BaseModel):
             idempotency=IdempotencyGuard(),
         )
         self._options_builder = OptionsStructureBuilder()
+        self._persistence = persistence
 
     @property
     def event_log(self) -> AutonomousEventLog:
@@ -203,6 +204,49 @@ class AutonomousController(BaseModel):
     def is_halted(self) -> bool:
         """True if the bot-level kill switch is tripped."""
         return self._safety_layer.kill_switch.is_halted
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Restore controller state from persisted storage."""
+        if not state:
+            return
+        bot_state = state.get("state")
+        if bot_state:
+            try:
+                self.config.state = AutonomousBotState(bot_state)
+                self.lifecycle = AutonomousBotLifecycle(
+                    initial_state=AutonomousBotState(bot_state)
+                )
+            except ValueError:
+                pass
+        enabled = state.get("enabled")
+        if enabled is not None:
+            self.config.enabled = bool(enabled)
+        kill_switch_state = state.get("kill_switch_state")
+        if kill_switch_state == "halted":
+            self._safety_layer.kill_switch.halt(
+                state.get("kill_switch_reason") or KillSwitchReason.MANUAL,
+                detail=state.get("kill_switch_reason") or "",
+            )
+
+    def _persist(self) -> None:
+        """Persist the current bot state."""
+        if self._persistence is None:
+            return
+        try:
+            self._persistence.save_state(
+                bot_id=self.config.bot_id,
+                state=self.config.state.value,
+                enabled=self.config.enabled,
+                kill_switch_state=self._safety_layer.kill_switch.state.value,
+                kill_switch_reason=(
+                    self._safety_layer.kill_switch.reason.value
+                    if self._safety_layer.kill_switch.reason
+                    else None
+                ),
+                kill_switch_halted_at=self._safety_layer.kill_switch.halt_timestamp,
+            )
+        except Exception:
+            pass
 
     def _record_event(self, event_type: AutonomousEventType, **kwargs: Any) -> None:
         """Record an event defensively — never blocks the calling operation."""
@@ -239,6 +283,7 @@ class AutonomousController(BaseModel):
 
             self.lifecycle.transition_to(AutonomousBotState.RUNNING)
             self.config.state = AutonomousBotState.RUNNING
+            self.config.enabled = True
 
             self._record_event(AutonomousEventType.BOT_STARTED)
 
@@ -246,6 +291,8 @@ class AutonomousController(BaseModel):
             self.config.last_decision_timestamp = __import__("datetime").datetime.now(
                 __import__("datetime").timezone.utc
             ).isoformat()
+
+            self._persist()
 
             return True, f"bot started successfully; state={self.lifecycle.state.value}"
 
@@ -269,7 +316,10 @@ class AutonomousController(BaseModel):
         Returns (success, message).
         """
         try:
-            # Transition RUNNING -> STOPPING
+            if self.lifecycle.state == AutonomousBotState.STOPPED:
+                return True, f"bot already stopped; state={self.lifecycle.state.value}"
+
+            # Transition RUNNING/PAUSED -> STOPPING
             if not self.lifecycle.can_transition_to(AutonomousBotState.STOPPING):
                 return False, f"bot cannot transition from {self.lifecycle.state.value} to STOPPING"
 
@@ -277,18 +327,23 @@ class AutonomousController(BaseModel):
             self.config.state = AutonomousBotState.STOPPING
 
             # Stop all autonomous deployments for this bot.
-            autonomous_deps = self.control_center.list_deployments()
-            bot_deployments = [
-                d for d in autonomous_deps
-                if d.notes and d.notes.startswith("bot:") and d.notes.split(":", 1)[1] == self.config.bot_id
-            ]
+            # This must not prevent the bot from reaching STOPPED if the
+            # database is missing columns or otherwise unhealthy.
+            try:
+                autonomous_deps = self.control_center.list_deployments()
+                bot_deployments = [
+                    d for d in autonomous_deps
+                    if d.notes and d.notes.startswith("bot:") and d.notes.split(":", 1)[1] == self.config.bot_id
+                ]
 
-            for dep in bot_deployments:
-                try:
-                    self.control_center.stop_deployment(deployment_id=dep.deployment_id)
-                except Exception:
-                    # Continue stopping other deployments even if one fails.
-                    pass
+                for dep in bot_deployments:
+                    try:
+                        self.control_center.stop_deployment(deployment_id=dep.deployment_id)
+                    except Exception:
+                        # Continue stopping other deployments even if one fails.
+                        pass
+            except Exception:
+                pass
 
             # Transition STOPPING -> STOPPED
             if not self.lifecycle.can_transition_to(AutonomousBotState.STOPPED):
@@ -297,17 +352,20 @@ class AutonomousController(BaseModel):
 
             self.lifecycle.transition_to(AutonomousBotState.STOPPED)
             self.config.state = AutonomousBotState.STOPPED
+            self.config.enabled = False
 
             # Phase 7: Halt the kill switch on stop.
             self._safety_layer.kill_switch.halt(
                 KillSwitchReason.DEPLOYMENT_ERROR,
-                detail="bot stopped — all trading halted",
+                detail="bot stopped - all trading halted",
             )
 
             self._record_event(AutonomousEventType.BOT_STOPPED)
 
             # Clear the decision timestamp.
             self.config.last_decision_timestamp = None
+
+            self._persist()
 
             return True, f"bot stopped successfully; state={self.lifecycle.state.value}"
 
@@ -337,6 +395,8 @@ class AutonomousController(BaseModel):
             self.config.state = AutonomousBotState.PAUSED
 
             self._record_event(AutonomousEventType.BOT_PAUSED)
+
+            self._persist()
 
             return True, f"bot paused successfully; state={self.lifecycle.state.value}"
 
@@ -371,10 +431,13 @@ class AutonomousController(BaseModel):
                     return False, f"bot cannot transition from {self.lifecycle.state.value} to RUNNING"
                 self.lifecycle.transition_to(AutonomousBotState.RUNNING)
                 self.config.state = AutonomousBotState.RUNNING
+                self.config.enabled = True
             else:
                 return False, f"bot cannot resume from {self.lifecycle.state.value}"
 
             self._record_event(AutonomousEventType.BOT_RESUMED)
+
+            self._persist()
 
             return True, f"bot resumed successfully; state={self.lifecycle.state.value}"
 
@@ -399,16 +462,21 @@ class AutonomousController(BaseModel):
         )
 
         # Pause all bot-owned deployments.
-        autonomous_deps = self.control_center.list_deployments()
-        bot_deployments = [
-            d for d in autonomous_deps
-            if d.notes and d.notes.startswith("bot:") and d.notes.split(":", 1)[1] == self.config.bot_id
-        ]
-        for dep in bot_deployments:
-            try:
-                self.control_center.pause_deployment(deployment_id=dep.deployment_id)
-            except Exception:
-                pass
+        try:
+            autonomous_deps = self.control_center.list_deployments()
+            bot_deployments = [
+                d for d in autonomous_deps
+                if d.notes and d.notes.startswith("bot:") and d.notes.split(":", 1)[1] == self.config.bot_id
+            ]
+            for dep in bot_deployments:
+                try:
+                    self.control_center.pause_deployment(deployment_id=dep.deployment_id)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        self._persist()
 
         return True, f"bot halted (reason={reason.value}); kill_switch={KillSwitchState.HALTED.value}"
 
@@ -883,20 +951,30 @@ class AutonomousController(BaseModel):
             as_of=as_of,
         )
 
-        if result.has_selection:
+        if result is None:
             self._record_event(
-                AutonomousEventType.DECISION_CREATED,
+                AutonomousEventType.ERROR,
                 symbol=underlying,
-                message=f"selected option contract {result.selected.instrument.key}",
-                payload=result.to_dict(),
+                message="option discovery returned no result",
+                payload={},
             )
-        elif result.candidates:
+            return None
+
+        if not result.has_selection:
             self._record_event(
                 AutonomousEventType.DECISION_REJECTED,
                 symbol=underlying,
                 message=f"no suitable option contract selected ({len(result.candidates)} candidates evaluated)",
                 payload=result.to_dict(),
             )
+            return result
+
+        self._record_event(
+            AutonomousEventType.DECISION_CREATED,
+            symbol=underlying,
+            message=f"selected option contract {result.selected.instrument.key}",
+            payload=result.to_dict(),
+        )
 
         return result
 
@@ -989,22 +1067,31 @@ class AutonomousController(BaseModel):
         client_order_id: Optional[str] = None,
         options_deployment_config: Optional[Any] = None,
         explicit_option_type: Optional[str] = None,
+        explicit_side: Optional[str] = None,
+        explicit_instrument: Optional[Any] = None,
+        existing_position: Optional[Any] = None,
     ) -> Optional["OrderResult"]:
         """Full autonomous options execution: discovery → premium → safety → paper fill.
 
         The caller must NOT supply ``current_price`` — this method obtains
         the option's current premium automatically from Upstox market data.
 
+        For exits, pass ``existing_position`` (a ``Position`` or namespace with
+        ``options_contract_id``, ``strike``, ``expiry``, ``option_type``,
+        ``contract_size``) to close that exact contract instead of discovering
+        a new one.
+
         Flow:
           1. Phase 7 kill-switch check (fail closed).
-          2. Phase 8B: discover exact option contract from InstrumentRepository.
-          3. Phase 8C: fetch current option premium from Upstox (real-time).
-          4. Validate quote freshness.
-          5. Phase 7 safety: validate contract validity (CE/PE, expiry).
-          6. PaperBroker.update_market_price() with the exact option premium.
-          7. Construct OrderIntent with current_price=premium (no manual injection).
-          8. submit_order_intent through the control center → PaperBroker fill.
-          9. Paper position created with premium-based avg_entry_price.
+          2. If exiting: build Instrument from existing position.
+          3. If entering: Phase 8B discover exact option contract from InstrumentRepository.
+          4. Phase 8C: fetch current option premium from Upstox (real-time).
+          5. Validate quote freshness.
+          6. Phase 7 safety: validate contract validity (CE/PE, expiry).
+          7. PaperBroker.update_market_price() with the exact option premium.
+          8. Construct OrderIntent with current_price=premium (no manual injection).
+          9. submit_order_intent through the control center → PaperBroker fill.
+          10. Paper position created/closed with premium-based avg_entry_price.
 
         Returns ``OrderResult`` on success, ``None`` on any rejection/failure.
         """
@@ -1023,31 +1110,100 @@ class AutonomousController(BaseModel):
             )
             return None
 
-        # --- Phase 8B + 8C: discover + fetch premium ---
-        from .options.model import OptionDirection
-        explicit_direction = None
-        if explicit_option_type == "CE":
-            explicit_direction = OptionDirection.CALL
-        elif explicit_option_type == "PE":
-            explicit_direction = OptionDirection.PUT
-        quote = self.fetch_option_premium(
-            decision=decision,
-            spot_price=spot_price,
-            config=config,
-            as_of=as_of,
-            max_quote_age_seconds=max_quote_age_seconds,
-            explicit_direction=explicit_direction,
+        # --- Resolve instrument + premium ---
+        from trading_system.india.instruments import (
+            Instrument,
+            InstrumentType,
+            InternalSymbol,
         )
-        if quote is None:
-            return None
 
-        instrument = quote.instrument
+        instrument = None
+        quote = None
+
+        if existing_position is not None:
+            pos_contract_id = getattr(existing_position, "options_contract_id", None)
+            pos_strike = getattr(existing_position, "strike", None)
+            pos_expiry = getattr(existing_position, "expiry", None)
+            pos_option_type = getattr(existing_position, "option_type", None)
+            pos_contract_size = getattr(existing_position, "contract_size", 1)
+
+            if pos_contract_id and pos_strike and pos_expiry and pos_option_type:
+                underlying = decision.opportunity_symbol.split(":")[-1] if ":" in decision.opportunity_symbol else decision.opportunity_symbol
+                itype = InstrumentType.OPTION_CE if pos_option_type == "CE" else InstrumentType.OPTION_PE
+                token = f"{underlying}{pos_expiry.replace('-', '')}{int(pos_strike)}{pos_option_type}"
+                instrument = Instrument(
+                    internal=InternalSymbol(exchange="NFO", symbol=token),
+                    instrument_type=itype,
+                    name=f"{underlying} {pos_option_type} {pos_strike} {pos_expiry}",
+                )
+                instrument.underlying = underlying
+                instrument.expiry = pos_expiry
+                instrument.strike = float(pos_strike)
+                instrument.option_type = pos_option_type
+                instrument.lot_size = int(pos_contract_size) if pos_contract_size else 1
+                instrument.provider_symbol = pos_contract_id
+
+                quote = self._quote_provider.get_quote(instrument)
+                if quote is None:
+                    self._record_event(
+                        AutonomousEventType.ERROR,
+                        symbol=underlying,
+                        message=f"failed to fetch exit premium for {pos_contract_id}",
+                    )
+                    return None
+                if not self._quote_provider.is_fresh(quote, max_age_seconds=max_quote_age_seconds):
+                    self._record_event(
+                        AutonomousEventType.ERROR,
+                        symbol=underlying,
+                        message=f"exit quote stale: age={quote.age_seconds:.0f}s for {pos_contract_id}",
+                    )
+                    return None
+            else:
+                self._record_event(
+                    AutonomousEventType.ERROR,
+                    symbol=decision.opportunity_symbol,
+                    message="exit rejected: existing position missing contract metadata",
+                )
+                return None
+        else:
+            # --- Phase 8B + 8C: discover + fetch premium ---
+            from .options.model import OptionDirection
+            explicit_direction = None
+            if explicit_option_type == "CE":
+                explicit_direction = OptionDirection.CALL
+            elif explicit_option_type == "PE":
+                explicit_direction = OptionDirection.PUT
+
+            if explicit_instrument is not None:
+                instrument = explicit_instrument
+                quote = None
+                if self._quote_provider is not None:
+                    quote = self._quote_provider.get_quote(instrument)
+                    if quote is None or not self._quote_provider.is_fresh(quote, max_age_seconds=max_age_seconds):
+                        self._record_event(
+                            AutonomousEventType.ERROR,
+                            symbol=getattr(instrument, "underlying", None) or decision.opportunity_symbol,
+                            message="option quote unavailable or stale for existing contract " + getattr(instrument, "contract_id", ""),
+                        )
+                        return None
+            else:
+                quote = self.fetch_option_premium(
+                    decision=decision,
+                    spot_price=spot_price,
+                    config=config,
+                    as_of=as_of,
+                    max_quote_age_seconds=max_quote_age_seconds,
+                    explicit_direction=explicit_direction,
+                )
+                if quote is None:
+                    return None
+                instrument = quote.instrument
 
         # Deterministic client_order_id for idempotency (generated before
         # the idempotency guard so cached results can be looked up on replay).
+        action_for_id = decision.action
         if client_order_id is None:
             import hashlib
-            action_for_id = decision.action
             client_order_id = hashlib.sha256(
                 f"{decision.decision_id}:{instrument.contract_id}:{action_for_id}".encode("utf-8")
             ).hexdigest()[:48]
@@ -1108,7 +1264,7 @@ class AutonomousController(BaseModel):
 
         # Pre-compute values needed for idempotency replay and OrderIntent.
         action = decision.action
-        side = Side.BUY if action == "buy" else Side.SELL
+        side = Side.BUY if str(action).lower() == "buy" else Side.SELL
 
         # --- Feed premium to PaperBroker BEFORE order submission ---
         # This sets _last_price so the broker has a current market price for
@@ -1141,6 +1297,7 @@ class AutonomousController(BaseModel):
             strategy_id=decision.selected_configuration.strategy_id if decision.selected_configuration else "unknown",
             timeframe=decision.selected_configuration.timeframe if decision.selected_configuration else "1d",
             options_contract_id=instrument.contract_id,
+            action=action_for_id,
         )
         if self._safety_layer.idempotency.is_duplicate_deployment(dep_key):
             # Return cached result from the session store if available.

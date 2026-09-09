@@ -857,12 +857,17 @@ class IdempotencyGuard:
         strategy_id: str,
         timeframe: str,
         options_contract_id: Optional[str] = None,
+        action: Optional[str] = None,
     ) -> str:
         """Deterministic key for a (bot, symbol, strategy, timeframe) deployment.
 
         When ``options_contract_id`` is provided the key additionally
         incorporates it so that a single deployment can manage at most
         one options contract at a time.
+
+        When ``action`` is provided the key also incorporates the action
+        so that BUY and SELL on the same option contract are treated as
+        separate idempotent operations.
         """
         import hashlib
         import json
@@ -874,6 +879,8 @@ class IdempotencyGuard:
         }
         if options_contract_id is not None:
             key_fields["options_contract_id"] = options_contract_id
+        if action is not None:
+            key_fields["action"] = action
         payload = json.dumps(key_fields, sort_keys=True)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 

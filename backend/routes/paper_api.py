@@ -46,7 +46,7 @@ def _build_market_data_callable():
     return md_provider, market_data_callable
 
 
-def _build_controller(center, settings, md_provider, market_data_callable):
+def _build_controller(center, settings, md_provider, market_data_callable, persistence=None):
     from trading_system.autonomous.bot_config import (
         AutonomousBotConfig,
         BotMode,
@@ -70,7 +70,13 @@ def _build_controller(center, settings, md_provider, market_data_callable):
         max_simultaneous_positions=5,
         source=Source.AUTONOMOUS,
     )
-    controller = AutonomousController(config=bot_config, control_center=center)
+    controller = AutonomousController(config=bot_config, control_center=center, persistence=persistence)
+
+    if persistence is not None:
+        try:
+            controller.load_state(persistence.load_state(bot_config.bot_id))
+        except Exception:
+            pass
 
     if md_provider.is_authenticated:
         try:
@@ -147,6 +153,9 @@ def _get_api_router():
         connect_args=connect_args,
     )
 
+    # Import persistence module so Base.metadata knows about autonomous_bots.
+    from trading_system.autonomous.persistence import AutonomousBotStateStore
+
     # Idempotent forward migration: adds missing columns introduced after the
     # initial ``Base.metadata.create_all``. Phase 8 added
     # ``options_enabled`` / ``allowed_option_types_json`` /
@@ -158,6 +167,7 @@ def _get_api_router():
     # routes have their own degraded fallback returning 200 + warning.
     try:
         EvidenceStore(engine).ensure_schema_current()
+        AutonomousBotStateStore(engine).ensure_schema()
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "paper_deployments migration helper raised: %r; deployment "
@@ -184,8 +194,9 @@ def _get_api_router():
 
     controller = None
     try:
+        bot_store = AutonomousBotStateStore(engine)
         controller = _build_controller(
-            center, settings, md_provider, market_data_callable
+            center, settings, md_provider, market_data_callable, persistence=bot_store
         )
     except Exception as exc:
         logger.warning(

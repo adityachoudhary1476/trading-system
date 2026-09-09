@@ -1055,6 +1055,7 @@ class PaperTradingControlCenter:
                 strike=intent.strike,
                 expiry=intent.expiry,
                 option_type=intent.option_type,
+                contract_size=intent.contract_size,
             )
             self._emit_external_event(
                 runner, "order_intent_rejected",

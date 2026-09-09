@@ -41,6 +41,7 @@ from trading_system.autonomous.bot_config import (
     TradingMode,
     UserConstraints,
 )
+from trading_system.autonomous import AutonomousBotState
 from trading_system.autonomous.coordinator import DeploymentCreationResult
 from trading_system.autonomous.events import AutonomousEventType
 from trading_system.paper.circuit_breaker import CircuitState, PaperCircuitBreaker
@@ -752,3 +753,380 @@ class TestStaticSafetyScan:
         assert "from trading_system.execution" not in content
         assert "from trading_system.execution.live" not in content
         assert "live_broker" not in content.lower()
+
+
+# --------------------------------------------------------------------------- #
+# Kill-switch end-to-end behaviour
+# --------------------------------------------------------------------------- #
+
+class TestKillSwitchEndToEnd:
+    def test_stop_bot_sets_enabled_false(self):
+        controller = _make_controller()
+        controller.start_bot()
+        assert controller.config.enabled is True
+        success, message = controller.stop_bot()
+        assert success is True
+        assert controller.config.enabled is False
+        assert controller.lifecycle.state == AutonomousBotState.STOPPED
+
+    def test_stop_bot_trips_kill_switch(self):
+        controller = _make_controller()
+        controller.start_bot()
+        success, message = controller.stop_bot()
+        assert success is True
+        assert controller.kill_switch.is_halted is True
+        assert controller.kill_switch.reason == KillSwitchReason.DEPLOYMENT_ERROR
+
+    def test_stop_bot_is_resilient_to_list_deployments_failure(self):
+        controller = _make_controller()
+        controller.start_bot()
+        controller.control_center.list_deployments = lambda: (_ for _ in ()).throw(RuntimeError("db down"))
+        success, message = controller.stop_bot()
+        assert success is True
+        assert controller.lifecycle.state == AutonomousBotState.STOPPED
+        assert controller.config.enabled is False
+        assert controller.kill_switch.is_halted is True
+
+    def test_resume_bot_sets_enabled_true(self):
+        controller = _make_controller()
+        controller.start_bot()
+        controller.stop_bot()
+        assert controller.config.enabled is False
+        # Cannot resume from STOPPED — start a fresh controller instead.
+        controller = _make_controller()
+        controller.config.enabled = False
+        controller.start_bot()
+        assert controller.config.enabled is True
+
+    def test_start_bot_sets_enabled_true(self):
+        controller = _make_controller()
+        controller.config.enabled = False
+        success, message = controller.start_bot()
+        assert success is True
+        assert controller.config.enabled is True
+
+
+class TestKillSwitchPersistence:
+    def test_persistence_save_and_load(self):
+        from sqlalchemy import create_engine
+        from trading_system.autonomous.persistence import AutonomousBotStateStore
+
+        engine = create_engine("sqlite://")
+        store = AutonomousBotStateStore(engine)
+        store.ensure_schema()
+
+        store.save_state(
+            bot_id="bot-test",
+            state="stopped",
+            enabled=False,
+            kill_switch_state="halted",
+            kill_switch_reason="deployment_error",
+            kill_switch_halted_at="2026-09-09T10:00:00+00:00",
+        )
+
+        loaded = store.load_state("bot-test")
+        assert loaded["state"] == "stopped"
+        assert loaded["enabled"] is False
+        assert loaded["kill_switch_state"] == "halted"
+        assert loaded["kill_switch_reason"] == "deployment_error"
+
+    def test_controller_loads_persisted_state(self):
+        from sqlalchemy import create_engine
+        from trading_system.autonomous.persistence import AutonomousBotStateStore
+        from trading_system.autonomous.bot_config import (
+            AutonomousBotConfig,
+            BotMode,
+            Source,
+            TradingMode,
+            UserConstraints,
+        )
+        from trading_system.paper.control import PaperTradingControlCenter
+        from trading_system.research.strategy_intelligence import (
+            EvidenceFreshnessConfig,
+            EvidenceRequirement,
+        )
+        from trading_system.research.evidence import EvidenceStore
+        from trading_system.research.strategy_registry import StrategyRegistry
+        from trading_system.research.strategy_intelligence import StrategyIntelligence
+        from trading_system.paper.gate import DeploymentGate
+
+        engine = create_engine("sqlite://")
+        store = EvidenceStore(engine)
+        registry = StrategyRegistry(store)
+        intelligence = StrategyIntelligence(registry)
+        gate = DeploymentGate(
+            intelligence=intelligence,
+            requirement=EvidenceRequirement(),
+            freshness_config=EvidenceFreshnessConfig(max_age_days=180),
+        )
+        control_center = PaperTradingControlCenter(
+            registry=registry,
+            intelligence=intelligence,
+            gate=gate,
+        )
+
+        bot_store = AutonomousBotStateStore(engine)
+        bot_store.ensure_schema()
+        bot_store.save_state(
+            bot_id="bot-test",
+            state="stopped",
+            enabled=False,
+            kill_switch_state="halted",
+            kill_switch_reason="deployment_error",
+        )
+
+        config = AutonomousBotConfig(
+            bot_id="bot-test",
+            name="Test Bot",
+            mode=BotMode.AUTONOMOUS,
+            trading_mode=TradingMode.PAPER,
+            enabled=True,
+            user_constraints=UserConstraints(
+                allowed_symbols=frozenset({"NSE:SBIN"}),
+                allowed_strategy_ids=frozenset(),
+                allowed_timeframes=frozenset({"1d"}),
+            ),
+            max_simultaneous_positions=5,
+            source=Source.AUTONOMOUS,
+        )
+        controller = AutonomousController(config=config, control_center=control_center, persistence=bot_store)
+        controller.load_state(bot_store.load_state("bot-test"))
+
+        assert controller.config.state == AutonomousBotState.STOPPED
+        assert controller.config.enabled is False
+        assert controller.kill_switch.is_halted is True
+
+
+class TestAdversarialAudit:
+    """Focused adversarial audit of the kill-switch fix."""
+
+    # ------------------------------------------------------------------ #
+    # 1. Cross-controller / cross-process enforcement
+    # ------------------------------------------------------------------ #
+
+    def test_cross_controller_kill_is_authoritative(self):
+        from sqlalchemy import create_engine
+        from trading_system.autonomous.persistence import AutonomousBotStateStore
+        from trading_system.autonomous.bot_config import (
+            AutonomousBotConfig,
+            BotMode,
+            Source,
+            TradingMode,
+            UserConstraints,
+        )
+        from trading_system.paper.control import PaperTradingControlCenter
+        from trading_system.research.strategy_intelligence import (
+            EvidenceFreshnessConfig,
+            EvidenceRequirement,
+        )
+        from trading_system.research.evidence import EvidenceStore
+        from trading_system.research.strategy_registry import StrategyRegistry
+        from trading_system.research.strategy_intelligence import StrategyIntelligence
+        from trading_system.paper.gate import DeploymentGate
+
+        engine = create_engine("sqlite://")
+        store = EvidenceStore(engine)
+        registry = StrategyRegistry(store)
+        intelligence = StrategyIntelligence(registry)
+        gate = DeploymentGate(
+            intelligence=intelligence,
+            requirement=EvidenceRequirement(),
+            freshness_config=EvidenceFreshnessConfig(max_age_days=180),
+        )
+        control_center = PaperTradingControlCenter(
+            registry=registry,
+            intelligence=intelligence,
+            gate=gate,
+        )
+        bot_store = AutonomousBotStateStore(engine)
+        bot_store.ensure_schema()
+
+        def _build_controller():
+            config = AutonomousBotConfig(
+                bot_id="bot-audit",
+                name="Audit Bot",
+                mode=BotMode.AUTONOMOUS,
+                trading_mode=TradingMode.PAPER,
+                enabled=True,
+                user_constraints=UserConstraints(
+                    allowed_symbols=frozenset({"NSE:SBIN"}),
+                    allowed_strategy_ids=frozenset(),
+                    allowed_timeframes=frozenset({"1d"}),
+                ),
+                max_simultaneous_positions=5,
+                source=Source.AUTONOMOUS,
+            )
+            return AutonomousController(
+                config=config,
+                control_center=control_center,
+                persistence=bot_store,
+            )
+
+        controller_a = _build_controller()
+        controller_a.start_bot()
+        assert controller_a.config.state == AutonomousBotState.RUNNING
+
+        controller_b = _build_controller()
+        controller_b.load_state(bot_store.load_state("bot-audit"))
+        assert controller_b.config.state == AutonomousBotState.RUNNING
+
+        controller_a.stop_bot()
+        assert controller_a.config.enabled is False
+        assert controller_a.kill_switch.is_halted is True
+
+        controller_c = _build_controller()
+        controller_c.load_state(bot_store.load_state("bot-audit"))
+        assert controller_c.config.enabled is False
+        assert controller_c.kill_switch.is_halted is True
+        assert controller_c.config.state == AutonomousBotState.STOPPED
+
+        assert controller_c.is_halted is True
+        assert controller_c.lifecycle.can_transition_to(AutonomousBotState.RUNNING) is False
+
+    # ------------------------------------------------------------------ #
+    # 2. Deployment-pause failure semantics
+    # ------------------------------------------------------------------ #
+
+    def test_stop_bot_fails_closed_when_list_deployments_raises(self):
+        controller = _make_controller()
+        controller.start_bot()
+        controller.control_center.list_deployments = (
+            lambda: (_ for _ in ()).throw(RuntimeError("db schema mismatch"))
+        )
+
+        success, message = controller.stop_bot()
+        assert success is True
+        assert controller.config.state == AutonomousBotState.STOPPED
+        assert controller.config.enabled is False
+        assert controller.kill_switch.is_halted is True
+        assert controller.kill_switch.reason == KillSwitchReason.DEPLOYMENT_ERROR
+
+    # ------------------------------------------------------------------ #
+    # 3. Restart correctness
+    # ------------------------------------------------------------------ #
+
+    def test_stop_persists_and_survives_controller_reconstruction(self):
+        from sqlalchemy import create_engine
+        from trading_system.autonomous.persistence import AutonomousBotStateStore
+        from trading_system.autonomous.bot_config import (
+            AutonomousBotConfig,
+            BotMode,
+            Source,
+            TradingMode,
+            UserConstraints,
+        )
+        from trading_system.paper.control import PaperTradingControlCenter
+        from trading_system.research.strategy_intelligence import (
+            EvidenceFreshnessConfig,
+            EvidenceRequirement,
+        )
+        from trading_system.research.evidence import EvidenceStore
+        from trading_system.research.strategy_registry import StrategyRegistry
+        from trading_system.research.strategy_intelligence import StrategyIntelligence
+        from trading_system.paper.gate import DeploymentGate
+
+        engine = create_engine("sqlite://")
+        store = EvidenceStore(engine)
+        registry = StrategyRegistry(store)
+        intelligence = StrategyIntelligence(registry)
+        gate = DeploymentGate(
+            intelligence=intelligence,
+            requirement=EvidenceRequirement(),
+            freshness_config=EvidenceFreshnessConfig(max_age_days=180),
+        )
+        control_center = PaperTradingControlCenter(
+            registry=registry,
+            intelligence=intelligence,
+            gate=gate,
+        )
+        bot_store = AutonomousBotStateStore(engine)
+        bot_store.ensure_schema()
+
+        def _build():
+            config = AutonomousBotConfig(
+                bot_id="bot-restart",
+                name="Restart Bot",
+                mode=BotMode.AUTONOMOUS,
+                trading_mode=TradingMode.PAPER,
+                enabled=True,
+                user_constraints=UserConstraints(
+                    allowed_symbols=frozenset({"NSE:SBIN"}),
+                    allowed_strategy_ids=frozenset(),
+                    allowed_timeframes=frozenset({"1d"}),
+                ),
+                max_simultaneous_positions=5,
+                source=Source.AUTONOMOUS,
+            )
+            return AutonomousController(
+                config=config,
+                control_center=control_center,
+                persistence=bot_store,
+            )
+
+        ctrl1 = _build()
+        ctrl1.start_bot()
+        ctrl1.stop_bot()
+        assert ctrl1.config.state == AutonomousBotState.STOPPED
+
+        ctrl2 = _build()
+        ctrl2.load_state(bot_store.load_state("bot-restart"))
+        assert ctrl2.config.state == AutonomousBotState.STOPPED
+        assert ctrl2.config.enabled is False
+        assert ctrl2.kill_switch.is_halted is True
+
+    # ------------------------------------------------------------------ #
+    # 4. Idempotency
+    # ------------------------------------------------------------------ #
+
+    def test_repeated_stops_are_idempotent_and_safe(self):
+        controller = _make_controller()
+        controller.start_bot()
+
+        for _ in range(4):
+            success, message = controller.stop_bot()
+            assert success is True
+            assert controller.config.state == AutonomousBotState.STOPPED
+            assert controller.config.enabled is False
+            assert controller.kill_switch.is_halted is True
+
+    # ------------------------------------------------------------------ #
+    # 5. Schema initialization
+    # ------------------------------------------------------------------ #
+
+    def test_fresh_db_creates_autonomous_bots_and_migrates_paper_deployments(self):
+        from sqlalchemy import create_engine, inspect
+        from trading_system.autonomous.persistence import AutonomousBotStateStore
+        from trading_system.research.evidence import EvidenceStore
+
+        engine = create_engine("sqlite://")
+        EvidenceStore(engine).ensure_schema_current()
+        bot_store = AutonomousBotStateStore(engine)
+        bot_store.ensure_schema()
+
+        insp = inspect(engine)
+        tables = insp.get_table_names()
+        assert "autonomous_bots" in tables
+        assert "paper_deployments" in tables
+
+        cols = {c["name"] for c in insp.get_columns("paper_deployments")}
+        assert "strategy_parameters_json" in cols
+
+    def test_existing_db_migration_is_idempotent(self):
+        from sqlalchemy import create_engine, inspect
+        from trading_system.autonomous.persistence import AutonomousBotStateStore
+        from trading_system.research.evidence import EvidenceStore
+
+        engine = create_engine("sqlite://")
+        store = EvidenceStore(engine)
+        store.ensure_schema_current()
+
+        insp = inspect(engine)
+        cols = {c["name"] for c in insp.get_columns("paper_deployments")}
+        assert "strategy_parameters_json" in cols
+
+        bot_store = AutonomousBotStateStore(engine)
+        bot_store.ensure_schema()
+        bot_store.ensure_schema()
+
+        tables = insp.get_table_names()
+        assert "autonomous_bots" in tables

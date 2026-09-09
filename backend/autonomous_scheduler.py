@@ -103,6 +103,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Iterator, Optional
 
 from sqlalchemy import create_engine, text
@@ -391,8 +392,8 @@ def _position_matches(
     """True iff the live position already reflects the intended signal.
 
     For BUY: already long with quantity >= target_qty.
-    For SELL: already flat (no short allowed in Phase 23) — caller
-    should treat this as "executed" because there is nothing to do.
+    For SELL: already flat (qty <= 0) because Phase 23 never allows shorting.
+    For option-aware matching, the caller should use _option_position_matches_contract.
     """
     if position is None:
         return False
@@ -400,11 +401,103 @@ def _position_matches(
     if action == "buy":
         return qty >= float(target_qty) and qty > 0
     if action == "sell":
-        # SELL in Phase 23 is only ever a reduce/close because the
-        # scheduler never sets allow_short=True. If the position is
-        # flat, the " signal has effectively been actioned.
         return qty <= 0
     return False
+
+
+def _option_position_matches_contract(position, decision, explicit_option_type):
+    """Verify the existing position matches the requested option contract."""
+    if explicit_option_type and getattr(position, "option_type", None) != explicit_option_type:
+        return False
+    # If the decision carries an explicit contract_id, match it exactly.
+    decision_contract_id = getattr(getattr(decision, "signal", None), "option_contract_id", None)
+    if decision_contract_id is None:
+        decision_contract_id = getattr(decision, "option_contract_id", None)
+    if decision_contract_id is not None:
+        position_contract_id = getattr(position, "options_contract_id", None)
+        if position_contract_id != decision_contract_id:
+            return False
+    return True
+
+
+def _get_open_option_positions(center, deployment_id: str) -> list:
+    """Return all open option positions for a deployment."""
+    try:
+        session = center.find_session_for_deployment(deployment_id)
+        if session is None:
+            return []
+        runner = center.get_runner(session)
+        if runner is None:
+            return []
+        positions = []
+        for pos in runner.broker.positions().values():
+            if pos.is_open and pos.is_option:
+                positions.append(pos)
+        return positions
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _check_sl_tp_for_position(runner, position, ts):
+    """Check SL/TP for a position and return the action if triggered."""
+    if position is None or not position.is_open:
+        return None
+    if position.is_option and position.current_price <= 0:
+        return None
+    price = position.current_price
+    avg = position.avg_entry_price
+    if avg <= 0 or price <= 0:
+        return None
+    qty = position.qty
+    contract_size = position.contract_size or 1
+    unrealized_pnl = (price - avg) * qty * contract_size
+    cost_basis = abs(qty) * avg * contract_size
+    if cost_basis <= 0:
+        return None
+    unrealized_pnl_pct = unrealized_pnl / cost_basis
+    cfg = getattr(runner, "config", None)
+    if cfg is None:
+        return None
+    if qty > 0:
+        if cfg.stop_loss_pct is not None and unrealized_pnl_pct <= -float(cfg.stop_loss_pct):
+            return "sell"
+        if cfg.take_profit_pct is not None and unrealized_pnl_pct >= float(cfg.take_profit_pct):
+            return "sell"
+    elif qty < 0:
+        if cfg.stop_loss_pct is not None and unrealized_pnl_pct <= -float(cfg.stop_loss_pct):
+            return "buy"
+        if cfg.take_profit_pct is not None and unrealized_pnl_pct >= float(cfg.take_profit_pct):
+            return "buy"
+    return None
+
+
+def _flatten_positions(runner, ts):
+    """Flatten all open positions (emergency/circuit-breaker)."""
+    if runner is None:
+        return
+    try:
+        from trading_system.execution.orders import Side
+        positions = runner.broker.positions()
+        for symbol, pos in list(positions.items()):
+            if not pos.is_open:
+                continue
+            qty = abs(pos.qty)
+            if qty <= 0:
+                continue
+            side = Side.SELL if pos.qty > 0 else Side.BUY
+            runner.broker.submit_order(
+                symbol=symbol,
+                side=side,
+                quantity=qty,
+                order_type="MARKET",
+                current_price=pos.current_price,
+                options_contract_id=pos.options_contract_id,
+                strike=pos.strike,
+                expiry=pos.expiry,
+                option_type=pos.option_type,
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -444,6 +537,7 @@ def _build_market_data_callable():
 def _build_control_center(engine: Engine):
     """Mirror ``routes/paper_api._get_api_router`` so the scheduler and
     the API share the same DB state and schema."""
+    from trading_system.autonomous.persistence import AutonomousBotStateStore
     from trading_system.paper.control import PaperTradingControlCenter
     from trading_system.research.evidence import EvidenceStore
     from trading_system.research.strategy_intelligence import (
@@ -453,6 +547,7 @@ def _build_control_center(engine: Engine):
 
     try:
         EvidenceStore(engine).ensure_schema_current()
+        AutonomousBotStateStore(engine).ensure_schema()
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "ensure_schema_current raised during scheduler startup: %r",
@@ -475,7 +570,7 @@ def _build_control_center(engine: Engine):
         freshness_config=freshness,
         market_data_provider=market_data_callable,
     )
-    return center, md_provider, market_data_callable
+    return center, md_provider, market_data_callable, engine
 
 
 def _build_controller(
@@ -484,6 +579,7 @@ def _build_controller(
     market_data_callable,
     bot_id: str,
     option_underlyings: frozenset = frozenset(),
+    persistence=None,
 ):
     """Build a fresh ``AutonomousController`` for one bot."""
     from trading_system.autonomous.bot_config import (
@@ -515,7 +611,12 @@ def _build_controller(
         "FATAL: scheduler must run in TradingMode.PAPER; aborting."
     )
 
-    controller = AutonomousController(config=bot_config, control_center=center)
+    controller = AutonomousController(config=bot_config, control_center=center, persistence=persistence)
+    if persistence is not None:
+        try:
+            controller.load_state(persistence.load_state(bot_id))
+        except Exception:
+            pass
     controller.set_chain_provider(None)
     return controller
 
@@ -654,6 +755,7 @@ def _execute_one_option_decision(
 ) -> dict:
     """Execute one option decision via the controller's option path.
 
+    Supports BUY (new position) and SELL/EXIT (close existing position).
     Returns a structured result dict. Never raises — all failures are
     captured in the result dict.
     """
@@ -662,8 +764,6 @@ def _execute_one_option_decision(
     # --- Pre-checks ---
     underlyings = _env_option_underlyings()
     if not underlyings:
-        # Fall back to the controller's configured option underlyings, or
-        # allow all options-enabled deployments when nothing is configured.
         underlyings = getattr(
             getattr(controller, "config", None),
             "user_constraints",
@@ -678,17 +778,24 @@ def _execute_one_option_decision(
 
     action = getattr(decision.signal, "action", None)
     action_value = action.value if hasattr(action, "value") else str(action)
-    if action_value != "buy":
-        return {
-            "result": "option_selling_not_supported",
-            "detail": f"Phase C supports BUY only, got action={action_value!r}",
-        }
-
     option_intent = getattr(decision.signal, "option_intent", None)
-    if option_intent is None:
+
+    if action_value == "buy":
+        if option_intent not in ("CE", "PE"):
+            return {
+                "result": "option_selling_not_supported",
+                "detail": "BUY option requires explicit option_intent=CE/PE",
+            }
+    elif action_value == "sell":
+        if option_intent is None:
+            return {
+                "result": "option_selling_not_supported",
+                "detail": "SELL option requires explicit option_intent=CE/PE",
+            }
+    else:
         return {
-            "result": "option_selling_not_supported",
-            "detail": "no option_intent on signal",
+            "result": "no_option_action",
+            "detail": f"action={action_value!r} does not trigger option execution",
         }
 
     # Find the first options-enabled deployment.
@@ -711,15 +818,6 @@ def _execute_one_option_decision(
             "deployment_id": deployment_id,
         }
 
-    # --- Check max contracts ---
-    max_contracts = getattr(cfg, "max_options_contracts_per_trade", None)
-    if max_contracts is not None and target_qty > max_contracts:
-        return {
-            "result": "max_contracts_exceeded",
-            "detail": f"target_qty={target_qty} > max={max_contracts}",
-            "deployment_id": deployment_id,
-        }
-
     # --- Kill switch ---
     if controller.is_halted:
         return {
@@ -727,35 +825,201 @@ def _execute_one_option_decision(
             "deployment_id": deployment_id,
         }
 
-    # --- Execute via controller ---
-    result = controller.execute_option_order(
-        decision=decision,
-        spot_price=spot_price,
-        deployment_id=deployment_id,
-        session_id=sid,
-        order_quantity=target_qty,
-        options_deployment_config=cfg,
-        explicit_option_type=option_intent,
-    )
+    runner = controller.control_center.get_runner(sid)
 
-    if result is None:
+    # --- BUY path: discover + buy ---
+    if action_value == "buy":
+        max_contracts = getattr(cfg, "max_options_contracts_per_trade", None)
+        if max_contracts is not None and target_qty > max_contracts:
+            return {
+                "result": "max_contracts_exceeded",
+                "detail": f"target_qty={target_qty} > max={max_contracts}",
+                "deployment_id": deployment_id,
+            }
+
+        # --- Duplicate BUY prevention ---
+        # The controller's idempotency guard (dep_key + client_order_id) prevents
+        # duplicate submissions. We do not short-circuit here so that the
+        # controller can return proper idempotency results.
+        explicit_instrument = None
+
+        # --- Circuit breaker: flatten if open ---
+        cb = runner.circuit_breaker
+        if cb is not None and cb.is_open:
+            _flatten_positions(runner, datetime.now(timezone.utc))
+            return {
+                "result": "circuit_breaker_open",
+                "detail": cb.reason,
+                "deployment_id": deployment_id,
+                "session_id": sid,
+            }
+
+        # --- SL/TP: if existing position violates thresholds, exit instead ---
+        open_positions = _get_open_option_positions(controller.control_center, deployment_id)
+        for pos in open_positions:
+            if _option_position_matches_contract(pos, decision, option_intent):
+                sl_tp_action = _check_sl_tp_for_position(runner, pos, datetime.now(timezone.utc))
+                if sl_tp_action is not None:
+                    contract_id = getattr(pos, "options_contract_id", None)
+                    strike = getattr(pos, "strike", None)
+                    expiry = getattr(pos, "expiry", None)
+                    pos_option_type = getattr(pos, "option_type", None)
+                    contract_size = getattr(pos, "contract_size", 1)
+
+                    exit_decision = SimpleNamespace(
+                        decision_id=getattr(decision, "decision_id", "exit") + "-sl-tp",
+                        opportunity_symbol=getattr(decision, "opportunity_symbol", dep.symbol),
+                        selected_configuration=getattr(decision, "selected_configuration", None),
+                        action="sell",
+                        signal=SimpleNamespace(
+                            action="sell",
+                            reference_price=spot_price,
+                            option_intent=option_intent,
+                        ),
+                    )
+
+                    result = controller.execute_option_order(
+                        decision=exit_decision,
+                        spot_price=spot_price,
+                        deployment_id=deployment_id,
+                        session_id=sid,
+                        order_quantity=target_qty,
+                        options_deployment_config=cfg,
+                        explicit_option_type=option_intent,
+                        existing_position=pos,
+                    )
+
+                    if result is None:
+                        return {
+                            "result": "rejected",
+                            "deployment_id": deployment_id,
+                        }
+
+                    return {
+                        "result": "sl_tp_exit",
+                        "status": result.status,
+                        "order_id": result.order_id,
+                        "option_intent": option_intent,
+                        "options_contract_id": contract_id,
+                        "strike": strike,
+                        "expiry": expiry,
+                        "filled_quantity": getattr(result, "filled_quantity", None),
+                        "avg_fill_price": getattr(result, "avg_fill_price", None),
+                        "deployment_id": deployment_id,
+                        "session_id": sid,
+                    }
+                break
+
+        result = controller.execute_option_order(
+            decision=decision,
+            spot_price=spot_price,
+            deployment_id=deployment_id,
+            session_id=sid,
+            order_quantity=target_qty,
+            options_deployment_config=cfg,
+            explicit_option_type=option_intent,
+            explicit_side="sell" if action_value == "sell" else "buy",
+            explicit_instrument=explicit_instrument,
+        )
+
+        if result is None:
+            return {
+                "result": "rejected",
+                "deployment_id": deployment_id,
+            }
+
         return {
-            "result": "rejected",
+            "result": "already_executed" if getattr(result, "is_idempotent_replay", False) else "submitted",
+            "status": result.status,
+            "order_id": result.order_id,
+            "option_intent": option_intent,
+            "options_contract_id": getattr(result, "options_contract_id", None),
+            "strike": getattr(result, "strike", None),
+            "expiry": getattr(result, "expiry", None),
+            "filled_quantity": getattr(result, "filled_quantity", None),
+            "avg_fill_price": getattr(result, "avg_fill_price", None),
             "deployment_id": deployment_id,
+            "session_id": sid,
         }
 
+    # --- SELL / EXIT path: close existing position ---
+    elif action_value in ("sell", "exit"):
+        open_positions = _get_open_option_positions(controller.control_center, deployment_id)
+        matching_position = None
+        for pos in open_positions:
+            if _option_position_matches_contract(pos, decision, option_intent):
+                matching_position = pos
+                break
+
+        if matching_position is None:
+            return {
+                "result": "no_long_option_position",
+                "detail": f"no open {option_intent} position to close",
+                "deployment_id": deployment_id,
+            }
+
+        contract_id = getattr(matching_position, "options_contract_id", None)
+        strike = getattr(matching_position, "strike", None)
+        expiry = getattr(matching_position, "expiry", None)
+        pos_option_type = getattr(matching_position, "option_type", None)
+        contract_size = getattr(matching_position, "contract_size", 1)
+
+        if contract_id is None or pos_option_type is None:
+            return {
+                "result": "invalid_position",
+                "detail": "existing position missing contract metadata",
+                "deployment_id": deployment_id,
+            }
+
+        exit_decision = SimpleNamespace(
+            decision_id=getattr(decision, "decision_id", "exit") + "-exit",
+            opportunity_symbol=getattr(decision, "opportunity_symbol", dep.symbol),
+            selected_configuration=getattr(decision, "selected_configuration", None),
+            action="sell",
+            signal=SimpleNamespace(
+                action="sell",
+                reference_price=spot_price,
+                option_intent=option_intent,
+            ),
+        )
+
+        result = controller.execute_option_order(
+            decision=exit_decision,
+            spot_price=spot_price,
+            deployment_id=deployment_id,
+            session_id=sid,
+            order_quantity=target_qty,
+            options_deployment_config=cfg,
+            explicit_option_type=option_intent,
+            explicit_instrument=_instrument_from_position(matching_position),
+            existing_position=matching_position,
+        )
+
+        if result is None:
+            return {
+                "result": "rejected",
+                "deployment_id": deployment_id,
+            }
+
+        return {
+            "result": "already_executed" if getattr(result, "is_idempotent_replay", False) else "submitted",
+            "status": result.status,
+            "order_id": result.order_id,
+            "option_intent": option_intent,
+            "options_contract_id": contract_id,
+            "strike": strike,
+            "expiry": expiry,
+            "filled_quantity": getattr(result, "filled_quantity", None),
+            "avg_fill_price": getattr(result, "avg_fill_price", None),
+            "deployment_id": deployment_id,
+            "session_id": sid,
+        }
+
+    # HOLD or unknown action
     return {
-        "result": "already_executed" if getattr(result, "is_idempotent_replay", False) else "submitted",
-        "status": result.status,
-        "order_id": result.order_id,
-        "option_intent": option_intent,
-        "options_contract_id": getattr(result, "options_contract_id", None),
-        "strike": getattr(result, "strike", None),
-        "expiry": getattr(result, "expiry", None),
-        "filled_quantity": getattr(result, "filled_quantity", None),
-        "avg_fill_price": getattr(result, "avg_fill_price", None),
+        "result": "no_option_intent",
+        "detail": f"unsupported action={action_value!r} for options",
         "deployment_id": deployment_id,
-        "session_id": sid,
     }
 
 
@@ -916,6 +1180,51 @@ def _execute_one_decision(
             "result": "no_reference_price",
         }
     runner.broker.update_market_price(symbol, ref_price)
+
+    # --- Circuit breaker: flatten if open ---
+    cb = runner.circuit_breaker
+    if cb is not None and cb.is_open:
+        _flatten_positions(runner, datetime.now(timezone.utc))
+        return {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "signal_id": signal_id,
+            "result": "circuit_breaker_open",
+            "detail": cb.reason,
+        }
+
+    # --- SL/TP: if existing position violates thresholds, exit instead ---
+    if position is not None and position.is_open:
+        sl_tp_action = _check_sl_tp_for_position(runner, position, datetime.now(timezone.utc))
+        if sl_tp_action is not None:
+            side_enum = Side.BUY if sl_tp_action == "buy" else Side.SELL
+            qty = abs(position.qty)
+            intent = OrderIntent(
+                symbol=symbol,
+                side=side_enum,
+                quantity=qty,
+                order_type=OrderType.MARKET,
+                client_order_id=signal_id,
+                current_price=position.current_price,
+            )
+            try:
+                order_result = center.submit_order_intent(session_id=sid, intent=intent)
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "symbol": symbol,
+                    "strategy_id": strategy_id,
+                    "signal_id": signal_id,
+                    "result": "sl_tp_rejected",
+                    "detail": str(exc),
+                }
+            return {
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "signal_id": signal_id,
+                "result": "sl_tp_exit",
+                "status": order_result.status,
+                "order_id": order_result.order_id,
+            }
 
     # --- Submit the canonical OrderIntent. ---
     side_enum = Side.BUY if action == "buy" else Side.SELL
@@ -1244,8 +1553,10 @@ def run() -> int:
     )
 
     engine = _build_engine(db_url)
-    center, md_provider, market_data_callable = _build_control_center(engine)
-    controller = _build_controller(center, md_provider, market_data_callable, bot_id)
+    center, md_provider, market_data_callable, _ = _build_control_center(engine)
+    from trading_system.autonomous.persistence import AutonomousBotStateStore
+    persistence = AutonomousBotStateStore(engine)
+    controller = _build_controller(center, md_provider, market_data_callable, bot_id, persistence=persistence)
 
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
@@ -1270,6 +1581,57 @@ def run() -> int:
 
     logger.info("autonomous scheduler stopped")
     return 0
+
+
+def _find_matching_option_position(controller, decision, option_intent):
+    """Find an existing open option position matching the decision."""
+    try:
+        center = controller.control_center
+    except Exception:  # noqa: BLE001
+        return None
+
+    for checkpoint in center.list_sessions():
+        runner = center.get_runner(checkpoint.session_id)
+        if runner is None:
+            continue
+        for position in runner.broker.positions().values():
+            if position is None or position.qty <= 0:
+                continue
+            if not getattr(position, "is_option", False):
+                continue
+            if option_intent and getattr(position, "option_type", None) != option_intent:
+                continue
+            return position
+    return None
+
+
+def _option_position_matches_contract_exit(position, decision, explicit_option_type):
+    """Verify the existing position matches the requested option contract."""
+    if explicit_option_type and getattr(position, "option_type", None) != explicit_option_type:
+        return False
+    return True
+
+
+def _instrument_from_position(position):
+    """Reconstruct a minimal instrument-like object from an existing option position."""
+    from trading_system.india.instruments import Instrument, InstrumentType, InternalSymbol
+    internal = InternalSymbol(
+        exchange="NFO",
+        symbol=getattr(position, "options_contract_id", position.symbol),
+    )
+    instr = Instrument(
+        internal=internal,
+        instrument_type=InstrumentType.OPTION_CE if getattr(position, "option_type", None) == "CE" else InstrumentType.OPTION_PE,
+        name=position.symbol,
+    )
+    instr.provider_symbol = position.symbol
+    instr.exchange_full = "NFO"
+    instr.underlying = position.symbol
+    instr.expiry = getattr(position, "expiry", None)
+    instr.strike = getattr(position, "strike", None)
+    instr.option_type = getattr(position, "option_type", None)
+    instr.lot_size = getattr(position, "contract_size", 1)
+    return instr
 
 
 if __name__ == "__main__":
