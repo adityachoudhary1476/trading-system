@@ -25,7 +25,7 @@ def test_autonomous_discovery_and_deployment():
 
     registry.get_paper_approved.return_value = [strategy_mock]
     registry.list_evidence.return_value = [
-        MagicMock(configuration={"qualification_status": "PAPER_APPROVED", "candidate_id": "test-candidate", "score": 75.0})
+        MagicMock(configuration_json={"qualification_status": "PAPER_APPROVED", "candidate_id": "test-candidate", "score": 75.0})
     ]
     registry.get_strategy.return_value = strategy_mock
 

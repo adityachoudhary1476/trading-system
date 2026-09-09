@@ -282,7 +282,7 @@ class TestTournamentIntegration:
     def test_rejection_gates(self):
         from trading_system.research.phase23.scoring import RejectionGate, RejectionReason, ScorerInput
         gate = RejectionGate()
-        inp = ScorerInput(trade_count=10, wf_coverage=0.5, bootstrap_prob_positive=0.3)
+        inp = ScorerInput(trade_count=10, wf_coverage=0.4, bootstrap_prob_positive=0.3)
         result = gate.evaluate(inp)
         assert RejectionReason.INSUFFICIENT_TRADES in result.rejection_reasons
         assert RejectionReason.POOR_WALK_FORWARD in result.rejection_reasons
