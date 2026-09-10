@@ -316,6 +316,13 @@ class AutonomousController(BaseModel):
         current state and the error message explains why.
         """
         try:
+            # Recovery path: ERROR -> STOPPED -> STARTING
+            if self.lifecycle.state == AutonomousBotState.ERROR:
+                if not self.lifecycle.can_transition_to(AutonomousBotState.STOPPED):
+                    return False, f"bot cannot recover from {self.lifecycle.state.value} to STOPPED"
+                self.lifecycle.transition_to(AutonomousBotState.STOPPED)
+                self.config.state = AutonomousBotState.STOPPED
+
             # Transition CREATED/STOPPED -> STARTING
             if not self.lifecycle.can_transition_to(AutonomousBotState.STARTING):
                 return False, f"bot cannot transition from {self.lifecycle.state.value} to STARTING"
@@ -411,6 +418,18 @@ class AutonomousController(BaseModel):
         try:
             if self.lifecycle.state == AutonomousBotState.STOPPED:
                 return True, f"bot already stopped; state={self.lifecycle.state.value}"
+
+            if self.lifecycle.state == AutonomousBotState.ERROR:
+                self.lifecycle.transition_to(AutonomousBotState.STOPPED)
+                self.config.state = AutonomousBotState.STOPPED
+                self.config.enabled = False
+                self._safety_layer.kill_switch.halt(
+                    KillSwitchReason.NORMAL_STOP,
+                    detail="bot recovered from error by operator",
+                )
+                self._record_event(AutonomousEventType.BOT_STOPPED)
+                self._persist()
+                return True, f"bot recovered from error and stopped; state={self.lifecycle.state.value}"
 
             # Transition RUNNING/PAUSED -> STOPPING
             if not self.lifecycle.can_transition_to(AutonomousBotState.STOPPING):
@@ -528,6 +547,11 @@ class AutonomousController(BaseModel):
                 self.lifecycle.transition_to(AutonomousBotState.RUNNING)
                 self.config.state = AutonomousBotState.RUNNING
                 self.config.enabled = True
+            elif self.lifecycle.state == AutonomousBotState.ERROR:
+                if not self.lifecycle.can_transition_to(AutonomousBotState.STOPPED):
+                    return False, f"bot cannot recover from {self.lifecycle.state.value} to STOPPED"
+                self.lifecycle.transition_to(AutonomousBotState.STOPPED)
+                self.config.state = AutonomousBotState.STOPPED
             else:
                 return False, f"bot cannot resume from {self.lifecycle.state.value}"
 

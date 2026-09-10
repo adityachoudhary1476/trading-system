@@ -324,6 +324,16 @@ export default function AutonomousCenter() {
                 Resume
               </Button>
             )}
+            {bot && bot.state === "error" && bot.safety?.kill_switch_state === "active" && (
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={actionLoading}
+                onClick={() => handleLifecycle("resume")}
+              >
+                Resume
+              </Button>
+            )}
           </div>
         </div>
       </div>
