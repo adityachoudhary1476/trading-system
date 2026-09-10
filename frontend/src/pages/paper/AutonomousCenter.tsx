@@ -145,7 +145,11 @@ export default function AutonomousCenter() {
   const handleLifecycle = async (action: "start" | "pause" | "resume" | "stop") => {
     setActionLoading(true);
     try {
-      await paperApi.setAutonomousBotLifecycle(action);
+      const res = await paperApi.setAutonomousBotLifecycle(action);
+      if (!res.success) {
+        setError(res.message);
+        return;
+      }
       await fetchBot();
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to ${action} bot`);
@@ -264,6 +268,15 @@ export default function AutonomousCenter() {
   const bot: AutonomousBot | null =
     botState.status === "ok" ? botState.data : null;
 
+  const scheduler = bot?.scheduler;
+  const schedulerStatus = scheduler
+    ? scheduler.worker_required
+      ? scheduler.worker_alive
+        ? ("running" as const)
+        : ("not_running" as const)
+      : ("not_required" as const)
+    : "unknown";
+
   return (
     <div className="paper-shell">
       {/* Header with status and lifecycle controls */}
@@ -283,12 +296,59 @@ export default function AutonomousCenter() {
           {bot && (
             <StatusIndicator status={botStatusToIndicator(bot.state as AutonomousBotStatus)} />
           )}
+          {/* Phase 24A — explicit scheduler liveness indicator.  The bot
+              lifecycle and the autonomous scheduler worker are separate
+              processes; this makes the distinction visible. */}
+          {scheduler && (
+            <div
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "4px 10px",
+                borderRadius: 999,
+                border: "1px solid var(--panel-border)",
+                background:
+                  schedulerStatus === "running"
+                    ? "rgba(34,197,94,0.10)"
+                    : schedulerStatus === "not_running"
+                      ? "rgba(245,158,11,0.10)"
+                      : "rgba(148,163,184,0.08)",
+                color:
+                  schedulerStatus === "running"
+                    ? "#22c55e"
+                    : schedulerStatus === "not_running"
+                      ? "#f59e0b"
+                      : "#94a3b8",
+                fontSize: 12,
+                fontWeight: 600,
+              }}
+              title={
+                scheduler.worker_required
+                  ? scheduler.worker_alive
+                    ? `Scheduler running; last tick ${scheduler.last_tick_at || "—"}`
+                    : "Scheduler NOT running — bot is RUNNING but no worker ticks"
+                  : "No ACTIVE deployments; scheduler not required"
+              }
+            >
+              <span
+                style={{
+                  width: 8,
+                  height: 8,
+                  borderRadius: "50%",
+                  background: "currentColor",
+                  opacity: schedulerStatus === "running" ? 1 : 0.5,
+                }}
+              />
+              Scheduler: {schedulerStatus === "running" ? "RUNNING" : schedulerStatus === "not_running" ? "NOT RUNNING" : "N/A"}
+            </div>
+          )}
           <div style={{ display: "inline-flex", gap: 8, flexWrap: "wrap" }}>
             {bot && bot.state !== "running" && (
               <Button
                 variant="primary"
                 size="sm"
-                disabled={actionLoading || bot.state === "stopped"}
+                disabled={actionLoading}
                 onClick={() => handleLifecycle("start")}
               >
                 Start
@@ -367,6 +427,91 @@ export default function AutonomousCenter() {
             />
             <MetricItem label="Event Count" value={(bot.event_count ?? 0).toString()} />
           </div>
+        </Panel>
+      )}
+
+      {/* Phase 24A — Scheduler liveness panel.  Shows whether the separate
+          autonomous scheduler worker is actually ticking, so the operator
+          can distinguish "bot RUNNING but no worker" from fully
+          operational. */}
+      {bot && bot.scheduler && (
+        <Panel title="Scheduler Worker">
+          <div className="metric-grid">
+            <MetricItem
+              label="Worker required"
+              value={bot.scheduler.worker_required ? "yes" : "no"}
+            />
+            <MetricItem
+              label="Worker alive"
+              value={
+                <Pill tone={bot.scheduler.worker_alive ? "pos" : "neg"}>
+                  {bot.scheduler.worker_alive ? "yes" : "no"}
+                </Pill>
+              }
+            />
+            <MetricItem
+              label="Last tick"
+              value={bot.scheduler.last_tick_at || "—"}
+            />
+            <MetricItem
+              label="Decisions"
+              value={(bot.decision_count ?? 0).toString()}
+            />
+          </div>
+          {bot.scheduler.worker_required && !bot.scheduler.worker_alive && (
+            <p className="muted" style={{ marginTop: 10, fontSize: 12 }}>
+              The bot lifecycle is RUNNING but the autonomous scheduler worker
+              is not ticking.  Start the worker with{" "}
+              <code>AUTONOMOUS_SCHEDULER_ENABLED=true</code> and run{" "}
+              <code>python -m backend.autonomous_scheduler</code> as a
+              background process.
+            </p>
+          )}
+          {bot.scheduler.deployments.length > 0 && (
+            <div style={{ marginTop: 12 }}>
+              <p className="muted" style={{ marginBottom: 6, fontSize: 12 }}>
+                Per-deployment scheduler liveness
+              </p>
+              <div style={{ overflowX: "auto" }}>
+                <table className="data dense">
+                  <thead>
+                    <tr>
+                      <th>Deployment</th>
+                      <th>Liveness</th>
+                      <th>Last tick</th>
+                      <th>Last data</th>
+                      <th>Last decision</th>
+                      <th>Last execution</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bot.scheduler.deployments.map((d) => (
+                      <tr key={d.deployment_id ?? Math.random()}>
+                        <td className="td-id">{d.deployment_id ?? "—"}</td>
+                        <td>
+                          <Pill
+                            tone={
+                              d.liveness === "worker_alive"
+                                ? "pos"
+                                : d.liveness === "market_closed"
+                                  ? undefined
+                                  : "neg"
+                            }
+                          >
+                            {d.liveness}
+                          </Pill>
+                        </td>
+                        <td className="td-muted">{d.last_tick_at || "—"}</td>
+                        <td className="td-muted">{d.last_market_data_at || "—"}</td>
+                        <td className="td-muted">{d.last_decision_at || "—"}</td>
+                        <td className="td-muted">{d.last_execution_at || "—"}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
         </Panel>
       )}
 

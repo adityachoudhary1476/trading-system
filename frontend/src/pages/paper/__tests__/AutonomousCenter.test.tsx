@@ -716,3 +716,160 @@ describe("AutonomousCenter — options capability surface (Phase A)", () => {
     expect(screen.getByText(/Greeks \/ OI \/ IV analytics/)).toBeDefined();
   });
 });
+
+// --------------------------------------------------------------------------- //
+// Lifecycle button behavior tests (regression fix for STOPPED → START bug)
+// --------------------------------------------------------------------------- //
+describe("AutonomousCenter — lifecycle button behavior", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(paperApi.getAutonomousScan).mockResolvedValue({ scan: mockScan([]), ranking: null });
+    vi.mocked(paperApi.getAutonomousDecisions).mockResolvedValue({ decisions: [] });
+    vi.mocked(paperApi.getAutonomousEvents).mockResolvedValue({ events: [], count: 0, schema_version: 1 });
+    vi.mocked(paperApi.getAutonomousDeployments).mockResolvedValue({ deployments: [], count: 0, schema_version: 1 });
+    vi.mocked(paperApi.getOptionsCapability).mockResolvedValue({
+      enabled: false,
+      allowed_option_types: [],
+      max_contracts_per_trade: null,
+      providers: {
+        discoverer: { status: "not_configured", detail: "" },
+        quote: { status: "not_configured", detail: "" },
+        chain: { status: "not_configured", detail: "" },
+      },
+      capable: false,
+      execution_phase: "single_leg_capability_surface",
+      autonomous_execution_active: false,
+      last_error: null,
+      schema_version: 1,
+    });
+    vi.mocked(paperApi.setAutonomousBotLifecycle).mockResolvedValue({
+      success: true,
+      message: "ok",
+      bot: mockBot("running"),
+      schema_version: 1,
+    });
+  });
+
+  it("STOPPED bot → Start button is enabled (not disabled)", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("stopped") });
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("STOPPED")).toBeDefined();
+    });
+
+    const startBtn = screen.getByRole("button", { name: "Start" });
+    expect(startBtn).toBeDefined();
+    expect(startBtn).not.toBeDisabled();
+  });
+
+  it("clicking Start calls setAutonomousBotLifecycle('start')", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("stopped") });
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("STOPPED")).toBeDefined();
+    });
+
+    const startBtn = screen.getByRole("button", { name: "Start" });
+    fireEvent.click(startBtn);
+
+    await waitFor(() => {
+      expect(paperApi.setAutonomousBotLifecycle).toHaveBeenCalledWith("start");
+    });
+  });
+
+  it("RUNNING bot → Start button is not shown (Pause/Stop shown instead)", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("running") });
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("ACTIVE")).toBeDefined();
+    });
+
+    expect(screen.queryByRole("button", { name: "Start" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Pause" })).toBeDefined();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeDefined();
+  });
+
+  it("PAUSED bot → Resume button is enabled", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("paused") });
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("PAUSED")).toBeDefined();
+    });
+
+    const resumeBtn = screen.getByRole("button", { name: "Resume" });
+    expect(resumeBtn).toBeDefined();
+    expect(resumeBtn).not.toBeDisabled();
+  });
+
+  it("actionLoading disables the lifecycle button", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("stopped") });
+
+    // Make the lifecycle call hang to simulate actionLoading
+    let resolveLifecycle: (value: any) => void;
+    const lifecyclePromise = new Promise((resolve) => {
+      resolveLifecycle = resolve;
+    });
+    vi.mocked(paperApi.setAutonomousBotLifecycle).mockReturnValue(lifecyclePromise);
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("STOPPED")).toBeDefined();
+    });
+
+    const startBtn = screen.getByRole("button", { name: "Start" });
+    fireEvent.click(startBtn);
+
+    // Button should be disabled while actionLoading is true
+    await waitFor(() => {
+      // Re-query the button as it may be re-rendered
+      const btn = screen.getByRole("button", { name: "Start" });
+      expect(btn).toBeDisabled();
+    });
+
+    // Resolve and verify button re-enables
+    resolveLifecycle!({
+      success: true,
+      message: "ok",
+      bot: mockBot("running"),
+      schema_version: 1,
+    });
+
+    await waitFor(() => {
+      const btn = screen.getByRole("button", { name: "Start" });
+      expect(btn).not.toBeDisabled();
+    });
+  });
+
+  it("backend start failure is surfaced to the UI (error banner)", async () => {
+    vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("stopped") });
+
+    vi.mocked(paperApi.setAutonomousBotLifecycle).mockResolvedValue({
+      success: false,
+      message: "no ACTIVE paper deployment for bot bot-nifty-options",
+      bot: mockBot("stopped"),
+      schema_version: 1,
+    });
+
+    render(<AutonomousCenter />);
+
+    await waitFor(() => {
+      expect(screen.getByText("STOPPED")).toBeDefined();
+    });
+
+    const startBtn = screen.getByRole("button", { name: "Start" });
+    fireEvent.click(startBtn);
+
+    await waitFor(() => {
+      expect(screen.getByText(/no ACTIVE paper deployment/)).toBeDefined();
+    });
+  });
+});
