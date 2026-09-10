@@ -99,12 +99,23 @@ async def health_check():
     """
     Health check endpoint.
 
-    Returns service status. Does NOT fabricate dependency health.
+    Returns service status and live pipeline state.
     """
+    try:
+        from runtime import get_trading_runtime
+        runtime = get_trading_runtime()
+        pipeline_status = {
+            "status": runtime.state.state.value,
+            "connected": runtime.state.connected,
+        }
+    except Exception:
+        pipeline_status = {"status": "unknown", "connected": False}
+
     return {
         "status": "ok",
         "service": "trading-system-backend",
         "environment": get_settings().environment,
+        "pipeline": pipeline_status,
     }
 
 
@@ -138,23 +149,16 @@ async def detailed_health_check():
 
     # Check trading runtime status
     try:
-        from runtime import get_trading_runtime, RuntimeStateEnum
+        from runtime import get_trading_runtime
         runtime = get_trading_runtime()
-        if runtime.state.state == RuntimeStateEnum.CONNECTED:
-            health["dependencies"]["trading_runtime"] = {
-                "status": "connected",
-                "connected": True,
-                "events_received": runtime.state.events_received,
-                "candles_generated": runtime.state.candles_generated,
-            }
-        elif runtime.state.state in (RuntimeStateEnum.DISABLED, RuntimeStateEnum.STOPPED):
-            health["dependencies"]["trading_runtime"] = runtime.state.state.value
-        else:
-            health["dependencies"]["trading_runtime"] = {
-                "status": runtime.state.state.value,
-                "connected": False,
-                "last_error": runtime.state.last_error,
-            }
+        health["dependencies"]["trading_runtime"] = {
+            "status": runtime.state.state.value,
+            "connected": runtime.state.connected,
+            "events_received": runtime.state.events_received,
+            "candles_generated": runtime.state.candles_generated,
+            "started_at": runtime.state.started_at,
+            "last_event_time": runtime.state.last_event_time,
+        }
     except Exception as e:
         health["dependencies"]["trading_runtime"] = f"error: {str(e)}"
 

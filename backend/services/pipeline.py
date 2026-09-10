@@ -44,110 +44,164 @@ async def get_pipeline_status(
 
         # If runtime is not running, return honest state
         if state == RuntimeStateEnum.DISABLED:
+            backend_last_activity = (
+                int(runtime_state.started_at * 1000)
+                if runtime_state.started_at
+                else int(time.time() * 1000)
+            )
             return [
                 PipelineStageDTO(
                     id="service",
                     label="Backend Service",
                     status="ready",
-                    last_activity=int(time.time() * 1000),
+                    last_activity=backend_last_activity,
                     metric="Running",
                 ),
                 PipelineStageDTO(
                     id="live-pipeline",
                     label="Live Pipeline",
                     status="disconnected",
-                    last_activity=None,
+                    last_activity=(
+                        int(runtime_state.last_event_time * 1000)
+                        if runtime_state.last_event_time
+                        else None
+                    ),
                     metric="Disabled",
                 ),
             ]
 
         if state in (RuntimeStateEnum.STOPPED, RuntimeStateEnum.STOPPING):
+            backend_last_activity = (
+                int(runtime_state.started_at * 1000)
+                if runtime_state.started_at
+                else int(time.time() * 1000)
+            )
+            pipeline_last_activity = (
+                int(runtime_state.last_event_time * 1000)
+                if runtime_state.last_event_time
+                else backend_last_activity
+            )
             return [
                 PipelineStageDTO(
                     id="service",
                     label="Backend Service",
                     status="ready",
-                    last_activity=int(time.time() * 1000),
+                    last_activity=backend_last_activity,
                     metric="Running",
                 ),
                 PipelineStageDTO(
                     id="live-pipeline",
                     label="Live Pipeline",
                     status="disconnected",
-                    last_activity=None,
+                    last_activity=pipeline_last_activity,
                     metric=state.value,
                 ),
             ]
 
         if state == RuntimeStateEnum.AUTH_ERROR:
+            backend_last_activity = (
+                int(runtime_state.started_at * 1000)
+                if runtime_state.started_at
+                else int(time.time() * 1000)
+            )
+            pipeline_last_activity = (
+                int(runtime_state.last_event_time * 1000)
+                if runtime_state.last_event_time
+                else backend_last_activity
+            )
             return [
                 PipelineStageDTO(
                     id="service",
                     label="Backend Service",
                     status="ready",
-                    last_activity=int(time.time() * 1000),
+                    last_activity=backend_last_activity,
                     metric="Running",
                 ),
                 PipelineStageDTO(
                     id="upstox-connection",
                     label="Upstox Connection",
                     status="auth_error",
-                    last_activity=None,
+                    last_activity=pipeline_last_activity,
                     metric="Authentication failed",
                 ),
             ]
 
         if state == RuntimeStateEnum.ERROR:
+            backend_last_activity = (
+                int(runtime_state.started_at * 1000)
+                if runtime_state.started_at
+                else int(time.time() * 1000)
+            )
+            pipeline_last_activity = (
+                int(runtime_state.last_event_time * 1000)
+                if runtime_state.last_event_time
+                else backend_last_activity
+            )
             return [
                 PipelineStageDTO(
                     id="service",
                     label="Backend Service",
                     status="ready",
-                    last_activity=int(time.time() * 1000),
+                    last_activity=backend_last_activity,
                     metric="Running",
                 ),
                 PipelineStageDTO(
                     id="live-pipeline",
                     label="Live Pipeline",
                     status="disconnected",
-                    last_activity=None,
+                    last_activity=pipeline_last_activity,
                     metric=f"Error: {runtime_state.last_error or 'Unknown error'}",
                 ),
             ]
 
         if state == RuntimeStateEnum.CONNECTING:
+            backend_last_activity = (
+                int(runtime_state.started_at * 1000)
+                if runtime_state.started_at
+                else int(time.time() * 1000)
+            )
             return [
                 PipelineStageDTO(
                     id="service",
                     label="Backend Service",
                     status="ready",
-                    last_activity=int(time.time() * 1000),
+                    last_activity=backend_last_activity,
                     metric="Running",
                 ),
                 PipelineStageDTO(
                     id="upstox-connection",
                     label="Upstox Connection",
                     status="disconnected",
-                    last_activity=None,
+                    last_activity=backend_last_activity,
                     metric="Connecting...",
                 ),
             ]
 
         # Runtime is connected - get actual monitor state
         if not monitor:
+            backend_last_activity = (
+                int(runtime_state.started_at * 1000)
+                if runtime_state.started_at
+                else int(time.time() * 1000)
+            )
+            pipeline_last_activity = (
+                int(runtime_state.last_event_time * 1000)
+                if runtime_state.last_event_time
+                else backend_last_activity
+            )
             return [
                 PipelineStageDTO(
                     id="service",
                     label="Backend Service",
                     status="ready",
-                    last_activity=int(time.time() * 1000),
+                    last_activity=backend_last_activity,
                     metric="Running",
                 ),
                 PipelineStageDTO(
                     id="live-pipeline",
                     label="Live Pipeline",
                     status="disconnected",
-                    last_activity=None,
+                    last_activity=pipeline_last_activity,
                     metric="No health monitor",
                 ),
             ]
@@ -194,7 +248,15 @@ async def get_pipeline_status(
                 id="analysis-engine",
                 label="Analysis Engine",
                 status="ready",
-                last_activity=current_time,
+                last_activity=(
+                    int(snapshot["latest_event_ts"])
+                    if snapshot.get("latest_event_ts")
+                    else (
+                        int(runtime_state.started_at * 1000)
+                        if runtime_state.started_at
+                        else current_time
+                    )
+                ),
                 metric="Available",
             ),
         ]
