@@ -506,6 +506,29 @@ export interface AutonomousBotSafety {
   kill_switch_halted_at: string | null
 }
 
+// Phase 24A — Scheduler liveness summary.
+ // The autonomous execution loop lives in backend/autonomous_scheduler.py,
+ // a separate worker process gated by AUTONOMOUS_SCHEDULER_ENABLED=true.
+ // The bot lifecycle can be RUNNING while the scheduler worker is absent —
+ // these fields expose the distinction explicitly.
+ export interface AutonomousBotScheduler {
+   worker_required: boolean
+   worker_alive: boolean
+   last_tick_at: string | null
+   last_successful_tick_at: string | null
+   deployments: AutonomousBotSchedulerDeployment[]
+ }
+ 
+ export interface AutonomousBotSchedulerDeployment {
+   deployment_id: string | null
+   liveness: SchedulerLiveness
+   last_tick_at: string | null
+   last_successful_tick_at: string | null
+   last_market_data_at: string | null
+   last_decision_at: string | null
+   last_execution_at: string | null
+ }
+
 export interface AutonomousBot {
   bot_id: string
   name: string
@@ -529,6 +552,7 @@ export interface AutonomousBot {
   max_exposure_pct: number
   max_drawdown_pct: number | null
   safety: AutonomousBotSafety
+  scheduler: AutonomousBotScheduler
   uptime_seconds: number
   started_at: string | null
   stopped_at: string | null
