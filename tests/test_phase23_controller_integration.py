@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 from trading_system.autonomous.controller import AutonomousController
 from trading_system.autonomous.bot_config import AutonomousBotConfig, BotMode, TradingMode, Source, UserConstraints
 from trading_system.autonomous.bot_lifecycle import AutonomousBotLifecycle, AutonomousBotState
+from trading_system.autonomous.coordinator import DeploymentCreationResult
 from trading_system.autonomous.safety import KillSwitchReason, KillSwitchState
 from trading_system.paper.control import PaperTradingControlCenter
 from trading_system.paper.deployment import PaperDeploymentStatus
@@ -320,3 +321,94 @@ def test_start_creates_deployments_for_error_bot():
 
     discovery.discover.assert_called_once_with(max_candidates=10)
     candidate.spec_builder.assert_called_once_with("NSE:NIFTY", "1d")
+
+
+def test_ensure_deployments_records_diagnostic_when_no_approved():
+    """When no PAPER_APPROVED strategies exist, a diagnostic event is recorded."""
+    config = AutonomousBotConfig(
+        bot_id="test-bot",
+        name="Test Bot",
+        mode=BotMode.AUTONOMOUS,
+        trading_mode=TradingMode.PAPER,
+        source=Source.AUTONOMOUS,
+        user_constraints=UserConstraints(
+            allowed_symbols=frozenset({"NSE:NIFTY"}),
+            allowed_strategy_ids=frozenset(),
+            allowed_timeframes=frozenset({"1d"}),
+        ),
+    )
+    center = MagicMock(spec=PaperTradingControlCenter)
+    phase23 = MagicMock()
+    discovery = MagicMock()
+    discovery.discover.return_value = []
+
+    with patch("trading_system.research.phase23.discovery.Phase23Discovery", return_value=discovery):
+        controller = AutonomousController(
+            config=config,
+            control_center=center,
+            phase23_registry=phase23,
+        )
+        controller._ensure_autonomous_deployments()
+
+    discovery.discover.assert_called_once_with(max_candidates=10)
+    # Verify diagnostic event was recorded
+    events = controller._event_log.events
+    assert len(events) == 1
+    assert "no PAPER_APPROVED strategies found" in events[0].message
+
+
+def test_ensure_deployments_records_diagnostic_on_creation_failure():
+    """When deployment creation fails, the exact failure is recorded."""
+    config = AutonomousBotConfig(
+        bot_id="test-bot",
+        name="Test Bot",
+        mode=BotMode.AUTONOMOUS,
+        trading_mode=TradingMode.PAPER,
+        source=Source.AUTONOMOUS,
+        user_constraints=UserConstraints(
+            allowed_symbols=frozenset({"NSE:NIFTY"}),
+            allowed_strategy_ids=frozenset(),
+            allowed_timeframes=frozenset({"1d"}),
+        ),
+    )
+    center = MagicMock(spec=PaperTradingControlCenter)
+    center.list_deployments.return_value = []
+
+    phase23 = MagicMock()
+    discovery = MagicMock()
+    approved_item = MagicMock()
+    approved_item.candidate_id = "test-candidate"
+    approved_item.strategy_id = "test-strategy"
+    approved_item.symbol = "NSE:NIFTY"
+    approved_item.timeframe = "1d"
+    discovery.discover.return_value = [approved_item]
+
+    candidate = MagicMock()
+    candidate.spec_builder.return_value = {
+        "name": "Test Strategy",
+        "symbol": "NSE:NIFTY",
+        "timeframe": "1d",
+    }
+
+    with patch("trading_system.research.phase23.discovery.Phase23Discovery", return_value=discovery):
+        with patch("trading_system.research.phase23.strategies.get_strategy_candidate", return_value=candidate):
+            with patch("trading_system.research.strategy_lab.spec.StrategySpec") as mock_spec:
+                mock_spec.model_validate.return_value = MagicMock()
+                controller = AutonomousController(
+                    config=config,
+                    control_center=center,
+                    phase23_registry=phase23,
+                )
+                # Mock create_autonomous_deployment to fail
+                with patch(
+                    "trading_system.autonomous.controller.AutonomousController.create_autonomous_deployment",
+                    return_value=(DeploymentCreationResult.FAILURE, None),
+                ):
+                    controller._ensure_autonomous_deployments()
+
+    # Verify diagnostic event was recorded for the failure
+    events = controller._event_log.events
+    failure_events = [e for e in events if "deployment creation failed" in e.message]
+    assert len(failure_events) == 1
+    assert "test-strategy" in failure_events[0].message
+    assert "failure" in failure_events[0].message.lower()

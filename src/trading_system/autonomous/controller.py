@@ -263,12 +263,20 @@ class AutonomousController(BaseModel):
     def _ensure_autonomous_deployments(self) -> None:
         """Auto-create paper deployments from PAPER_APPROVED strategies if none exist."""
         if self._phase23_registry is None:
+            self._record_event(
+                AutonomousEventType.ERROR,
+                message="Phase23 registry not available; cannot discover PAPER_APPROVED strategies",
+            )
             return
         try:
             from trading_system.research.phase23.discovery import Phase23Discovery
             discovery = Phase23Discovery(self._phase23_registry)
             approved = discovery.discover(max_candidates=10)
             if not approved:
+                self._record_event(
+                    AutonomousEventType.ERROR,
+                    message="no PAPER_APPROVED strategies found in registry; tournament results may not be persisted to production",
+                )
                 return
             existing = [
                 d for d in self.control_center.list_deployments()
@@ -283,23 +291,42 @@ class AutonomousController(BaseModel):
                         from trading_system.research.phase23.strategies import get_strategy_candidate
                         candidate = get_strategy_candidate(item.candidate_id)
                     if candidate is None:
+                        self._record_event(
+                            AutonomousEventType.ERROR,
+                            symbol=getattr(item, 'symbol', ''),
+                            message=f"candidate {getattr(item, 'candidate_id', 'unknown')} not found in universe",
+                        )
                         continue
                     spec_dict = candidate.spec_builder(item.symbol, item.timeframe)
                     from trading_system.research.strategy_lab.spec import StrategySpec
                     spec = StrategySpec.model_validate(spec_dict)
                     from trading_system.paper.deployment import PaperDeploymentConfig
                     dep_config = PaperDeploymentConfig()
-                    self.create_autonomous_deployment(
+                    result, deployment = self.create_autonomous_deployment(
                         symbol=item.symbol,
                         strategy_id=item.strategy_id,
                         timeframe=item.timeframe,
                         strategy_spec=spec,
                         deployment_config=dep_config,
                     )
-                except Exception:
+                    if result != DeploymentCreationResult.SUCCESS or deployment is None:
+                        self._record_event(
+                            AutonomousEventType.ERROR,
+                            symbol=item.symbol,
+                            message=f"deployment creation failed for {item.strategy_id}: {result.value}",
+                        )
+                except Exception as exc:
+                    self._record_event(
+                        AutonomousEventType.ERROR,
+                        symbol=getattr(item, 'symbol', ''),
+                        message=f"deployment creation exception for {getattr(item, 'strategy_id', 'unknown')}: {exc}",
+                    )
                     continue
-        except Exception:
-            pass
+        except Exception as exc:
+            self._record_event(
+                AutonomousEventType.ERROR,
+                message=f"PAPER_APPROVED discovery failed: {exc}",
+            )
 
     def start_bot(self) -> Tuple[bool, str]:
         """Start the autonomous bot.
