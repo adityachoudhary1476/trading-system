@@ -10,6 +10,7 @@ which returns a :class:`ResponseEnvelope`; we translate that into a
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request, Response
@@ -50,15 +51,17 @@ def _build_controller(center, settings, md_provider, market_data_callable, persi
     from trading_system.autonomous.bot_config import (
         AutonomousBotConfig,
         BotMode,
-        TradingMode,
         Source,
+        TradingMode,
         UserConstraints,
     )
     from trading_system.autonomous.controller import AutonomousController
 
+    bot_id = os.environ.get("AUTONOMOUS_BOT_ID", "bot-nifty-options").strip() or "bot-nifty-options"
+
     bot_config = AutonomousBotConfig(
-        bot_id="bot-nifty-options",
-        name="Paper Autonomous Bot",
+        bot_id=bot_id,
+        name=f"Paper Autonomous Bot ({bot_id})",
         mode=BotMode.AUTONOMOUS,
         trading_mode=TradingMode.PAPER,
         enabled=True,
