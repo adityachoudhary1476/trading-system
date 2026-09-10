@@ -17,7 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Optional
 
@@ -616,6 +616,20 @@ class EvidenceStore:
             existing = s.get(StrategyEvidenceRecord, e.evidence_id)
             if existing:
                 return _rec_to_strategy_evidence(existing)
+            # Keep append-only history ordered even when two writes land in the
+            # same microsecond. A deterministic secondary key below prevents
+            # ambiguous ordering for older rows that already share a timestamp.
+            latest = s.execute(
+                select(StrategyEvidenceRecord.created_at)
+                .where(StrategyEvidenceRecord.strategy_id == e.strategy_id)
+                .order_by(StrategyEvidenceRecord.created_at.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if latest is not None:
+                if latest.tzinfo is None:
+                    latest = latest.replace(tzinfo=timezone.utc)
+                if rec.created_at <= latest:
+                    rec.created_at = latest + timedelta(microseconds=1)
             s.add(rec)
             s.commit()
         return e
@@ -639,7 +653,10 @@ class EvidenceStore:
                 q = q.where(StrategyEvidenceRecord.dataset_id == dataset_id)
             if fold_id is not None:
                 q = q.where(StrategyEvidenceRecord.fold_id == fold_id)
-            recs = s.execute(q.order_by(StrategyEvidenceRecord.created_at.desc())).scalars().all()
+            recs = s.execute(q.order_by(
+                StrategyEvidenceRecord.created_at.desc(),
+                StrategyEvidenceRecord.evidence_id.desc(),
+            )).scalars().all()
         return [_rec_to_strategy_evidence(r) for r in recs]
 
     def get_latest_strategy_evidence(self, strategy_id: str) -> Optional[StrategyEvidence]:
@@ -686,17 +703,15 @@ class EvidenceStore:
             ``last_decision_at``, ``last_execution_at``, ``worker_id``,
             ``worker_version``).
 
+        In addition to version-gated migrations, idempotent column fixes are
+        applied unconditionally on every call so that databases which were
+        created before a column was added to the model are repaired without
+        manual intervention.
+
         All migrations are additive only: existing tables/columns are
         untouched, so Phase 16/17 records remain readable. Safe to call on
         every startup; safe to re-run after partial failure.
         """
-        current = self._schema_version()
-        if current is not None and current >= self.CURRENT_SCHEMA_VERSION:
-            return current
-
-        # Reuse the same idempotent ``inspect + conditional ALTER`` pattern
-        # that ``storage.database.init_db`` uses for SQLite. PostgreSQL ≥9.6
-        # natively supports ``ADD COLUMN IF NOT EXISTS`` for the same effect.
         from sqlalchemy import inspect as _inspect, text as _text
 
         inspector = _inspect(self.engine)
@@ -748,6 +763,17 @@ class EvidenceStore:
                 for col, ddl in phase23_cols.items():
                     if col not in existing:
                         conn.execute(_text(ddl))
+
+            # Hotfix: add missing strategy_parameters_json column that was
+            # present in the model but never migrated in Phase 18.
+            if inspector.has_table("paper_deployments"):
+                existing = {c["name"] for c in inspector.get_columns("paper_deployments")}
+                if "strategy_parameters_json" not in existing:
+                    conn.execute(_text(
+                        "ALTER TABLE paper_deployments "
+                        "ADD COLUMN strategy_parameters_json TEXT NOT NULL "
+                        "DEFAULT '{}'"
+                    ))
 
         self._set_schema_version(self.CURRENT_SCHEMA_VERSION)
         return self.CURRENT_SCHEMA_VERSION

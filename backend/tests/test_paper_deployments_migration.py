@@ -372,3 +372,129 @@ class TestPaperDeploymentMigration:
             paper_api_mod._api_router = None
             paper_api_mod._controller = None
             monkeypatch.undo()
+
+
+class TestStrategyParametersJsonHotfix:
+    """Regression test for the strategy_parameters_json hotfix.
+
+    Production PostgreSQL databases that were already at schema version 4
+    (Phase 23) before the hotfix was added would skip the column fix
+    because ensure_schema_current() returned early. This test proves the
+    hotfix runs unconditionally.
+    """
+
+    def test_hotfix_runs_when_schema_already_current(self, tmp_path):
+        """strategy_parameters_json is added even when schema version is 4."""
+        db_path = tmp_path / "current.db"
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+        )
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE paper_deployments ("
+                "deployment_id VARCHAR(64) PRIMARY KEY,"
+                "strategy_id VARCHAR(64) NOT NULL,"
+                "strategy_spec_hash VARCHAR(64) NOT NULL,"
+                "symbol VARCHAR(32) NOT NULL,"
+                "timeframe VARCHAR(8) NOT NULL,"
+                "dataset_id VARCHAR(64) NOT NULL,"
+                "config_json TEXT NOT NULL DEFAULT '{}',"
+                "status VARCHAR(16) NOT NULL DEFAULT 'created',"
+                "evidence_ids_json TEXT NOT NULL DEFAULT '[]',"
+                "created_at DATETIME NOT NULL,"
+                "activated_at DATETIME,"
+                "updated_at DATETIME NOT NULL,"
+                "notes TEXT NOT NULL DEFAULT ''"
+                ")"
+            ))
+            conn.execute(text(
+                "CREATE TABLE schema_versions ("
+                "id INTEGER PRIMARY KEY,"
+                "version INTEGER NOT NULL,"
+                "updated_at DATETIME NOT NULL"
+                ")"
+            ))
+            conn.execute(text(
+                "INSERT INTO schema_versions (id, version, updated_at) "
+                "VALUES (1, 4, :ts)"
+            ), {"ts": datetime.now(timezone.utc)})
+
+        from trading_system.research.evidence import EvidenceStore
+        store = EvidenceStore(engine)
+        version = store.ensure_schema_current()
+        assert version == 4
+
+        inspector = inspect(engine)
+        cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
+        assert "strategy_parameters_json" in cols
+
+    def test_production_schema_contains_all_required_columns(self, tmp_path):
+        """All currently required paper_deployments columns are present after migration."""
+        db_path = tmp_path / "production.db"
+        engine = create_engine(
+            f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+        )
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE paper_deployments ("
+                "deployment_id VARCHAR(64) PRIMARY KEY,"
+                "strategy_id VARCHAR(64) NOT NULL,"
+                "strategy_spec_hash VARCHAR(64) NOT NULL,"
+                "symbol VARCHAR(32) NOT NULL,"
+                "timeframe VARCHAR(8) NOT NULL,"
+                "dataset_id VARCHAR(64) NOT NULL,"
+                "config_json TEXT NOT NULL DEFAULT '{}',"
+                "status VARCHAR(16) NOT NULL DEFAULT 'created',"
+                "evidence_ids_json TEXT NOT NULL DEFAULT '[]',"
+                "created_at DATETIME NOT NULL,"
+                "activated_at DATETIME,"
+                "updated_at DATETIME NOT NULL,"
+                "notes TEXT NOT NULL DEFAULT ''"
+                ")"
+            ))
+            conn.execute(text(
+                "CREATE TABLE schema_versions ("
+                "id INTEGER PRIMARY KEY,"
+                "version INTEGER NOT NULL,"
+                "updated_at DATETIME NOT NULL"
+                ")"
+            ))
+            conn.execute(text(
+                "INSERT INTO schema_versions (id, version, updated_at) "
+                "VALUES (1, 4, :ts)"
+            ), {"ts": datetime.now(timezone.utc)})
+
+        from trading_system.research.evidence import EvidenceStore
+        EvidenceStore(engine).ensure_schema_current()
+
+        inspector = inspect(engine)
+        cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
+
+        required = [
+            "deployment_id",
+            "strategy_id",
+            "strategy_spec_hash",
+            "symbol",
+            "timeframe",
+            "dataset_id",
+            "config_json",
+            "status",
+            "evidence_ids_json",
+            "created_at",
+            "activated_at",
+            "updated_at",
+            "notes",
+            "options_enabled",
+            "allowed_option_types_json",
+            "max_options_contracts_per_trade",
+            "last_tick_at",
+            "last_successful_tick_at",
+            "last_market_data_at",
+            "last_decision_at",
+            "last_execution_at",
+            "worker_id",
+            "worker_version",
+            "strategy_parameters_json",
+        ]
+        missing = [c for c in required if c not in cols]
+        assert not missing, f"Missing columns after migration: {missing}"
