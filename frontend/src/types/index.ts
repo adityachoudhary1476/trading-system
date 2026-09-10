@@ -210,4 +210,11 @@ export interface AppEnvironment {
   environment: "development" | "production";
   dataSource: "Mock" | "API" | "WebSocket";
   execution: "DISABLED" | "ENABLED";
+  paperExecution?: "DISABLED" | "ENABLED" | "RUNNING";
+  liveExecution?: "DISABLED" | "ENABLED";
+  autonomousPaperPipeline?: {
+    status: string;
+    enabled: boolean;
+    lastActivity?: string;
+  };
 }

@@ -261,21 +261,21 @@ class AutonomousController(BaseModel):
     # ------------------------------------------------------------------ #
 
     def _ensure_autonomous_deployments(self) -> None:
-        """Auto-create paper deployments from PAPER_APPROVED strategies if none exist."""
+        """Auto-create paper deployments from PAPER_APPROVED and PAPER_EXPERIMENTAL strategies if none exist."""
         if self._phase23_registry is None:
             self._record_event(
                 AutonomousEventType.ERROR,
-                message="Phase23 registry not available; cannot discover PAPER_APPROVED strategies",
+                message="Phase23 registry not available; cannot discover PAPER_APPROVED/PAPER_EXPERIMENTAL strategies",
             )
             return
         try:
             from trading_system.research.phase23.discovery import Phase23Discovery
             discovery = Phase23Discovery(self._phase23_registry)
-            approved = discovery.discover(max_candidates=10)
+            approved = discovery.discover(max_candidates=50, include_experimental=True)
             if not approved:
                 self._record_event(
                     AutonomousEventType.ERROR,
-                    message="no PAPER_APPROVED strategies found in registry; tournament results may not be persisted to production",
+                    message="no PAPER_APPROVED/PAPER_EXPERIMENTAL strategies found in registry; tournament results may not be persisted to production",
                 )
                 return
             existing = [
@@ -325,7 +325,7 @@ class AutonomousController(BaseModel):
         except Exception as exc:
             self._record_event(
                 AutonomousEventType.ERROR,
-                message=f"PAPER_APPROVED discovery failed: {exc}",
+                message=f"PAPER_APPROVED/PAPER_EXPERIMENTAL discovery failed: {exc}",
             )
 
     def start_bot(self) -> Tuple[bool, str]:

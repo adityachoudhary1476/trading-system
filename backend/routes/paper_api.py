@@ -140,6 +140,23 @@ def _build_controller(center, settings, md_provider, market_data_callable, persi
     return controller
 
 
+def get_autonomous_controller_state() -> Optional[dict]:
+    """Get the autonomous controller state for system status endpoints."""
+    global _controller
+    if _controller is None:
+        return None
+    try:
+        return {
+            "state": _controller.config.state.value,
+            "enabled": _controller.config.enabled,
+            "bot_id": _controller.config.bot_id,
+            "last_decision_timestamp": _controller.config.last_decision_timestamp,
+            "is_halted": _controller.is_halted,
+        }
+    except Exception:
+        return None
+
+
 def _get_api_router():
     global _api_router, _controller
     if _api_router is not None:

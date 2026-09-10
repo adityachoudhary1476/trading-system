@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, status
@@ -13,6 +14,7 @@ from routes.signals import router as signals_router
 from routes.pipeline import router as pipeline_router
 from routes.live import router as live_router
 from routes.paper_api import router as paper_api_router
+from routes.paper_api import get_autonomous_controller_state
 
 # Configure logging
 logging.basicConfig(
@@ -111,11 +113,43 @@ async def health_check():
     except Exception:
         pipeline_status = {"status": "unknown", "connected": False}
 
+    try:
+        autonomous_state = get_autonomous_controller_state()
+    except Exception:
+        autonomous_state = None
+
+    scheduler_enabled = False
+    try:
+        scheduler_enabled = os.environ.get("AUTONOMOUS_SCHEDULER_ENABLED", "false").strip().lower() == "true"
+    except Exception:
+        pass
+
+    autonomous_pipeline = {
+        "status": autonomous_state["state"] if autonomous_state else "not_configured",
+        "bot_id": autonomous_state.get("bot_id") if autonomous_state else None,
+        "enabled": autonomous_state.get("enabled", False) if autonomous_state else False,
+        "last_activity": autonomous_state.get("last_decision_timestamp") if autonomous_state else None,
+    }
+
     return {
         "status": "ok",
         "service": "trading-system-backend",
         "environment": get_settings().environment,
         "pipeline": pipeline_status,
+        "upstox_connection": pipeline_status,
+        "live_pipeline": pipeline_status,
+        "autonomous_paper_pipeline": autonomous_pipeline,
+        "paper_execution": {
+            "enabled": True,
+            "running": autonomous_pipeline["status"] in ("running", "paused"),
+        },
+        "live_execution": {
+            "enabled": False,
+        },
+        "scheduler": {
+            "enabled": scheduler_enabled,
+            "running": scheduler_enabled,
+        },
     }
 
 

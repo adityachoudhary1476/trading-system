@@ -37,11 +37,24 @@ const CONNECTION_META: Record<
   network_error: { label: "Network Error", tone: "neg" },
 };
 
+function derivePipelineStatus(
+  status: string | undefined,
+): "ready" | "healthy" | "connected" | "disconnected" | "stale" | "auth_error" | "invalid_data" {
+  const s = (status || "").toLowerCase();
+  if (s === "connected" || s === "healthy") return "healthy";
+  if (s === "disconnected" || s === "stopped" || s === "disabled") return "disconnected";
+  if (s === "auth_error") return "auth_error";
+  if (s === "invalid_data") return "invalid_data";
+  if (s === "stale") return "stale";
+  return "ready";
+}
+
 export function SystemPage() {
   const { env } = useApp();
   const [stages, setStages] = useState<PipelineStage[]>([]);
   const [stagesError, setStagesError] = useState<string | null>(null);
   const [connState, setConnState] = useState<ConnectionState>({ kind: "loading" });
+  const [autonomousStatus, setAutonomousStatus] = useState<string | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -71,7 +84,42 @@ export function SystemPage() {
     return () => { alive = false; };
   }, [env.mode]);
 
+  useEffect(() => {
+    let alive = true;
+    fetch("/health", { cache: "no-store" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: Record<string, unknown> | null) => {
+        if (!alive) return;
+        const app = data?.autonomous_paper_pipeline as Record<string, unknown> | undefined;
+        const status = app?.status as string | undefined;
+        setAutonomousStatus(status || null);
+      })
+      .catch(() => {
+        if (alive) setAutonomousStatus(null);
+      });
+    return () => { alive = false; };
+  }, []);
+
   const connMeta = CONNECTION_META[connState.kind];
+
+  const pipelineStages: PipelineStage[] = [
+    ...stages,
+    autonomousStatus
+      ? {
+          id: "autonomous-paper-pipeline",
+          label: "Autonomous Paper Pipeline",
+          status: derivePipelineStatus(autonomousStatus),
+          lastActivity: env.autonomousPaperPipeline?.lastActivity ? new Date(env.autonomousPaperPipeline.lastActivity).getTime() : null,
+          metric: autonomousStatus,
+        }
+      : {
+          id: "autonomous-paper-pipeline",
+          label: "Autonomous Paper Pipeline",
+          status: "disconnected",
+          lastActivity: null,
+          metric: "not_configured",
+        },
+  ];
 
   return (
     <>
@@ -86,7 +134,8 @@ export function SystemPage() {
       <div className="grid cols-3" style={{ gap: 16 }}>
         <Panel title="Environment"><EnvRow k="Environment" v={env.environment} /></Panel>
         <Panel title="Data Source"><EnvRow k="Data Source" v={env.dataSource} /></Panel>
-        <Panel title="Execution"><EnvRow k="Execution" v={env.execution} tone={env.execution === "DISABLED" ? "pos" : "neg"} /></Panel>
+        <Panel title="Paper Execution"><EnvRow k="Paper Execution" v={env.paperExecution || env.execution} tone={(env.paperExecution || env.execution) === "DISABLED" ? "pos" : "warn"} /></Panel>
+        <Panel title="Live Execution"><EnvRow k="Live Execution" v={env.liveExecution || "DISABLED"} tone={(env.liveExecution || "DISABLED") === "DISABLED" ? "pos" : "neg"} /></Panel>
       </div>
 
       <div className="panel" style={{ marginTop: 16 }}>
@@ -121,7 +170,7 @@ export function SystemPage() {
           </div>
         ) : (
           <div className="pipeline-flow">
-            {stages.map((s, i) => (
+            {pipelineStages.map((s, i) => (
               <div className="pf-node" key={s.id}>
                 <div className="pf-left">
                   <HealthDot status={s.status} pulse />
@@ -134,7 +183,7 @@ export function SystemPage() {
                 <div className="pf-right">
                   <Badge kind={s.status}>{s.status.replace("_", " ")}</Badge>
                 </div>
-                {i < stages.length - 1 && <div className="pf-connector" aria-hidden="true" />}
+                {i < pipelineStages.length - 1 && <div className="pf-connector" aria-hidden="true" />}
               </div>
             ))}
           </div>
@@ -149,7 +198,7 @@ export function SystemPage() {
   );
 }
 
-function EnvRow({ k, v, tone }: { k: string; v: string; tone?: "pos" | "neg" }) {
+function EnvRow({ k, v, tone }: { k: string; v: string; tone?: "pos" | "neg" | "warn" | "muted" }) {
   return (
     <div className="stat">
       <span className="label">{k}</span>

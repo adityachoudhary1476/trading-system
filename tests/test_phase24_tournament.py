@@ -218,6 +218,98 @@ class TestPhase23Discovery:
         results = discovery.discover()
         assert isinstance(results, list)
 
+    def test_discovery_approved_only(self):
+        registry = MagicMock()
+        s1 = MagicMock(strategy_id="s1", name="S1", symbol="NSE:SBIN", timeframe="1d", spec_hash="h1")
+        registry.get_paper_approved.return_value = [s1]
+        registry.get_paper_experimental.return_value = []
+        registry.list_evidence.return_value = [
+            MagicMock(configuration_json={"qualification_status": "PAPER_APPROVED", "candidate_id": "c1", "score": 0.9})
+        ]
+        discovery = Phase23Discovery(registry)
+        results = discovery.discover(include_experimental=True)
+        assert len(results) == 1
+        assert results[0].strategy_id == "s1"
+        assert results[0].is_deployable is True
+        assert results[0].score == 0.9
+
+    def test_discovery_experimental_only(self):
+        registry = MagicMock()
+        s1 = MagicMock(strategy_id="s1", name="S1", symbol="NSE:SBIN", timeframe="1d", spec_hash="h1")
+        registry.get_paper_approved.return_value = []
+        registry.get_paper_experimental.return_value = [s1]
+        registry.list_evidence.return_value = [
+            MagicMock(configuration_json={"qualification_status": "PAPER_EXPERIMENTAL", "candidate_id": "c1", "score": 0.7})
+        ]
+        discovery = Phase23Discovery(registry)
+        results = discovery.discover(include_experimental=True)
+        assert len(results) == 1
+        assert results[0].strategy_id == "s1"
+        assert results[0].is_deployable is False
+        assert results[0].score == 0.7
+
+    def test_discovery_approved_and_experimental(self):
+        registry = MagicMock()
+        approved = MagicMock(strategy_id="approved", name="Approved", symbol="NSE:SBIN", timeframe="1d", spec_hash="ha")
+        experimental = MagicMock(strategy_id="experimental", name="Experimental", symbol="NSE:SBIN", timeframe="1d", spec_hash="he")
+        registry.get_paper_approved.return_value = [approved]
+        registry.get_paper_experimental.return_value = [experimental]
+        registry.list_evidence.side_effect = lambda strategy_id: {
+            "approved": [MagicMock(configuration_json={"qualification_status": "PAPER_APPROVED", "candidate_id": "ca", "score": 0.9})],
+            "experimental": [MagicMock(configuration_json={"qualification_status": "PAPER_EXPERIMENTAL", "candidate_id": "ce", "score": 0.7})],
+        }.get(strategy_id, [])
+        discovery = Phase23Discovery(registry)
+        results = discovery.discover(include_experimental=True)
+        assert len(results) == 2
+        ids = [r.strategy_id for r in results]
+        assert "approved" in ids
+        assert "experimental" in ids
+        assert results[0].is_deployable is True
+        assert results[1].is_deployable is False
+
+    def test_discovery_removes_duplicates(self):
+        registry = MagicMock()
+        s1 = MagicMock(strategy_id="s1", name="S1", symbol="NSE:SBIN", timeframe="1d", spec_hash="h1")
+        registry.get_paper_approved.return_value = [s1]
+        registry.get_paper_experimental.return_value = [s1]
+        registry.list_evidence.return_value = [
+            MagicMock(configuration_json={"qualification_status": "PAPER_APPROVED", "candidate_id": "c1", "score": 0.9})
+        ]
+        discovery = Phase23Discovery(registry)
+        results = discovery.discover(include_experimental=True)
+        assert len(results) == 1
+        assert results[0].strategy_id == "s1"
+
+    def test_discovery_max_candidates_enforced_after_combining(self):
+        registry = MagicMock()
+        approved = [MagicMock(strategy_id=f"a{i}", name=f"A{i}", symbol="NSE:SBIN", timeframe="1d", spec_hash=f"ha{i}") for i in range(5)]
+        experimental = [MagicMock(strategy_id=f"e{i}", name=f"E{i}", symbol="NSE:SBIN", timeframe="1d", spec_hash=f"he{i}") for i in range(5)]
+        registry.get_paper_approved.return_value = approved
+        registry.get_paper_experimental.return_value = experimental
+        registry.list_evidence.side_effect = lambda strategy_id: {
+            **{f"a{i}": [MagicMock(configuration_json={"qualification_status": "PAPER_APPROVED", "candidate_id": f"ca{i}", "score": 0.9})] for i in range(5)},
+            **{f"e{i}": [MagicMock(configuration_json={"qualification_status": "PAPER_EXPERIMENTAL", "candidate_id": f"ce{i}", "score": 0.7})] for i in range(5)},
+        }.get(strategy_id, [])
+        discovery = Phase23Discovery(registry)
+        results = discovery.discover(max_candidates=3, include_experimental=True)
+        assert len(results) == 3
+
+    def test_discovery_include_experimental_false(self):
+        registry = MagicMock()
+        approved = MagicMock(strategy_id="approved", name="Approved", symbol="NSE:SBIN", timeframe="1d", spec_hash="ha")
+        experimental = MagicMock(strategy_id="experimental", name="Experimental", symbol="NSE:SBIN", timeframe="1d", spec_hash="he")
+        registry.get_paper_approved.return_value = [approved]
+        registry.get_paper_experimental.return_value = [experimental]
+        registry.list_evidence.side_effect = lambda strategy_id: {
+            "approved": [MagicMock(configuration_json={"qualification_status": "PAPER_APPROVED", "candidate_id": "ca", "score": 0.9})],
+            "experimental": [MagicMock(configuration_json={"qualification_status": "PAPER_EXPERIMENTAL", "candidate_id": "ce", "score": 0.7})],
+        }.get(strategy_id, [])
+        discovery = Phase23Discovery(registry)
+        results = discovery.discover(include_experimental=False)
+        assert len(results) == 1
+        assert results[0].strategy_id == "approved"
+        assert results[0].is_deployable is True
+
 
 # --------------------------------------------------------------------------- #
 # Deployment tests

@@ -83,7 +83,7 @@ def test_ensure_deployments_with_registry_no_approved():
         )
         controller._ensure_autonomous_deployments()
 
-    discovery.discover.assert_called_once_with(max_candidates=10)
+    discovery.discover.assert_called_once_with(max_candidates=50, include_experimental=True)
     center.list_deployments.assert_not_called()
 
 
@@ -131,7 +131,7 @@ def test_ensure_deployments_creates_deployments():
                 )
                 controller._ensure_autonomous_deployments()
 
-    discovery.discover.assert_called_once_with(max_candidates=10)
+    discovery.discover.assert_called_once_with(max_candidates=50, include_experimental=True)
     candidate.spec_builder.assert_called_once_with("NSE:NIFTY", "1d")
 
 
@@ -319,7 +319,7 @@ def test_start_creates_deployments_for_error_bot():
 
                 success, message = controller.start_bot()
 
-    discovery.discover.assert_called_once_with(max_candidates=10)
+    discovery.discover.assert_called_once_with(max_candidates=50, include_experimental=True)
     candidate.spec_builder.assert_called_once_with("NSE:NIFTY", "1d")
 
 
@@ -350,11 +350,11 @@ def test_ensure_deployments_records_diagnostic_when_no_approved():
         )
         controller._ensure_autonomous_deployments()
 
-    discovery.discover.assert_called_once_with(max_candidates=10)
+    discovery.discover.assert_called_once_with(max_candidates=50, include_experimental=True)
     # Verify diagnostic event was recorded
     events = controller._event_log.events
     assert len(events) == 1
-    assert "no PAPER_APPROVED strategies found" in events[0].message
+    assert "no PAPER_APPROVED/PAPER_EXPERIMENTAL strategies found" in events[0].message
 
 
 def test_ensure_deployments_records_diagnostic_on_creation_failure():

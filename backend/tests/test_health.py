@@ -87,3 +87,31 @@ class TestHealthEndpoint:
         data = response.json()
         # Should have dependencies section
         assert "dependencies" in data
+
+    def test_health_includes_autonomous_pipeline_fields(self, client):
+        """Test that health endpoint includes autonomous pipeline fields."""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert "autonomous_paper_pipeline" in data
+        assert "paper_execution" in data
+        assert "live_execution" in data
+        assert "scheduler" in data
+        assert data["live_execution"]["enabled"] is False
+        assert data["scheduler"]["enabled"] in (True, False)
+
+    def test_health_paper_execution_when_controller_running(self, client):
+        """Test paper execution reflects autonomous controller state."""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        paper_exec = data.get("paper_execution", {})
+        assert "enabled" in paper_exec
+        assert "running" in paper_exec
+
+    def test_health_does_not_enable_live_execution(self, client):
+        """Test that live execution is always reported as disabled."""
+        response = client.get("/health")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["live_execution"]["enabled"] is False
