@@ -895,10 +895,10 @@ def _print_backtest_report(result, perf, oos: bool, label: str = "BACKTEST") -> 
 
 
 def _cmd_backfill_history(args: argparse.Namespace) -> int:
-    """Bulk historical backfill for Indian (FYERS) market data.
+    """Bulk historical backfill for Indian market data.
 
     DATA ONLY — never places orders. Chunks the requested range, fetches each
-    chunk via the FYERS provider, validates, and stores idempotently.
+    chunk via the configured provider, validates, and stores idempotently.
     """
     from .india.backfill import BackfillEngine, format_symbol_summary
     from .data.provider_exports import get_provider
@@ -917,11 +917,11 @@ def _cmd_backfill_history(args: argparse.Namespace) -> int:
     start = pd.Timestamp(args.start) if args.start else None
     end = pd.Timestamp(args.end) if args.end else None
 
-    print("UPSTOX HISTORICAL BACKFILL  (DATA ONLY — no orders placed)")
+    print(f"{provider.name.upper()} HISTORICAL BACKFILL  (DATA ONLY — no orders placed)")
     if not provider.is_authenticated:
         print(
-            "ERROR: Upstox credentials not found in environment (.env). "
-            "Set UPSTOX_CLIENT_ID and UPSTOX_ACCESS_TOKEN, then retry."
+            f"ERROR: {provider.name} credentials not found in environment (.env). "
+            f"Check provider configuration, then retry."
         )
         return 2
     print(f"Provider: {provider.name}")
@@ -946,7 +946,7 @@ def _cmd_backfill_history(args: argparse.Namespace) -> int:
 
         print("=" * 64)
         print(f"Symbol:      {res.symbol}")
-        print(f"Provider symbol: {res.fyers_symbol}")
+        print(f"Provider symbol: {res.provider_symbol}")
         print(f"Timeframe:   {res.timeframe}")
         if res.requested_start and res.requested_end:
             print(f"Requested:   {res.requested_start.date()} -> {res.requested_end.date()}")
@@ -1276,7 +1276,7 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
         if not md_provider.is_authenticated:
             return None
         try:
-            return md_provider.get_historical(symbol, timeframe, limit=250)
+            return md_provider.get_historical(symbol, timeframe, limit=365)
         except Exception:
             return None
 

@@ -1,20 +1,20 @@
-"""Historical backfill for Indian (FYERS) market data — DATA ONLY.
+"""Historical backfill for Indian market data — DATA ONLY.
 
 This command reuses the existing, provider-independent architecture:
 
-    FYERSMarketDataProvider.get_historical   (provider boundary; symbol mapping)
-        -> plan_chunks                       (history_chunking, FYERS caps)
+    MarketDataProvider.get_historical          (provider boundary; symbol mapping)
+        -> plan_chunks                         (history_chunking, provider caps)
         -> per-chunk fetch + normalize
-        -> validate_ohlcv                    (data.validation safety gate)
-        -> MarketStore.upsert_many           (storage.database, idempotent)
+        -> validate_ohlcv                      (data.validation safety gate)
+        -> MarketStore.upsert_many             (storage.database, idempotent)
 
 It NEVER places orders, NEVER trades, and NEVER exposes credentials. It is a
-bulk, resumable, idempotent loader for historical OHLCV candles into the same
-SQLite dataset the rest of the system reads from.
+bulk, resumable, idempotent loader for historical OHLCV candles into the
+production database configured via MARKET_DATA_DB_URL.
 
 Design notes
 ------------
-* The FYERS per-request caps (100 days for minute resolutions, 366 for day/
+* Provider per-request caps (e.g. 100 days for minute resolutions, 366 for day/
   week/month) live in ``history_chunking`` and are reused here via ``plan_chunks``.
   We do NOT implement a second chunking algorithm.
 * Validation reuses ``validate_ohlcv``. Error-severity problems are recorded and
@@ -24,9 +24,8 @@ Design notes
 * Storage reuses ``MarketStore.upsert_many``, whose UNIQUE(symbol, timeframe,
   timestamp, provider, exchange) constraint makes re-runs idempotent: a second run
   over the same period stores zero new rows.
-* FYERS errors are represented by the typed exceptions in ``fyers``
-  (FYERSAuthError / FYERSAPIError / FYERSNetworkError / FYERSRateLimitError) so an
-  authentication failure is never mistaken for "no market data".
+* Provider errors are represented by typed exceptions so an authentication
+  failure is never mistaken for "no market data".
 """
 from __future__ import annotations
 
@@ -38,6 +37,7 @@ from typing import Callable, Optional
 import pandas as pd
 
 from ..config import log
+from ..data.base import MarketDataProvider
 from ..data.validation import validate_ohlcv
 from ..storage.database import MarketStore
 from .fyers import (
@@ -50,6 +50,13 @@ from .fyers import (
 )
 from .history_chunking import plan_chunks, DateChunk
 from .instruments import InstrumentRegistry
+from .upstox import (
+    UpstoxAuthError,
+    UpstoxAPIError,
+    UpstoxNetworkError,
+    UpstoxRateLimitError,
+    UpstoxError,
+)
 
 
 class BackfillStatus(str, Enum):
@@ -58,8 +65,8 @@ class BackfillStatus(str, Enum):
     COMPLETE = "COMPLETE"      # all chunks fetched, some data stored
     PARTIAL = "PARTIAL"        # some chunks failed but data was stored
     EMPTY = "EMPTY"            # no data returned and no errors
-    AUTH_ERROR = "AUTH_ERROR"  # FYERS authentication failed
-    API_ERROR = "API_ERROR"    # FYERS returned an API-level error
+    AUTH_ERROR = "AUTH_ERROR"  # provider authentication failed
+    API_ERROR = "API_ERROR"    # provider returned an API-level error
     NETWORK_ERROR = "NETWORK_ERROR"  # transport failure / exhausted retries
     VALIDATION_ERROR = "VALIDATION_ERROR"  # data returned but rejected by validation
     FAILED = "FAILED"          # all chunks failed (non-auth)
@@ -84,12 +91,12 @@ class BackfillSymbolResult:
 
     symbol: str
     timeframe: str
-    fyers_symbol: str = ""
+    provider_symbol: str = ""
     exchange: str = ""
-    provider: str = "fyers"
+    provider: str = ""
     contract_id: str = ""
 
-    # Requested vs actual (what FYERS actually returned).
+    # Requested vs actual (what the provider actually returned).
     requested_start: Optional[pd.Timestamp] = None
     requested_end: Optional[pd.Timestamp] = None
     actual_start: Optional[pd.Timestamp] = None
@@ -99,7 +106,7 @@ class BackfillSymbolResult:
     chunks_ok: int = 0
     chunks_failed: int = 0
 
-    fetched: int = 0          # total rows returned by FYERS across chunks
+    fetched: int = 0          # total rows returned by the provider across chunks
     valid: int = 0            # rows that passed validation
     stored: int = 0           # new rows persisted (idempotent)
     skipped: int = 0          # rows rejected by validation or failed chunks
@@ -164,23 +171,34 @@ def _resolve_range(
     return start, end
 
 
-def _chunk_plan(start: pd.Timestamp, end: pd.Timestamp, timeframe: str) -> list[DateChunk]:
+def _chunk_plan(start: pd.Timestamp, end: pd.Timestamp, timeframe: str, provider: Optional[MarketDataProvider] = None) -> list[DateChunk]:
     """Plan chunks on the date range.
 
     Delegates to ``plan_chunks`` (the existing, tested chunking primitive) which
-    now preserves time-of-day and produces exclusive boundaries (no overlap). The
-    final chunk's end is already the true ``end`` (which may carry a time-of-day),
-    so intraday backfills reach the latest not-yet-finalized candle FYERS has.
+    now preserves time-of-day and produces exclusive boundaries (no overlap).
+    Provider-specific per-request caps are respected when the provider is known.
     """
-    return plan_chunks(start, end, timeframe)
+    max_days = None
+    if provider is not None:
+        pname = getattr(provider, "name", "").lower()
+        if pname == "upstox":
+            token = timeframe
+            if token in ("1d", "1w", "1M", "D"):
+                max_days = 365
+            else:
+                max_days = 100
+        elif pname in ("fyers", "india"):
+            from .history_chunking import _fy_cap_days
+            max_days = _fy_cap_days(timeframe)
+    return plan_chunks(start, end, timeframe, max_days_per_request=max_days)
 
 
 class BackfillEngine:
-    """Provider-agnostic historical backfill engine (wired to FYERS by default)."""
+    """Provider-agnostic historical backfill engine."""
 
     def __init__(
         self,
-        provider: FYERSMarketDataProvider,
+        provider: MarketDataProvider,
         store: MarketStore,
         registry: Optional[InstrumentRegistry] = None,
         max_retries: int = 2,
@@ -209,15 +227,14 @@ class BackfillEngine:
         res = BackfillSymbolResult(symbol=symbol, timeframe=timeframe)
         res.provider = self.provider.name
 
-        # Symbol mapping (reuse existing abstraction; no ad-hoc manipulation).
+        # Symbol mapping is handled by the provider internally; keep the
+        # internal symbol and let get_historical resolve it.
         try:
             instr = self.registry.resolve(symbol)
             res.exchange = instr.internal.exchange
-            res.fyers_symbol = self.provider._fyers_symbol(symbol)
             res.contract_id = getattr(instr, "contract_id", None) or symbol
         except Exception as e:  # pragma: no cover - registry is robust
             res.exchange = symbol.split(":", 1)[0] if ":" in symbol else ""
-            res.fyers_symbol = symbol
             res.contract_id = symbol
 
         # Resolve the requested range.
@@ -234,7 +251,7 @@ class BackfillEngine:
                 "No --days or --start supplied; defaulting to 365 days ending now."
             )
 
-        chunks = _chunk_plan(req_start, req_end, timeframe)
+        chunks = _chunk_plan(req_start, req_end, timeframe, provider=self.provider)
         res.chunks_total = len(chunks)
 
         if dry_run:
@@ -269,31 +286,31 @@ class BackfillEngine:
                 outcome.rows = len(new_rows)
                 res.fetched += len(rows)
                 res.chunks_ok += 1
-            except FYERSAuthError as e:
+            except (FYERSAuthError, UpstoxAuthError) as e:
                 fatal_auth = True
                 outcome.status = "FAILED"
                 outcome.error = f"AUTH: {e}"
                 dominant_error = dominant_error or "auth"
                 res.chunks_failed += 1
                 res.warnings.append(f"Chunk {i}: authentication failed: {e}")
-            except (FYERSAPIError, FYERSRateLimitError) as e:
+            except (FYERSAPIError, FYERSRateLimitError, UpstoxAPIError, UpstoxRateLimitError) as e:
                 outcome.status = "FAILED"
                 outcome.error = f"API: {e}"
                 dominant_error = dominant_error or "api"
                 res.chunks_failed += 1
                 res.warnings.append(f"Chunk {i}: API error: {e}")
-            except FYERSNetworkError as e:
+            except (FYERSNetworkError, UpstoxNetworkError) as e:
                 outcome.status = "FAILED"
                 outcome.error = f"NETWORK: {e}"
                 dominant_error = dominant_error or "network"
                 res.chunks_failed += 1
                 res.warnings.append(f"Chunk {i}: network error: {e}")
-            except FYERSError as e:
+            except (FYERSError, UpstoxError) as e:
                 outcome.status = "FAILED"
-                outcome.error = f"FYERS: {e}"
+                outcome.error = f"PROVIDER: {e}"
                 dominant_error = dominant_error or "api"
                 res.chunks_failed += 1
-                res.warnings.append(f"Chunk {i}: FYERS error: {e}")
+                res.warnings.append(f"Chunk {i}: provider error: {e}")
             except Exception as e:  # noqa: BLE001 - surface, never crash the whole run
                 outcome.status = "FAILED"
                 outcome.error = f"{type(e).__name__}: {e}"
@@ -354,10 +371,10 @@ class BackfillEngine:
             # Nothing fetched.
             if fatal_auth:
                 res.status = BackfillStatus.AUTH_ERROR
-                res.error = "FYERS authentication failed (see warnings)"
+                res.error = f"{res.provider} authentication failed (see warnings)"
             elif dominant_error == "api":
                 res.status = BackfillStatus.API_ERROR
-                res.error = "All chunks failed with FYERS API errors"
+                res.error = f"All chunks failed with {res.provider} API errors"
             elif dominant_error == "network":
                 res.status = BackfillStatus.NETWORK_ERROR
                 res.error = "All chunks failed with network errors"
@@ -385,7 +402,8 @@ class BackfillEngine:
                 return self.provider.get_historical(
                     symbol, timeframe, start=start, end=end
                 )
-            except (FYERSAuthError, FYERSAPIError, FYERSRateLimitError, FYERSError):
+            except (FYERSAuthError, FYERSAPIError, FYERSRateLimitError, FYERSError,
+                    UpstoxAuthError, UpstoxAPIError, UpstoxRateLimitError, UpstoxError):
                 raise  # authoritative; do not retry
             except Exception as e:  # noqa: BLE001 - transient network/parse
                 last = e
@@ -394,7 +412,7 @@ class BackfillEngine:
 
                     time.sleep(self.retry_backoff)
         # Re-raise as a network-style error so the status mapping is consistent.
-        raise FYERSNetworkError(f"chunk fetch failed after retries: {last}")
+        raise RuntimeError(f"chunk fetch failed after retries: {last}")
 
     @staticmethod
     def _df_to_rows(df, symbol, timeframe, exchange, provider, contract_id=None) -> list[dict]:
