@@ -504,3 +504,44 @@ class TestTournamentIntegration:
                 assert r.evaluation is not None
                 assert r.scorer_output is not None
                 break
+
+
+class TestNiftySma5Identity:
+    """Focused identity consistency tests for nifty-sma5."""
+
+    def test_canonical_build_spec_identity(self):
+        from trading_system.research.evidence import strategy_identity
+        candidate = build_default_universe()["nifty-sma5"]
+        spec = candidate.build_spec(symbol="NSE:NIFTY", timeframe="1d")
+        assert spec.generated_by == "phase23:nifty-sma5"
+        assert strategy_identity(spec) == "cbf82834f769dae2b5cfbeb1332fa9c07b6d9ddd752c8ac67ab6eedbf6182e37"
+
+    def test_tournament_uses_canonical_identity(self):
+        from trading_system.research.evidence import strategy_identity
+        from trading_system.storage.database import MarketStore
+
+        store = MarketStore('sqlite:///./data/market_data.db')
+
+        def load_data(symbol, timeframe):
+            df = store.load(symbol, timeframe)
+            return df if not df.empty else None
+
+        universe = build_default_universe()
+        config = Phase23Config(
+            tournament_id='test-identity',
+            wf_n_folds=2,
+            bootstrap_n=10,
+            wf_min_validation_trades=1,
+            wf_min_fold_coverage=0.01,
+        )
+        runner = TournamentRunner(config=config, universe=universe, data_loader=load_data)
+        result = runner.run()
+
+        nifty = result.candidates.get("nifty-sma5")
+        assert nifty is not None
+        expected_id = "cbf82834f769dae2b5cfbeb1332fa9c07b6d9ddd752c8ac67ab6eedbf6182e37"
+        assert nifty.strategy_id == expected_id, (
+            f"nifty-sma5 strategy_id={nifty.strategy_id!r} "
+            f"does not match canonical {expected_id!r}"
+        )
+        assert nifty.strategy_id != "NIFTY Options SMA5 Trend"
