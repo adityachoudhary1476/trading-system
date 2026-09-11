@@ -8,13 +8,12 @@ full ~100-candidate universe will be added incrementally.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any
 
 from ..strategy_lab.spec import (
-    PositionSizing,
-    RiskParams,
     StrategySpec,
     const_operand,
     field_operand,
@@ -52,7 +51,8 @@ class UniverseCandidate:
     parameter_ranges: dict[str, tuple[Any, Any]]
     version: str = "1.0.0"
     implementation_status: str = "implemented"
-    spec_builder: Optional[Callable[..., dict]] = None
+    spec_builder: Callable[..., dict] | None = None
+    options_strategy: bool = False
 
     def build_spec(self, symbol: str = "NSE:SBIN", timeframe: str = "1d") -> StrategySpec:
         if self.spec_builder is None:
@@ -2730,10 +2730,46 @@ def _new_triple_ema_momentum(symbol: str, timeframe: str) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# Strategy — NIFTY Options SMA5 Trend (options-capable, index-based)
+# --------------------------------------------------------------------------- #
+def _nifty_options_sma5_trend(symbol: str, timeframe: str) -> dict:
+    return {
+        "name": "NIFTY Options SMA5 Trend",
+        "description": "LONG when close > SMA(5); exit when close < SMA(5). Applied to NIFTY index via option contracts (CE/PE).",
+        "symbol": symbol, "timeframe": timeframe,
+        "indicators": [{"name": "sma", "params": {"window": 5}}],
+        "entry": make_condition(field_operand("close"), ">", indicator_operand("sma_5")),
+        "entry_short": None,
+        "exit": make_condition(field_operand("close"), "<", indicator_operand("sma_5")),
+        "allow_long": True,
+        "position_sizing": _size(0.25),
+        "risk": _risk(stop=0.03, take=0.06),
+    }
+
+
+# --------------------------------------------------------------------------- #
 # Universe assembly
 # --------------------------------------------------------------------------- #
 def build_default_universe() -> dict[str, UniverseCandidate]:
     return {
+        "nifty-sma5": UniverseCandidate(
+            candidate_id="nifty-sma5",
+            strategy_family=StrategyFamily.TREND_MOMENTUM,
+            strategy_name="NIFTY Options SMA5 Trend",
+            description="LONG when close > SMA(5); exit when close < SMA(5). Applied to NIFTY index via option contracts (CE/PE).",
+            hypothesis="Short-term SMA(5) trend persistence on the NIFTY index, traded via option contracts",
+            required_features=["sma"],
+            timeframe="1d",
+            supported_instruments=["NSE:NIFTY"],
+            supported_sessions=["regular"],
+            parameter_schema={"window": {"type": "int", "min": 3, "max": 20}},
+            default_parameters={"window": 5},
+            parameter_ranges={"window": (3, 20)},
+            version="1.0.0",
+            implementation_status="implemented",
+            spec_builder=_nifty_options_sma5_trend,
+            options_strategy=True,
+        ),
         "trend-ema-fast-slow": UniverseCandidate(
             candidate_id="trend-ema-fast-slow",
             strategy_family=StrategyFamily.TREND_MOMENTUM,
