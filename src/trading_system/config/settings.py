@@ -81,6 +81,9 @@ class StorageConfig:
 
     @property
     def db_url(self) -> str:
+        env_url = os.getenv("MARKET_DATA_DB_URL", "").strip()
+        if env_url:
+            return env_url
         return f"sqlite:///{self.db_path}"
 
 
