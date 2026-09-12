@@ -19,6 +19,7 @@ import { PaperEvents } from "@/pages/paper/PaperEvents";
 import { PaperRiskHealth } from "@/pages/paper/PaperRiskHealth";
 import { PaperReports } from "@/pages/paper/PaperReports";
 import { PaperResearch } from "@/pages/paper/PaperResearch";
+import TerminalPage from "@/pages/Terminal";
 
 const AutonomousCenter = lazy(() => import("@/pages/paper/AutonomousCenter"));
 
@@ -28,6 +29,7 @@ const KEYS: Record<string, string> = {
   "3": "/signals",
   "4": "/system",
   "5": "/paper",
+  "6": "/terminal",
 };
 
 export function App() {
@@ -54,7 +56,8 @@ export function App() {
       }} />
       <main className="app-main">
         <Routes>
-          <Route path="/" element={<DashboardPage />} />
+          <Route path="/" element={<TerminalPage />} />
+          <Route path="/dashboard" element={<DashboardPage />} />
           <Route path="/markets" element={<MarketsPage />} />
           <Route path="/signals" element={<SignalsPage />} />
           <Route path="/system" element={<SystemPage />} />

@@ -116,3 +116,6 @@ export function fmtDateTime(ms: number | null): string {
     timeZone: IST,
   });
 }
+
+/** Generic number formatter - alias for fmtNum for compatibility */
+export const fmt = fmtNum;

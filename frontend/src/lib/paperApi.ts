@@ -310,33 +310,33 @@ export const paperApi = {
   },
 
   // Phase 6 — Autonomous Trading Operations Center
-  async getAutonomousBot(): Promise<AutonomousBotResponse> {
-    return this.request<AutonomousBotResponse>("/autonomous/bot")
-  },
+    async getAutonomousBot(): Promise<ApiResult<AutonomousBotResponse>> {
+      return this.request<AutonomousBotResponse>("/autonomous/bot")
+    },
 
-  async setAutonomousBotLifecycle(
-    action: "start" | "pause" | "resume" | "stop"
-  ): Promise<AutonomousLifecycleResponse> {
-    return this.request<AutonomousLifecycleResponse>(
-      `/autonomous/bot/${action}`,
-      { method: "POST" }
-    )
-  },
+    async setAutonomousBotLifecycle(
+      action: "start" | "pause" | "resume" | "stop"
+    ): Promise<ApiResult<AutonomousLifecycleResponse>> {
+      return this.request<AutonomousLifecycleResponse>(
+        `/autonomous/bot/${action}`,
+        { method: "POST" }
+      )
+    },
 
-  async getAutonomousScan(): Promise<AutonomousScanResponse> {
-    return this.request<AutonomousScanResponse>("/autonomous/scan")
-  },
+    async getAutonomousScan(): Promise<ApiResult<AutonomousScanResponse>> {
+      return this.request<AutonomousScanResponse>("/autonomous/scan")
+    },
 
-  async getAutonomousDecisions(): Promise<AutonomousDecideResponse> {
-    return this.request<AutonomousDecideResponse>(
-      "/autonomous/decide",
-      { method: "POST" }
-    )
-  },
+    async getAutonomousDecisions(): Promise<ApiResult<AutonomousDecideResponse>> {
+      return this.request<AutonomousDecideResponse>(
+        "/autonomous/decide",
+        { method: "POST" }
+      )
+    },
 
-  async getAutonomousDeployments(): Promise<AutonomousDeploymentsResponse> {
-    return this.request<AutonomousDeploymentsResponse>("/autonomous/deployments")
-  },
+    async getAutonomousDeployments(): Promise<ApiResult<AutonomousDeploymentsResponse>> {
+      return this.request<AutonomousDeploymentsResponse>("/autonomous/deployments")
+    },
 
   async stopAutonomousDeployment(deploymentId: string): Promise<{
     status: string
