@@ -1309,7 +1309,7 @@ def _cmd_serve_paper_api(args: argparse.Namespace) -> int:
         trading_mode=TradingMode.PAPER,
         enabled=True,
         user_constraints=UserConstraints(
-            allowed_symbols=frozenset({"NSE:NIFTY"}),
+            allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
             allowed_strategy_ids=frozenset(),
             allowed_timeframes=frozenset({"1d"}),
             allowed_option_underlyings=frozenset({"NIFTY"}),
