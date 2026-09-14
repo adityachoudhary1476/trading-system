@@ -106,20 +106,33 @@ def extract_result_payload(stdout: str) -> Optional[Dict[str, Any]]:
         ```
 
     A bare JSON object as the entire (stripped) output is also accepted.
+    Also accepts ```json blocks for compatibility with OpenCode output.
     Returns None when no parseable payload exists (malformed output).
     """
-    marker = "```ai-office-result"
     payloads: List[str] = []
+
+    # Look for ```ai-office-result blocks first (preferred)
+    marker = "```ai-office-result"
     if marker in stdout:
         for block in stdout.split(marker)[1:]:
             block = block.split("```", 1)[0].strip()
             if block:
                 payloads.append(block)
+
+    # Also look for ```json blocks (compatibility)
+    if "```json" in stdout:
+        for block in stdout.split("```json")[1:]:
+            block = block.split("```", 1)[0].strip()
+            if block and block not in payloads:
+                payloads.append(block)
+
+    # A bare JSON object as the entire (stripped) output is also accepted
     stripped = stdout.strip()
     if not payloads and stripped.startswith("{") and stripped.endswith("}"):
         payloads.append(stripped)
-    # Take the LAST parseable payload (final message wins).
-    for candidate in reversed(payloads):
+
+    # Take the FIRST parseable payload (first block wins for ```json compat)
+    for candidate in payloads:
         try:
             parsed = json.loads(candidate)
             if isinstance(parsed, dict):

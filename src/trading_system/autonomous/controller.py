@@ -425,7 +425,7 @@ class AutonomousController(BaseModel):
 
         except BotTransitionError as exc:
             return False, str(exc)
-        except Exception as exc:  # noqa: BLE001 — guard against unexpected errors
+        except Exception as exc:  # noqa: BLE001 â€” guard against unexpected errors
             # Fail closed: if we can't start, bot stays CREATED or goes to ERROR.
             try:
                 self.lifecycle.transition_to(AutonomousBotState.ERROR)
@@ -1004,7 +1004,7 @@ class AutonomousController(BaseModel):
 
         # Phase 8A guard: reject synthetic chain providers in production.
         # InMemoryOptionsChainProvider generates deterministic/synthetic
-        # premiums — these must never silently enter real paper execution.
+        # premiums â€” these must never silently enter real paper execution.
         from trading_system.autonomous.options_contract import InMemoryOptionsChainProvider
         if isinstance(provider, InMemoryOptionsChainProvider):
             self._record_event(
@@ -1083,7 +1083,7 @@ class AutonomousController(BaseModel):
             elif action == "sell":
                 direction = OptionDirection.PUT
             else:
-                return None  # HOLD or EXIT — no new option contract
+                return None  # HOLD or EXIT â€” no new option contract
 
         underlying = decision.opportunity_symbol
         # Strip exchange prefix if present (e.g. "NSE:NIFTY" â†’ "NIFTY")

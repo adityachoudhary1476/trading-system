@@ -1,4 +1,4 @@
-"""Phase 7 — Safety, Kill-Switch, and Recovery Layer tests.
+"""Phase 7 â€” Safety, Kill-Switch, and Recovery Layer tests.
 
 Covers:
   - KillSwitch: initial state, halt, idempotent re-halt, resume, reason/detail
@@ -103,7 +103,7 @@ def _make_controller():
 
 
 # --------------------------------------------------------------------------- #
-# Phase 7B — KillSwitch
+# Phase 7B â€” KillSwitch
 # --------------------------------------------------------------------------- #
 
 
@@ -169,7 +169,7 @@ class TestKillSwitch:
 
 
 # --------------------------------------------------------------------------- #
-# Phase 7A — SafetyValidator: individual checks
+# Phase 7A â€” SafetyValidator: individual checks
 # --------------------------------------------------------------------------- #
 
 
@@ -333,7 +333,7 @@ class TestSafetyValidatorChecks:
 
 
 # --------------------------------------------------------------------------- #
-# Phase 7A — SafetyValidator: composite checks
+# Phase 7A â€” SafetyValidator: composite checks
 # --------------------------------------------------------------------------- #
 
 
@@ -416,7 +416,7 @@ class TestSafetyValidatorComposite:
 
 
 # --------------------------------------------------------------------------- #
-# Phase 7C — IdempotencyGuard
+# Phase 7C â€” IdempotencyGuard
 # --------------------------------------------------------------------------- #
 
 
@@ -509,7 +509,7 @@ class TestIdempotencyGuard:
 
 
 # --------------------------------------------------------------------------- #
-# Phase 7D — Phase7SafetyLayer
+# Phase 7D â€” Phase7SafetyLayer
 # --------------------------------------------------------------------------- #
 
 
@@ -712,7 +712,7 @@ class TestControllerPhase7Integration:
 
 
 # --------------------------------------------------------------------------- #
-# Static safety scan — no live broker references
+# Static safety scan â€” no live broker references
 # --------------------------------------------------------------------------- #
 
 
@@ -797,7 +797,7 @@ class TestKillSwitchEndToEnd:
         controller.start_bot()
         controller.stop_bot()
         assert controller.config.enabled is False
-        # Cannot resume from STOPPED — start a fresh controller instead.
+        # Cannot resume from STOPPED â€” start a fresh controller instead.
         controller = _make_controller()
         controller.config.enabled = False
         controller.start_bot()

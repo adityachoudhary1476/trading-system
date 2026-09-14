@@ -25,6 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY backend/ ./backend/
 COPY src/ ./src/
+COPY update_notes.py /app/
 
 # Ensure the data directory exists for SQLite paper-trading storage
 RUN mkdir -p /app/data
@@ -43,4 +44,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD python -c "import os,urllib.request; urllib.request.urlopen(f'http://localhost:{os.environ.get(\"PORT\", \"8080\")}/health')" || exit 1
 
 # Run the application (shell form so $PORT is expanded by Railway's runtime)
-CMD ["sh", "-c", "uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "python /app/update_notes.py && uvicorn backend.main:app --host 0.0.0.0 --port ${PORT:-8080}"]

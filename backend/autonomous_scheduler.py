@@ -598,7 +598,30 @@ def _build_control_center(engine: Engine):
         freshness_config=freshness,
         market_data_provider=market_data_callable,
     )
+    # Seed Phase 22 strategy specs into the DB (idempotent).
+    # Required on fresh PostgreSQL deployments where no strategies
+    # are pre-registered, so the autonomous bot has specs to scan.
+    _seed_phase22_strategies(center)
     return center, md_provider, market_data_callable, engine
+
+
+def _seed_phase22_strategies(center) -> list[str]:
+    """Register Phase 22 strategy specs into the DB if not already present.
+
+    Idempotent — safe to call on every startup.  On fresh PostgreSQL
+    deployments no strategies are pre-registered, so this guarantees the
+    autonomous bot has specs to scan/rank/decide on.
+    """
+    from trading_system.research.phase22 import build_phase22_strategy_specs
+    specs = build_phase22_strategy_specs()
+    for strategy_id, spec in specs.items():
+        existing = center.registry.get_strategy(strategy_id)
+        if existing is None:
+            try:
+                center.registry.register_strategy(spec)
+            except Exception:
+                logger.debug("strategy %s already registered", strategy_id)
+    return list(specs.keys())
 
 
 def _build_controller(
@@ -627,7 +650,9 @@ def _build_controller(
         enabled=True,
         user_constraints=UserConstraints(
             allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
-            allowed_strategy_ids=frozenset(),
+            allowed_strategy_ids=frozenset(
+                s.strategy_id for s in center.registry.list_strategies()
+            ),
             allowed_timeframes=frozenset({"1d"}),
             allowed_option_underlyings=option_underlyings,
         ),
