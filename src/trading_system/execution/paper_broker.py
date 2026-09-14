@@ -387,6 +387,69 @@ class PaperBroker(Broker):
     def positions(self) -> dict:
         return dict(self._positions)
 
+    # -- capital management (paper-only) --------------------------------------
+    def add_capital(self, amount: float) -> float:
+        """Inject virtual cash into the paper account. Paper-only; no real transfer.
+
+        Returns the new cash balance after the deposit.
+        """
+        if amount is None or amount <= 0:
+            raise BrokerError(f"add_capital amount must be > 0; got {amount}")
+        self._cash += float(amount)
+        return self._cash
+
+    def withdraw_capital(self, amount: float) -> float:
+        """Remove virtual cash from the paper account. Paper-only.
+
+        Returns the new cash balance after the withdrawal.
+        """
+        if amount is None or amount <= 0:
+            raise BrokerError(f"withdraw_capital amount must be > 0; got {amount}")
+        if amount > self._cash:
+            raise BrokerError(
+                f"insufficient cash: requested {amount:.2f}, available {self._cash:.2f}"
+            )
+        self._cash -= float(amount)
+        return self._cash
+
+    def reset_capital(self) -> dict:
+        """Reset cash to initial capital and liquidate all open positions.
+
+        Paper-only. All open positions are closed at their last known market
+        price. Realized PnL from liquidation is folded into ``_realized_pnl``
+        before the cash reset.
+
+        Returns a dict with pre/post cash, positions closed, and realized PnL.
+        """
+        pre_cash = self._cash
+        closed = []
+        for symbol, pos in list(self._positions.items()):
+            if pos.is_open and pos.qty != 0:
+                price = self._last_price.get(symbol, pos.current_price or 0.0)
+                if price > 0:
+                    side = Side.SELL if pos.qty > 0 else Side.BUY
+                    qty = abs(pos.qty)
+                    self._fill_order(
+                        Order(
+                            order_id=f"reset-{__import__('uuid').uuid4().hex[:8]}",
+                            symbol=symbol,
+                            side=side,
+                            quantity=qty,
+                            order_type=OrderType.MARKET,
+                        ),
+                        market_price=price,
+                        fill_qty=qty,
+                    )
+                    closed.append(symbol)
+        realized = self._realized_pnl
+        self._cash = float(self.initial_cash)
+        return {
+            "pre_reset_cash": pre_cash,
+            "post_reset_cash": self._cash,
+            "positions_closed": closed,
+            "realized_pnl_at_reset": realized,
+        }
+
     def account(self) -> AccountSnapshot:
         return AccountSnapshot(
             initial_cash=self.initial_cash,

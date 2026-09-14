@@ -68,6 +68,8 @@ from .models import (
     PROVIDER_STATUS_UNAVAILABLE,
     OrderIntentRequest,
     OrderIntentResponse,
+    CapitalRequest,
+    CapitalOperationResponse,
     PerformanceResponse,
     PositionsResponse,
     RestoreRequest,
@@ -225,6 +227,13 @@ class PaperAPIRouter:
                   frozenset({"POST"}), self._route_stop)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/reset-circuit-breaker$",
                   frozenset({"POST"}), self._route_reset_circuit_breaker)
+        # Phase 21Q — Capital management (paper-only)
+        self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/add-capital$",
+                  frozenset({"POST"}), self._route_add_capital)
+        self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/withdraw-capital$",
+                  frozenset({"POST"}), self._route_withdraw_capital)
+        self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/reset-capital$",
+                  frozenset({"POST"}), self._route_reset_capital)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/checkpoint$",
                   frozenset({"POST"}), self._route_checkpoint)
         self._add(r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/restore$",
@@ -913,6 +922,93 @@ class PaperAPIRouter:
             ) from exc
         body = CircuitBreakerResponse(
             circuit_breaker=self.center.inspect_circuit_breaker(sid)
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_reset_capital(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /deployments/{id}/reset-capital — liquidate + reset to initial cash."""
+        sid, _ = self._require_live_session(ctx)
+        result = self.center.reset_capital(sid)
+        body = CapitalOperationResponse(
+            operation="reset_capital",
+            cash_before=result["pre_reset_cash"],
+            cash_after=result["post_reset_cash"],
+            positions_closed=result["positions_closed"],
+            realized_pnl_at_reset=result["realized_pnl_at_reset"],
+            account=result["account"],
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_add_capital(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /deployments/{id}/add-capital — inject virtual cash (paper-only)."""
+        sid, _ = self._require_live_session(ctx)
+        amount = None
+        if ctx.body is not None:
+            try:
+                req = CapitalRequest.model_validate(ctx.body)
+                amount = req.amount
+            except ValidationError as exc:
+                raise APIErrorException(
+                    code=APIErrorCode.BAD_REQUEST,
+                    message=f"invalid capital request: {exc}",
+                    status=400,
+                ) from exc
+        if amount is None or amount <= 0:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="request body with positive 'amount' is required",
+                status=400,
+            )
+        account_before = self.center.inspect_account(sid)
+        cash_before = account_before.cash
+        self.center.add_capital(sid, amount)
+        account_after = self.center.inspect_account(sid)
+        body = CapitalOperationResponse(
+            operation="add_capital",
+            amount=amount,
+            cash_before=cash_before,
+            cash_after=account_after.cash,
+            account=account_after,
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_withdraw_capital(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /deployments/{id}/withdraw-capital — remove virtual cash (paper-only)."""
+        sid, _ = self._require_live_session(ctx)
+        amount = None
+        if ctx.body is not None:
+            try:
+                req = CapitalRequest.model_validate(ctx.body)
+                amount = req.amount
+            except ValidationError as exc:
+                raise APIErrorException(
+                    code=APIErrorCode.BAD_REQUEST,
+                    message=f"invalid capital request: {exc}",
+                    status=400,
+                ) from exc
+        if amount is None or amount <= 0:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="request body with positive 'amount' is required",
+                status=400,
+            )
+        account_before = self.center.inspect_account(sid)
+        cash_before = account_before.cash
+        try:
+            self.center.withdraw_capital(sid, amount)
+        except ControlCenterError as exc:
+            raise APIErrorException(
+                code=APIErrorCode.RISK_HALTED,
+                message=str(exc),
+                status=409,
+            ) from exc
+        account_after = self.center.inspect_account(sid)
+        body = CapitalOperationResponse(
+            operation="withdraw_capital",
+            amount=amount,
+            cash_before=cash_before,
+            cash_after=account_after.cash,
+            account=account_after,
         )
         return ResponseEnvelope(status=200, body=_safe_dump(body))
 

@@ -134,6 +134,31 @@ class RestoreRequest(BaseModel):
 
 
 # --------------------------------------------------------------------------- #
+# Capital management request / response models
+# --------------------------------------------------------------------------- #
+class CapitalRequest(BaseModel):
+    """Body for capital management endpoints (add / withdraw)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    amount: float = Field(..., gt=0, description="Positive amount of currency to add or withdraw")
+
+
+class CapitalOperationResponse(BaseModel):
+    """Response for add-capital / withdraw-capital / reset-capital."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operation: str = Field(..., description="add_capital, withdraw_capital, or reset_capital")
+    amount: Optional[float] = None
+    cash_before: float
+    cash_after: float
+    positions_closed: list[str] = []
+    realized_pnl_at_reset: Optional[float] = None
+    account: DashboardAccountBlock
+
+
+# --------------------------------------------------------------------------- #
 # Session / checkpoint responses
 # --------------------------------------------------------------------------- #
 class SessionResponse(BaseModel):
@@ -233,6 +258,8 @@ __all__ = [
     "LifecycleRequest",
     "CheckpointRequest",
     "RestoreRequest",
+    "CapitalRequest",
+    "CapitalOperationResponse",
     "SessionResponse",
     "AccountResponse",
     "PositionsResponse",

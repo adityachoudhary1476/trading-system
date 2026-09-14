@@ -1302,6 +1302,54 @@ class PaperTradingControlCenter:
             payload,
         )
 
+
+    # ------------------------------------------------------------------ #
+    # Capital management (paper-only)
+    # ------------------------------------------------------------------ #
+    def add_capital(self, session_id: str, amount: float) -> AccountSnapshot:
+        """Inject virtual cash into a paper deployment. Paper-only; no real transfer.
+
+        Requires a live session. Returns the updated account snapshot.
+        """
+        runner = self._runners.get(session_id)
+        if runner is None:
+            raise UnknownDeploymentError(session_id)
+        new_cash = runner.broker.add_capital(amount)
+        return self.inspect_account(session_id)
+
+    def withdraw_capital(self, session_id: str, amount: float) -> AccountSnapshot:
+        """Remove virtual cash from a paper deployment. Paper-only.
+
+        Raises if insufficient cash. Returns the updated account snapshot.
+        """
+        runner = self._runners.get(session_id)
+        if runner is None:
+            raise UnknownDeploymentError(session_id)
+        new_cash = runner.broker.withdraw_capital(amount)
+        return self.inspect_account(session_id)
+
+    def reset_capital(self, session_id: str) -> dict:
+        """Reset a paper deployment to initial capital + liquidate all positions.
+
+        Liquidates all open positions at mark-to-market, resets cash to the
+        deployment's configured initial capital, and saves a checkpoint.
+
+        Returns a dict with pre/post cash, closed positions, realized PnL,
+        and the new account state.
+        """
+        runner = self._runners.get(session_id)
+        if runner is None:
+            raise UnknownDeploymentError(session_id)
+        result = runner.broker.reset_capital()
+        account = self.inspect_account(session_id)
+        return {
+            "pre_reset_cash": result["pre_reset_cash"],
+            "post_reset_cash": result["post_reset_cash"],
+            "positions_closed": result["positions_closed"],
+            "realized_pnl_at_reset": result["realized_pnl_at_reset"],
+            "account": account,
+        }
+
     # ------------------------------------------------------------------ #
     # Scheduler heartbeat (Phase 23)
     # ------------------------------------------------------------------ #
