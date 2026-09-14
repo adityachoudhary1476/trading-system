@@ -28,8 +28,8 @@ import numpy as np
 import pandas as pd
 
 from ..strategies import Signal, Strategy, StrategyMeta
-from ...indicators import atr as _atr, bollinger_bands, ema as _ema, macd as _macd
-from ...indicators import momentum as _momentum, rsi as _rsi, sma as _sma
+from ...indicators import atr as _atr, bollinger_bands, donchian_lower as _donchian_lower, donchian_upper as _donchian_upper, ema as _ema, macd as _macd
+from ...indicators import momentum as _momentum, rsi as _rsi, sma as _sma, volume_sma as _volume_sma
 from .dsl import (
     Comparison,
     ComparisonOp,
@@ -141,6 +141,12 @@ def compute_indicators(spec: StrategySpec, df: pd.DataFrame) -> dict:
             column = {"bb_upper": "upper", "bb_middle": "middle",
                       "bb_lower": "lower"}[name]
             out[ind.key] = frame[column]
+        elif name == "donchian_upper":
+            out[ind.key] = _donchian_upper(df["high"], int(p["window"]))
+        elif name == "donchian_lower":
+            out[ind.key] = _donchian_lower(df["low"], int(p["window"]))
+        elif name == "volume_sma":
+            out[ind.key] = _volume_sma(df["volume"], int(p["window"]))
         else:  # pragma: no cover - registry-guarded
             raise InterpreterError(f"indicator {name!r} has no interpreter mapping")
     return out
