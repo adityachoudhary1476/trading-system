@@ -405,7 +405,11 @@ class PaperAPIRouter:
         )
 
     def _require_live_session(self, ctx: RequestContext) -> tuple[str, Any]:
-        """Return ``(session_id, deployment)`` for the live session only."""
+        """Return ``(session_id, deployment)`` for a live session.
+
+        Lazily restores the in-memory runner from the DB checkpoint if no
+        live session is currently attached (e.g. after a server restart).
+        """
         deployment_id = ctx.params["deployment_id"]
         deployment = self.center.get_deployment(deployment_id)
         if deployment is None:
@@ -414,7 +418,7 @@ class PaperAPIRouter:
                 message=f"unknown deployment {deployment_id!r}",
                 status=404,
             )
-        sid = self.center.find_session_for_deployment(deployment_id)
+        sid = self.center.ensure_live_session(deployment_id)
         if sid is None:
             raise APIErrorException(
                 code=APIErrorCode.UNKNOWN_SESSION,

@@ -555,6 +555,65 @@ class PaperTradingControlCenter:
         self._runners[sid] = runner
         return checkpoint
 
+    def ensure_live_session(self, deployment_id: str) -> Optional[str]:
+        """Return the session_id for a live runner, restoring from DB if needed.
+
+        First checks for an existing in-memory runner. If none, attempts to
+        reconstruct a ``PaperStrategyRunner`` from the persisted session
+        checkpoint so that capital-management endpoints work after a server
+        restart (the in-memory runner is lost but the DB checkpoint persists).
+
+        Returns ``None`` when no checkpoint exists for the deployment.
+        """
+        # Fast path: a live runner is already attached.
+        sid = self.find_session_for_deployment(deployment_id)
+        if sid is not None:
+            return sid
+        # Slow path: reconstruct from the persisted checkpoint.
+        deployment = self._load_or_cache_deployment(deployment_id)
+        sid = session_identity(deployment)
+        checkpoint = self.session_store.get_checkpoint(sid)
+        if checkpoint is None:
+            return None
+        broker_state = checkpoint.broker_state or {}
+        initial_cash = float(
+            broker_state.get("initial_cash", deployment.config.initial_cash)
+        )
+        cash = float(broker_state.get("cash", initial_cash))
+        broker = PaperBroker(initial_cash=initial_cash)
+        # Reconcile cash: the checkpoint may differ from initial_cash
+        # because of prior add-capital / withdraw-capital operations.
+        if cash > initial_cash:
+            broker.add_capital(cash - initial_cash)
+        elif cash < initial_cash:
+            broker.withdraw_capital(initial_cash - cash)
+        # Resolve the strategy spec from the registry.
+        resolved_spec: Optional[StrategySpec] = None
+        try:
+            strategy = self.registry.get_strategy(deployment.strategy_id)
+            if strategy is not None:
+                resolved_spec = StrategySpec.model_validate_json(strategy.spec_json)
+            else:
+                for s in self.registry.list_strategies():
+                    if s.strategy_id == deployment.strategy_id:
+                        resolved_spec = StrategySpec.model_validate_json(s.spec_json)
+                        break
+        except Exception:
+            resolved_spec = None
+        if resolved_spec is None:
+            return None
+        runner = PaperStrategyRunner(
+            deployment=deployment,
+            broker=broker,
+            spec=resolved_spec,
+            circuit_breaker=PaperCircuitBreaker(),
+        )
+        try:
+            self.restore_session(session_id=sid, runner=runner)
+        except Exception:
+            self.attach_runner(deployment_id, runner)
+        return sid
+
     # ------------------------------------------------------------------ #
     # Inspection (read-only, JSON-serializable)
     # ------------------------------------------------------------------ #
