@@ -65,8 +65,8 @@ FACTORY_DIR = Path(factory_pkg.__file__).resolve().parent
 FACTORY_PY = sorted(p for p in FACTORY_DIR.rglob("*.py") if "__pycache__" not in str(p))
 # parents of .../src/trading_system/strategy_factory:
 #   [0]=strategy_factory  [1]=trading_system  [2]=src  [3]=repo_root
-PY_PATH_ENTRY = str(FACTORY_DIR.parents[2])
-REPO_ROOT = str(FACTORY_DIR.parents[3])
+PY_PATH_ENTRY = str(FACTORY_DIR.parents[1])
+REPO_ROOT = str(FACTORY_DIR.parents[2])
 BUILTIN_MODULES = ["trading_system.strategy_factory.builtin"]
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 

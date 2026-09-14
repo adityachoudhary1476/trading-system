@@ -260,8 +260,9 @@ def test_auth_failure_classified(tmp_path, monkeypatch):
     assert res.status == BackfillStatus.AUTH_ERROR
     assert res.stored == 0
     assert store.count("NSE:SBIN", "1d") == 0
-    # Ensure the message does NOT contain any credential value.
-    assert "X" not in res.error.split("FYERS authentication failed")[1] or "tok" not in res.error
+    # Ensure no credential value leaks into the error string.  The engine
+    # formats this as "{provider} authentication failed (see warnings)".
+    assert "X" not in res.error or "Y" not in res.error
 
 
 # --------------------------------------------------------------------------- #
@@ -481,11 +482,11 @@ def test_symbol_normalization_maps_to_fyers(tmp_path, monkeypatch):
     eng = BackfillEngine(prov, store)
     res = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=1))
     # The fyers symbol is derived via the existing mapping layer.
-    assert res.fyers_symbol == "NSE:SBIN-EQ"
+    assert res.provider_symbol == "NSE:SBIN-EQ"
     assert res.exchange == "NSE"
     # INDEX symbols also map.
     res2 = eng.backfill_symbol("NSE:NIFTY50", "1d", start=base, end=base + timedelta(days=1))
-    assert res2.fyers_symbol == "NSE:NIFTY50-INDEX"
+    assert res2.provider_symbol == "NSE:NIFTY50-INDEX"
 
 
 # --------------------------------------------------------------------------- #

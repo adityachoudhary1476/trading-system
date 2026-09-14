@@ -49,7 +49,8 @@ from .fyers import (
     FYERSError,
 )
 from .history_chunking import plan_chunks, DateChunk
-from .instruments import InstrumentRegistry
+from .instruments import InstrumentRegistry, Instrument
+from .symbol_map import to_fyers_symbol
 from .upstox import (
     UpstoxAuthError,
     UpstoxAPIError,
@@ -233,6 +234,7 @@ class BackfillEngine:
             instr = self.registry.resolve(symbol)
             res.exchange = instr.internal.exchange
             res.contract_id = getattr(instr, "contract_id", None) or symbol
+            res.provider_symbol = getattr(instr, "provider_symbol", None) or to_fyers_symbol(instr)
         except Exception as e:  # pragma: no cover - registry is robust
             res.exchange = symbol.split(":", 1)[0] if ":" in symbol else ""
             res.contract_id = symbol

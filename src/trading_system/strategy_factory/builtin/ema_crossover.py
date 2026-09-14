@@ -82,13 +82,20 @@ class EMACrossoverStrategy(Strategy):
 
     metadata = _METADATA
 
-    def __init__(self, fast_period: int = 12, slow_period: int = 26, allow_short: bool = False) -> None:
+    def __init__(
+        self,
+        fast_period: int = 12,
+        slow_period: int = 26,
+        allow_short: bool = False,
+        options_mode: bool = False,
+    ) -> None:
         values = _PARAMETER_SCHEMA.validate_values(
             {"fast_period": fast_period, "slow_period": slow_period, "allow_short": allow_short}
         )
         self._fast = int(values["fast_period"])
         self._slow = int(values["slow_period"])
         self._allow_short = bool(values["allow_short"])
+        self._options_mode = bool(options_mode)
         if self._fast >= self._slow:
             raise ValueError(
                 f"fast_period ({self._fast}) must be < slow_period ({self._slow})"
@@ -159,6 +166,15 @@ class EMACrossoverStrategy(Strategy):
             else "short (fast EMA < slow EMA)" if desired == -1
             else "flat (fast EMA <= slow EMA)"
         )
+        option_intent = None
+        if self._options_mode:
+            if desired == 1 and action == SignalAction.BUY:
+                option_intent = "CE"
+            elif desired == -1 and action == SignalAction.SELL:
+                # In options mode a bearish signal enters via a long PUT
+                # (BUY the PE option contract, not short the underlying).
+                action = SignalAction.BUY
+                option_intent = "PE"
         return StrategySignal(
             action=action,
             strategy_id=self.metadata.strategy_id,
@@ -168,6 +184,7 @@ class EMACrossoverStrategy(Strategy):
             confidence=confidence,
             reason=f"{direction}; fast={fast_val:.6f} slow={slow_val:.6f}",
             target_position=target,
+            option_intent=option_intent,
             metadata={
                 "fast_ema": fast_val,
                 "slow_ema": slow_val,

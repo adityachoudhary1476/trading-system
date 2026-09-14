@@ -626,7 +626,7 @@ def _build_controller(
         trading_mode=TradingMode.PAPER,  # ENFORCED by the Pydantic validator
         enabled=True,
         user_constraints=UserConstraints(
-            allowed_symbols=frozenset({"NSE:NIFTY"}),
+            allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
             allowed_strategy_ids=frozenset(),
             allowed_timeframes=frozenset({"1d"}),
             allowed_option_underlyings=option_underlyings,

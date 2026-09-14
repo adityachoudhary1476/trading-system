@@ -215,7 +215,7 @@ def test_importing_factory_loads_no_execution_or_paper_modules():
     paper-trading broker layers. (The pre-existing ``india`` package is imported
     transitively by ``trading_system.research``, exactly as documented in
     ``tests/test_strategy_safety.py``; that import makes no network connection.)"""
-    src_path = str(Path(factory_pkg.__file__).resolve().parents[1])
+    src_path = str(Path(factory_pkg.__file__).resolve().parents[2])
     code = (
         "import sys, trading_system.strategy_factory; "
         "bad=[m for m in sys.modules "

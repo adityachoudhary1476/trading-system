@@ -141,7 +141,8 @@ def test_exchange_auth_code_http_error_does_not_store():
         return _FakeResp(400, {"status": "error", "errors": [{"code": "invalid_grant", "message": "bad code"}]})
 
     tm = UpstoxTokenManager(
-        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=fake_post,
+        client_id=CLIENT, secret=SECRET, access_token="",
+        redirect_uri=REDIRECT, http_post=fake_post,
     )
     with pytest.raises(TokenError):
         tm.exchange_auth_code(CODE)
@@ -154,7 +155,8 @@ def test_exchange_auth_code_network_error_does_not_store():
         raise __import__("requests").RequestException("conn reset")
 
     tm = UpstoxTokenManager(
-        client_id=CLIENT, secret=SECRET, redirect_uri=REDIRECT, http_post=fake_post,
+        client_id=CLIENT, secret=SECRET, access_token="",
+        redirect_uri=REDIRECT, http_post=fake_post,
     )
     with pytest.raises(TokenError):
         tm.exchange_auth_code(CODE)
