@@ -44,6 +44,10 @@ railway-worker.toml
 trading-system-audit/
 vibetrading-inspection/
 
+# AI Office local SQLite databases (test artifacts)
+.ai-office/*.db
+.ai-office/*.db-journal
+
 # OS
 Thumbs.db
 .DS_Store
