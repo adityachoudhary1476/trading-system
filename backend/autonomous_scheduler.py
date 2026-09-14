@@ -268,6 +268,36 @@ def _env_db_url() -> Optional[str]:
     return url or None
 
 
+def _validate_runtime_env() -> None:
+    """Fail fast with clear messages if required env vars are missing.
+
+    Called before the scheduler starts its tick loop. Checks vars that
+    the scheduler needs beyond the already-checked AUTONOMOUS_SCHEDULER_ENABLED
+    and MARKET_DATA_DB_URL.
+    """
+    checks = [
+        ("AUTONOMOUS_BOT_ID", "bot-nifty-options"),
+        ("AUTONOMOUS_SCAN_INTERVAL_SECONDS", "60"),
+    ]
+    for var_name, default in checks:
+        val = os.environ.get(var_name)
+        if val is None or not val.strip():
+            logger.info(
+                "%s not set; using default: %s", var_name, default
+            )
+
+    # Upstox token — warn but don't fail (bot can still start, just won't trade)
+    upstox_token = os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN", "").strip()
+    if not upstox_token:
+        logger.error(
+            "UPSTOX_SERVICE_ACCOUNT_TOKEN is not set — the scheduler will start "
+            "but will NOT fetch market data or generate trades."
+        )
+        logger.error(
+            "Fix: run 'python -m trading_system auth-login' and redeploy."
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Cross-replica advisory lock
 # --------------------------------------------------------------------------- #
@@ -560,6 +590,56 @@ def _build_market_data_callable():
             return None
 
     return md_provider, market_data_callable
+
+
+def _check_market_data_health(
+    md_provider, market_data_callable
+) -> bool:
+    """Probe the market data provider; return True if functional.
+
+    Logs clear, actionable messages when the Upstox token is missing or expired,
+    so Railway logs make it obvious why the bot appears to be running but
+    generating no trades.
+    """
+    if market_data_callable is None:
+        logger.warning(
+            "No market data callable configured — bot will start but "
+            "skip all tick cycles (no data to trade on)."
+        )
+        return False
+
+    if not getattr(md_provider, "is_authenticated", False):
+        logger.error(
+            "Upstox market data provider is NOT authenticated — bot will NOT "
+            "trade. UPSTOX_SERVICE_ACCOUNT_TOKEN is likely missing or expired."
+        )
+        logger.error(
+            "Fix: run 'python -m trading_system auth-login', then set "
+            "UPSTOX_SERVICE_ACCOUNT_TOKEN in your Railway environment."
+        )
+        return False
+
+    # Quick probe — fetch a small amount of data
+    try:
+        probe = market_data_callable("NSE:TCS", "1d")
+        if probe is None:
+            logger.error(
+                "Market data probe returned None — token may be expired "
+                "or Upstox is rate-limiting. Bot will NOT trade until fixed."
+            )
+            return False
+        rows = len(probe) if hasattr(probe, "__len__") else "?"
+        logger.info(
+            "Market data provider healthy (probe returned %s bars for NSE:TCS).",
+            rows,
+        )
+        return True
+    except Exception as exc:
+        logger.error(
+            "Market data probe failed: %s — bot will NOT trade until fixed.",
+            type(exc).__name__,
+        )
+        return False
 
 
 def _build_control_center(engine: Engine):
@@ -1610,6 +1690,17 @@ def run() -> int:
     from trading_system.autonomous.persistence import AutonomousBotStateStore
     persistence = AutonomousBotStateStore(engine)
     controller = _build_controller(center, md_provider, market_data_callable, bot_id, persistence=persistence)
+
+    # Validate remaining env vars (token, bot id, etc.)
+    _validate_runtime_env()
+
+    # Probe market data health — logs clear actionable messages
+    md_healthy = _check_market_data_health(md_provider, market_data_callable)
+    if not md_healthy:
+        logger.warning(
+            "Scheduler starting WITHOUT functional market data — "
+            "bot will not generate trades until the token issue is resolved."
+        )
 
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
