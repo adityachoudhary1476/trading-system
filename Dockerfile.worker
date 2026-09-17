@@ -25,6 +25,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY backend/ ./backend/
 COPY src/ ./src/
+COPY run_tournament.py deploy_top_strategies.py ./
 
 # Ensure the data directory exists for SQLite fallback
 RUN mkdir -p /app/data

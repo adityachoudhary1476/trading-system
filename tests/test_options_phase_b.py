@@ -245,9 +245,9 @@ def test_options_disabled_preserves_equity_behavior(monkeypatch) -> None:
     # No option discoverer / quote provider attached.
     assert controller._option_discoverer is None
     assert controller._quote_provider is None
-    # Equity universe unchanged.
+    # Equity universe unchanged (new canonical NIFTY50 symbol).
     assert controller.config.user_constraints.allowed_symbols == frozenset(
-        {"NSE:SBIN", "NSE:TCS", "NSE:INFY"}
+        {"NSE:NIFTY50"}
     )
     # Underlyings empty.
     assert controller.config.user_constraints.allowed_option_underlyings == frozenset()

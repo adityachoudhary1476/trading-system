@@ -4,7 +4,7 @@ Splits a large date range into chunks that respect each provider's per-request
 limits, fetches each chunk, normalizes, combines, dedupes, sorts, and validates.
 
 The chunk *planning* (date math) is pure and fully testable offline. The *fetch*
-is delegated to a callable so the same engine works for any provider (FYERS,
+is delegated to a callable so the same engine works for any provider (Upstox,
 Binance, Stooq) without the engine knowing provider specifics.
 """
 from __future__ import annotations
@@ -16,32 +16,45 @@ from typing import Callable, Optional
 import pandas as pd
 
 from ..data.validation import validate_ohlcv
-from .fyers import _RESOLUTION  # documented FYERS caps drive the default planner
 
-
-# Documented FYERS caps (Day 3 research, docs/FYERS.md).
-# resolution -> max days per single /history request.
-FYERS_MAX_DAYS_PER_REQUEST = {
-    # minute resolutions
-    "1": 100, "2": 100, "3": 100, "5": 100, "10": 100, "15": 100,
-    "20": 100, "30": 100, "45": 100, "60": 100, "120": 100, "240": 100,
-    # day / week / month
-    "D": 366, "1D": 366, "1W": 366, "1M": 366,
-    # seconds (last 30 trading days) — not used as internal timeframe today
+# Provider resolution-caps (days per single historical request).
+# These are conservative upper bounds based on each provider's documented limits.
+_PROVIDER_MAX_DAYS = {
+    "upstox": {
+        "1d": 365, "1w": 365, "1M": 365, "D": 365,  # daily+ capped at 365 days
+        "1m": 100, "5m": 100, "15m": 100, "30m": 100, "60m": 100,  # intraday capped at 100
+    },
+    "binance": {
+        "1d": 1000, "1w": 1000, "1M": 1000,  # Binance allows larger daily windows
+        "1m": 1000, "5m": 1000, "15m": 1000, "1h": 1000,
+    },
 }
 
-# Internal timeframe -> FYERS resolution token (mirrors fyers._RESOLUTION).
-# `_RESOLUTION` maps internal name -> FYERS token, e.g. "1d" -> "D", "5m" -> "5".
-_FYERS_TOKEN_OF = dict(_RESOLUTION)
+# Internal timeframe -> provider-agnostic default cap (days).
+_DEFAULT_CAP_DAYS = {
+    "1d": 365, "1w": 365, "1M": 365, "D": 365,
+    "1m": 100, "5m": 100, "15m": 100, "30m": 100,
+    "60m": 100, "1h": 100, "2h": 100, "4h": 100,
+    "2m": 100, "3m": 100, "10m": 100, "20m": 100, "45m": 100,
+}
 
 
-def _fy_cap_days(timeframe: str) -> int:
-    """Max days/request for an internal timeframe under FYERS caps."""
-    token = _FYERS_TOKEN_OF.get(timeframe)
-    if token is None:
-        # Unknown resolution: be conservative (small window) rather than assume.
-        return 30
-    return FYERS_MAX_DAYS_PER_REQUEST.get(token, 30)
+def _default_cap_days(timeframe: str) -> int:
+    """Default days/request cap for an internal timeframe.
+
+    Conservative fallback (no provider import required). If the timeframe is
+    unknown, returns 30 days.
+    """
+    return _DEFAULT_CAP_DAYS.get(timeframe, 30)
+
+
+def provider_cap_days(provider_name: str, timeframe: str) -> int:
+    """Max days/request for a given provider + internal timeframe."""
+    caps = _PROVIDER_MAX_DAYS.get(provider_name.lower(), {})
+    if timeframe in caps:
+        return caps[timeframe]
+    # Try matching the provider's resolution token
+    return caps.get(timeframe, _default_cap_days(timeframe))
 
 
 @dataclass
@@ -78,7 +91,7 @@ def plan_chunks(
         end = end.tz_localize("UTC")
     if start > end:
         raise ValueError("start must be <= end")
-    cap = max_days_per_request if max_days_per_request is not None else _fy_cap_days(timeframe)
+    cap = max_days_per_request if max_days_per_request is not None else _default_cap_days(timeframe)
     if cap < 1:
         cap = 1
     chunks: list[DateChunk] = []

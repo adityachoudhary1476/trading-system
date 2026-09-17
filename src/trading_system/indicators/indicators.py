@@ -100,6 +100,35 @@ def atr(
     return tr.ewm(alpha=1 / window, adjust=False, min_periods=window).mean()
 
 
+def donchian_lower(series: pd.Series, window: int = 20) -> pd.Series:
+    """Donchian channel lower band: rolling minimum over the prior window bars.
+
+    Causal: excludes the current bar (shifts by 1) so a breakout condition
+    like ``close < donchian_lower`` uses only past data.
+    """
+    if window <= 0:
+        raise ValueError("window must be positive")
+    return series.shift(1).rolling(window=window, min_periods=window).min()
+
+
+def donchian_upper(series: pd.Series, window: int = 20) -> pd.Series:
+    """Donchian channel upper band: rolling maximum over the prior window bars.
+
+    Causal: excludes the current bar (shifts by 1) so a breakout condition
+    like ``close > donchian_upper`` uses only past data.
+    """
+    if window <= 0:
+        raise ValueError("window must be positive")
+    return series.shift(1).rolling(window=window, min_periods=window).max()
+
+
+def volume_sma(volume: pd.Series, window: int = 20) -> pd.Series:
+    """Simple moving average of volume."""
+    if window <= 0:
+        raise ValueError("window must be positive")
+    return volume.rolling(window=window, min_periods=window).mean()
+
+
 def add_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """Convenience: attach a standard set of indicators to an OHLCV frame.
 

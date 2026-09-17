@@ -5,8 +5,8 @@ current derivative contract discovery. It is DATA-ONLY (read-only; never places
 orders) and never fabricates contracts — if auth is unavailable or the request
 fails, discovery returns an empty list.
 
-This mirrors :class:`trading_system.india.instrument_discovery.FyersInstrumentDiscovery`
-but for the Upstox REST API v2 instead of FYERS' SDK ``optionchain`` call.
+This mirrors the provider-independent ``InstrumentRepository`` discovery pattern
+but for the Upstox REST API v2 instead of a previous provider's SDK ``optionchain`` call.
 """
 from __future__ import annotations
 

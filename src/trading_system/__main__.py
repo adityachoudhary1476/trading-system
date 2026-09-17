@@ -165,35 +165,38 @@ def _cmd_instruments(args: argparse.Namespace) -> int:
     from .india import (
         InstrumentRegistry,
         InstrumentRepository,
-        to_fyers_symbol,
-        FyersInstrumentDiscovery,
+        to_upstox_symbol,
+        UpstoxInstrumentDiscovery,
     )
 
     repo = InstrumentRepository(InstrumentRegistry())
 
-    # Live discovery via FYERS option chain (data-only; requires credentials).
+    # Live discovery via Upstox option chain (data-only; requires credentials).
     if args.discover and args.underlying:
-        from fyers_apiv3 import fyersModel
-        import os
+        from services.broker import get_upstox_access_token
+        import asyncio
         try:
             dotenv_module = __import__("dotenv")
             dotenv_module.load_dotenv()
         except Exception:
             pass
-        cid = os.getenv("FYERS_CLIENT_ID")
-        tok = os.getenv("FYERS_ACCESS_TOKEN")
-        if not (cid and tok):
-            print("ERROR: FYERS credentials not found in environment (.env). "
-                  "Set FYERS_CLIENT_ID and FYERS_ACCESS_TOKEN, then retry.")
+        loop = asyncio.new_event_loop()
+        try:
+            tok = loop.run_until_complete(get_upstox_access_token("upstox-service-account"))
+        finally:
+            loop.close()
+        if not tok:
+            print("ERROR: UPSTOX_ACCESS_TOKEN not found in environment (.env). "
+                  "Set UPSTOX_ACCESS_TOKEN, then retry.")
             return 2
-        model = fyersModel.FyersModel(client_id=cid, token=tok, log_level="ERROR")
-        disc = FyersInstrumentDiscovery(model, repo)
+        provider = UpstoxMarketDataProvider(access_token=tok)
+        disc = UpstoxInstrumentDiscovery(provider, repo)
         found = disc.discover_options(args.underlying, strikecount=20)
         if not found:
             print(f"No contracts discovered for {args.underlying} "
                   f"(auth or availability issue — no data fabricated).")
             return 0
-        print(f"Discovered {len(found)} {args.underlying} option contracts (live FYERS).")
+        print(f"Discovered {len(found)} {args.underlying} option contracts (live Upstox).")
 
     if args.underlying:
         if args.instr_type in ("future", "futures"):
@@ -215,7 +218,7 @@ def _cmd_instruments(args: argparse.Namespace) -> int:
 
     table = []
     for instr in rows:
-        fy = instr.provider_symbol or to_fyers_symbol(instr)
+        up_sym = instr.provider_symbol or to_upstox_symbol(instr)
         table.append([
             instr.key,
             instr.instrument_type.value,
@@ -683,7 +686,7 @@ def _cmd_research_coverage(args: argparse.Namespace, store) -> int:
 def _cmd_backfill_universe(args: argparse.Namespace) -> int:
     """Bulk historical backfill for a research universe. DATA ONLY, no orders."""
     from .india.backfill import BackfillEngine, format_symbol_summary, BackfillStatus
-    from .india.fyers import FYERSMarketDataProvider
+    from .india.upstox import UpstoxMarketDataProvider
     from .india.instruments import InstrumentRegistry
     from .research.universe import UniverseRegistry, default_universe_registry
     from trading_system.config.settings import settings
@@ -1107,7 +1110,7 @@ def _cmd_instrument_search(args: argparse.Namespace) -> int:
         [i.key, i.instrument_type.value, i.provider_symbol or "-"]
         for i in results
     ]
-    print(tabulate(rows, headers=["internal", "type", "fyers_symbol"], tablefmt="github"))
+    print(tabulate(rows, headers=["internal", "type", "provider_symbol"], tablefmt="github"))
     return 0
 
 

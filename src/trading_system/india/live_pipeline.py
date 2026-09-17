@@ -12,8 +12,8 @@ SAFETY BOUNDARY: this module is DATA + PAPER only. It never places orders and
 never calls brokerage execution. The AI runs on candle close at a configurable
 interval — never per tick.
 
-The pipeline is driven by a normalized ``InternalMarketEvent`` stream, so it does
-not know whether the source was FYERS, Binance, or a replay fixture.
+    The pipeline is driven by a normalized ``InternalMarketEvent`` stream, so it does
+    not know whether the source was Upstox, Binance, or a replay fixture.
 """
 from __future__ import annotations
 
@@ -227,7 +227,7 @@ def bootstrap_historical(
     ``MarketStore`` (idempotent: re-ingesting the same key inserts nothing), and
     seeds the closed-candle pipeline so live ticks continue from the last close.
 
-    Provider-agnostic: works for FYERS, Binance, or any MarketDataProvider.
+    Provider-agnostic: works for Upstox, Binance, or any MarketDataProvider.
 
     Returns a mapping of symbol -> number of NEW rows persisted (0 means already
     present / idempotent).
@@ -243,11 +243,12 @@ def bootstrap_historical(
             continue
         # Persist idempotently via the provider-agnostic storage layer.
         rows = []
-        fy_sym = None
+        # Provider-agnostic symbol resolution for storage (informational only).
+        prov_sym = None
         try:
-            fy_sym = provider._fyers_symbol(sym)
+            prov_sym = provider._upstox_symbol(sym)
         except Exception:
-            fy_sym = None
+            prov_sym = None
         exchange = sym.split(":", 1)[0] if ":" in sym else "UNKNOWN"
         for ts, row in df.iterrows():
             rows.append(

@@ -2,14 +2,12 @@
 from .base import MarketDataProvider
 from .binance import BinanceProvider
 from .stooq import StooqProvider
-from ..india.fyers import FYERSMarketDataProvider
 from ..india.upstox import UpstoxMarketDataProvider
 
 __all__ = [
     "MarketDataProvider",
     "BinanceProvider",
     "StooqProvider",
-    "FYERSMarketDataProvider",
     "UpstoxMarketDataProvider",
 ]
 
@@ -21,8 +19,9 @@ def get_provider(name: str, **kwargs) -> MarketDataProvider:
         return BinanceProvider(**kwargs)
     if name == "stooq":
         return StooqProvider(**kwargs)
-    if name in ("fyers", "india"):
-        return FYERSMarketDataProvider(**kwargs)
-    if name == "upstox":
+    if name in ("upstox", "india", "fyers"):
+        # "india" and the legacy "fyers" alias now resolve to Upstox — the
+        # sole Indian market-data provider. No Fyers credentials or SDK
+        # remain in the system.
         return UpstoxMarketDataProvider(**kwargs)
     raise ValueError(f"Unknown data provider: {name}")

@@ -1,0 +1,1 @@
+x = 1\nprint(x)\n

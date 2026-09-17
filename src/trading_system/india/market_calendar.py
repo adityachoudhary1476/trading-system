@@ -13,7 +13,7 @@ may differ slightly but we keep the conservative equity boundaries as default.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -70,7 +70,9 @@ class TradingCalendar:
     def is_open(self, dt_utc: datetime) -> bool:
         return self.phase(dt_utc) in (SessionPhase.REGULAR, SessionPhase.PRE_MARKET, SessionPhase.POST_MARKET)
 
-    def is_regular_session(self, dt_utc: datetime) -> bool:
+    def is_regular_session(self, dt_utc: datetime | date) -> bool:
+        if isinstance(dt_utc, date) and not isinstance(dt_utc, datetime):
+            dt_utc = datetime.combine(dt_utc, time.min, tzinfo=timezone.utc)
         return self.phase(dt_utc) == SessionPhase.REGULAR
 
     def is_trading_day(self, dt_utc: datetime) -> bool:

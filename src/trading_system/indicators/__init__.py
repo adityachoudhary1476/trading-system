@@ -8,6 +8,9 @@ from .indicators import (
     atr,
     momentum,
     rolling_std,
+    donchian_lower,
+    donchian_upper,
+    volume_sma,
     add_all_indicators,
 )
 
@@ -20,5 +23,8 @@ __all__ = [
     "atr",
     "momentum",
     "rolling_std",
+    "donchian_lower",
+    "donchian_upper",
+    "volume_sma",
     "add_all_indicators",
 ]

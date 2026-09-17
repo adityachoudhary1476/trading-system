@@ -40,17 +40,6 @@ from ..config import log
 from ..data.base import MarketDataProvider
 from ..data.validation import validate_ohlcv
 from ..storage.database import MarketStore
-from .fyers import (
-    FYERSMarketDataProvider,
-    FYERSAuthError,
-    FYERSAPIError,
-    FYERSNetworkError,
-    FYERSRateLimitError,
-    FYERSError,
-)
-from .history_chunking import plan_chunks, DateChunk
-from .instruments import InstrumentRegistry, Instrument
-from .symbol_map import to_fyers_symbol
 from .upstox import (
     UpstoxAuthError,
     UpstoxAPIError,
@@ -58,6 +47,9 @@ from .upstox import (
     UpstoxRateLimitError,
     UpstoxError,
 )
+from .history_chunking import plan_chunks, DateChunk, provider_cap_days
+from .instruments import InstrumentRegistry, Instrument
+from .symbol_map import to_upstox_symbol
 
 
 class BackfillStatus(str, Enum):
@@ -182,15 +174,7 @@ def _chunk_plan(start: pd.Timestamp, end: pd.Timestamp, timeframe: str, provider
     max_days = None
     if provider is not None:
         pname = getattr(provider, "name", "").lower()
-        if pname == "upstox":
-            token = timeframe
-            if token in ("1d", "1w", "1M", "D"):
-                max_days = 365
-            else:
-                max_days = 100
-        elif pname in ("fyers", "india"):
-            from .history_chunking import _fy_cap_days
-            max_days = _fy_cap_days(timeframe)
+        max_days = provider_cap_days(pname, timeframe)
     return plan_chunks(start, end, timeframe, max_days_per_request=max_days)
 
 
@@ -234,7 +218,7 @@ class BackfillEngine:
             instr = self.registry.resolve(symbol)
             res.exchange = instr.internal.exchange
             res.contract_id = getattr(instr, "contract_id", None) or symbol
-            res.provider_symbol = getattr(instr, "provider_symbol", None) or to_fyers_symbol(instr)
+            res.provider_symbol = getattr(instr, "provider_symbol", None) or to_upstox_symbol(instr)
         except Exception as e:  # pragma: no cover - registry is robust
             res.exchange = symbol.split(":", 1)[0] if ":" in symbol else ""
             res.contract_id = symbol
@@ -288,26 +272,26 @@ class BackfillEngine:
                 outcome.rows = len(new_rows)
                 res.fetched += len(rows)
                 res.chunks_ok += 1
-            except (FYERSAuthError, UpstoxAuthError) as e:
+            except (UpstoxAuthError) as e:
                 fatal_auth = True
                 outcome.status = "FAILED"
                 outcome.error = f"AUTH: {e}"
                 dominant_error = dominant_error or "auth"
                 res.chunks_failed += 1
                 res.warnings.append(f"Chunk {i}: authentication failed: {e}")
-            except (FYERSAPIError, FYERSRateLimitError, UpstoxAPIError, UpstoxRateLimitError) as e:
+            except (UpstoxAPIError, UpstoxRateLimitError) as e:
                 outcome.status = "FAILED"
                 outcome.error = f"API: {e}"
                 dominant_error = dominant_error or "api"
                 res.chunks_failed += 1
                 res.warnings.append(f"Chunk {i}: API error: {e}")
-            except (FYERSNetworkError, UpstoxNetworkError) as e:
+            except (UpstoxNetworkError) as e:
                 outcome.status = "FAILED"
                 outcome.error = f"NETWORK: {e}"
                 dominant_error = dominant_error or "network"
                 res.chunks_failed += 1
                 res.warnings.append(f"Chunk {i}: network error: {e}")
-            except (FYERSError, UpstoxError) as e:
+            except (UpstoxError) as e:
                 outcome.status = "FAILED"
                 outcome.error = f"PROVIDER: {e}"
                 dominant_error = dominant_error or "api"
@@ -404,8 +388,7 @@ class BackfillEngine:
                 return self.provider.get_historical(
                     symbol, timeframe, start=start, end=end
                 )
-            except (FYERSAuthError, FYERSAPIError, FYERSRateLimitError, FYERSError,
-                    UpstoxAuthError, UpstoxAPIError, UpstoxRateLimitError, UpstoxError):
+            except (UpstoxAuthError, UpstoxAPIError, UpstoxRateLimitError, UpstoxError):
                 raise  # authoritative; do not retry
             except Exception as e:  # noqa: BLE001 - transient network/parse
                 last = e

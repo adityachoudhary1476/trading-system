@@ -146,9 +146,8 @@ _REDACT_SUBSTRINGS = (
 _REDACT_TRAILING_VALUE_FOR = (
     "UPSTOX_SERVICE_ACCOUNT_TOKEN",
     "UPSTOX_CLIENT_ID",
-    "FYERS_CLIENT_ID",
-    "FYERS_SECRET_KEY",
-    "FYERS_ACCESS_TOKEN",
+    "UPSTOX_ACCESS_TOKEN",
+    "UPSTOX_REFRESH_TOKEN",
 )
 
 
@@ -723,22 +722,22 @@ def _build_controller(
     from trading_system.autonomous.controller import AutonomousController
 
     bot_config = AutonomousBotConfig(
-        bot_id=bot_id,
-        name=f"Paper Autonomous Bot ({bot_id})",
-        mode=BotMode.AUTONOMOUS,
-        trading_mode=TradingMode.PAPER,  # ENFORCED by the Pydantic validator
-        enabled=True,
-        user_constraints=UserConstraints(
-            allowed_symbols=frozenset({"NSE:SBIN", "NSE:TCS", "NSE:INFY"}),
-            allowed_strategy_ids=frozenset(
-                s.strategy_id for s in center.registry.list_strategies()
+            bot_id=bot_id,
+            name=f"Paper Autonomous Bot ({bot_id})",
+            mode=BotMode.AUTONOMOUS,
+            trading_mode=TradingMode.PAPER,  # ENFORCED by the Pydantic validator
+            enabled=True,
+            user_constraints=UserConstraints(
+                allowed_symbols=frozenset({"NSE:NIFTY50"}),
+                allowed_strategy_ids=frozenset(
+                    s.strategy_id for s in center.registry.list_strategies()
+                ),
+                allowed_timeframes=frozenset({"1d"}),
+                allowed_option_underlyings=option_underlyings,
             ),
-            allowed_timeframes=frozenset({"1d"}),
-            allowed_option_underlyings=option_underlyings,
-        ),
-        max_simultaneous_positions=5,
-        source=Source.AUTONOMOUS,
-    )
+            max_simultaneous_positions=5,
+            source=Source.AUTONOMOUS,
+        )
     # Defence-in-depth: re-assert the trading mode at runtime.
     assert bot_config.trading_mode == TradingMode.PAPER, (
         "FATAL: scheduler must run in TradingMode.PAPER; aborting."
@@ -1656,6 +1655,67 @@ def _configure_logging() -> None:
     root.setLevel(level)
 
 
+def _check_remote_kill_switch(controller, persistence, bot_id: str) -> bool:
+    """Sync the kill-switch state from the database on each tick.
+
+    This enables remote start/stop via the Vercel UI: the API persists the
+    kill-switch state to ``autonomous_bots.kill_switch_state``, and this
+    function reads it so the scheduler responds within one scan interval
+    without a restart.
+
+    - If the DB says 'halted', the in-memory kill switch is tripped
+      (fail-closed).
+    - If the DB says 'active' and the in-memory switch was halted
+      with a user-initiated reason (MANUAL / NORMAL_STOP), it is
+      resumed.  Safety-triggered halts (CONSECUTIVE_ERRORS,
+      EMERGENCY_LOSS, DATA_STALENESS) are preserved — fail-closed.
+
+    Returns True if the bot should skip this tick (halted).
+    """
+    try:
+        state = persistence.load_state(bot_id)
+        if not state:
+            return False
+        ks_state = state.get("kill_switch_state", "active")
+        ks_reason = state.get("kill_switch_reason")
+
+        if ks_state == "halted":
+            if not controller.is_halted:
+                from trading_system.autonomous.safety import KillSwitchReason
+                controller.kill_switch.halt(
+                    ks_reason or KillSwitchReason.MANUAL,
+                    detail=ks_reason or "",
+                )
+            logger.info(
+                "remote kill switch HALT detected (reason=%s, at=%s)",
+                ks_reason,
+                state.get("kill_switch_halted_at"),
+            )
+            return True
+
+        # ks_state == "active" — attempt to resume if the in-memory
+        # kill switch was tripped by a user-initiated halt.
+        if controller.is_halted:
+            from trading_system.autonomous.safety import KillSwitchReason
+            current_reason = controller.kill_switch.reason
+            if current_reason in (
+                KillSwitchReason.NORMAL_STOP,
+                KillSwitchReason.MANUAL,
+            ):
+                controller.kill_switch.resume()
+                logger.info("remote kill switch RESUME detected; bot un-halted")
+            else:
+                logger.warning(
+                    "Kill switch remains halted (reason=%s) despite DB "
+                    "state=active; safety halt preserved — fail-closed.",
+                    current_reason,
+                )
+        return False
+    except Exception:
+        logger.debug("Could not reload kill-switch state from DB (non-fatal)")
+        return False
+
+
 def run() -> int:
     """Entrypoint for ``python -m backend.autonomous_scheduler``."""
     _configure_logging()
@@ -1714,7 +1774,14 @@ def run() -> int:
                         "tick skipped: cross-replica lock held by another worker"
                     )
                 else:
-                    result = _run_one_tick(controller)
+                    # Phase 24B — check remote kill-switch state from DB so
+                    # the Vercel Start/Stop buttons take effect within one
+                    # scan interval without a scheduler restart.
+                    if _check_remote_kill_switch(controller, persistence, bot_id):
+                        result = {"result": "skip", "reason": "kill_switch_halted_remote"}
+                        logger.info("tick skipped: remote kill switch active")
+                    else:
+                        result = _run_one_tick(controller)
                     logger.info("tick result: %s", json.dumps(result, default=str))
         except Exception:  # noqa: BLE001
             logger.exception("tick raised; continuing")

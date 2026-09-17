@@ -183,6 +183,9 @@ class IndicatorName(str, Enum):
     BOLLINGER_MIDDLE = "bb_middle"
     BOLLINGER_LOWER = "bb_lower"
     MOMENTUM = "momentum"
+    DONCHIAN_UPPER = "donchian_upper"
+    DONCHIAN_LOWER = "donchian_lower"
+    VOLUME_SMA = "volume_sma"
 
 
 # param -> (type, inclusive_min, inclusive_max, default)
@@ -210,6 +213,9 @@ _PARAM_SPECS: dict[str, dict[str, tuple[type, float, float, float]]] = {
         "window": (int, 2, 500, 20), "num_std": (float, 0.1, 10.0, 2.0),
     },
     IndicatorName.MOMENTUM.value: {"window": (int, 2, 500, 10)},
+    IndicatorName.DONCHIAN_UPPER.value: {"window": (int, 2, 500, 20)},
+    IndicatorName.DONCHIAN_LOWER.value: {"window": (int, 2, 500, 20)},
+    IndicatorName.VOLUME_SMA.value: {"window": (int, 2, 500, 20)},
 }
 
 

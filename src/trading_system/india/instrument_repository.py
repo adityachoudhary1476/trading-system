@@ -2,12 +2,12 @@
 
 The repository keeps a normalized `Instrument` per `InternalSymbol` and supports
 queries (get/ search/ equities/ indices/ derivatives). Provider-specific symbol
-masters (e.g. FYERS CSV) are parsed into the normalized model by the importer, so
+masters (e.g. CSV imports) are parsed into the normalized model by the importer, so
 the rest of the system never depends on a broker's raw master format.
 
-Day 6 extension: derivative discovery (futures / options / expiries) behind a
-provider-independent interface. The FYERS implementation uses the live
-``optionchain`` endpoint (read-only, no orders); see ``FyersInstrumentDiscovery``.
+Derivative discovery (futures / options / expiries) behind a
+provider-independent interface. The Upstox implementation uses the live
+``/option-chain`` endpoint (read-only, no orders); see ``UpstoxInstrumentDiscovery``.
 """
 from __future__ import annotations
 

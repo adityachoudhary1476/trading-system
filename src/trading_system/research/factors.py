@@ -195,9 +195,13 @@ def _build_factors() -> dict[str, Factor]:
 
 
 def _trend_strength(close: pd.Series, w: int) -> pd.Series:
-    idx = pd.Series(np.arange(len(close)), index=close.index)
+    # Relative bar positions within the current window. Spearman correlation
+    # depends only on ranks, so a simple range [0, 1, ..., w-1] is sufficient
+    # and correct for every window (unlike slicing a global idx Series,
+    # which always returned the last w positions — correct only for the
+    # final window).
     return close.rolling(w).apply(
-        lambda x: _spearman(x, idx.iloc[len(idx) - len(x):].values), raw=False
+        lambda x: _spearman(x, np.arange(len(x))), raw=False
     ).astype(float)
 
 

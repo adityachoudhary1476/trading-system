@@ -4,7 +4,7 @@ Covers:
 * futures identity / options identity
 * CE vs PE distinction
 * expiry distinction
-* FYERS symbol resolution (verified format, no guessing)
+* symbol resolution (verified format, no guessing)
 * commodity (MCX) representation
 * database uniqueness (Jun != Jul future, 25000CE != 25000PE)
 * derivative historical normalization (backfill integration w/ mocked provider)
@@ -37,7 +37,7 @@ from trading_system.india.derivatives import (
 )
 from trading_system.india.instrument_repository import InstrumentRepository
 from trading_system.india.backfill import BackfillEngine, BackfillStatus
-from trading_system.india.fyers import FYERSMarketDataProvider
+from trading_system.india.upstox import UpstoxMarketDataProvider
 from trading_system.storage.database import MarketStore
 from trading_system.data.validation import validate_ohlcv, validate_contract_identity
 
@@ -227,14 +227,14 @@ def test_db_uniqueness_jun_vs_jul_future(tmp_path):
         {
             "symbol": "NIFTY25JUNFUT", "timeframe": "1d", "timestamp": base.to_pydatetime(),
             "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
-            "provider": "fyers", "exchange": "NFO", "contract_id": jun.contract_id,
+            "provider": "upstox", "exchange": "NFO", "contract_id": jun.contract_id,
         }
     ]
     rows_jul = [
         {
             "symbol": "NIFTY25JULFUT", "timeframe": "1d", "timestamp": base.to_pydatetime(),
             "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
-            "provider": "fyers", "exchange": "NFO", "contract_id": jul.contract_id,
+            "provider": "upstox", "exchange": "NFO", "contract_id": jul.contract_id,
         }
     ]
     assert store.upsert_many(rows_jun) == 1
@@ -250,7 +250,7 @@ def test_db_uniqueness_ce_vs_pe(tmp_path):
     ts = _ts("2025-12-01").to_pydatetime()
     base = {
         "timeframe": "1d", "timestamp": ts, "open": 1, "high": 2, "low": 0.5,
-        "close": 1.5, "volume": 10, "provider": "fyers", "exchange": "NFO",
+        "close": 1.5, "volume": 10, "provider": "upstox", "exchange": "NFO",
     }
     assert store.upsert_many([{**base, "symbol": "NIFTY25DEC24800CE", "contract_id": ce.contract_id}]) == 1
     assert store.upsert_many([{**base, "symbol": "NIFTY25DEC24800PE", "contract_id": pe.contract_id}]) == 1
@@ -265,7 +265,7 @@ def test_db_idempotent_rerun(tmp_path):
         "symbol": "NIFTY25JUNFUT", "timeframe": "1d",
         "timestamp": _ts("2025-06-01").to_pydatetime(),
         "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
-        "provider": "fyers", "exchange": "NFO", "contract_id": fut.contract_id,
+        "provider": "upstox", "exchange": "NFO", "contract_id": fut.contract_id,
     }
     assert store.upsert_many([row]) == 1
     assert store.upsert_many([row]) == 0  # idempotent
@@ -278,14 +278,14 @@ def test_existing_equity_data_not_clobbered(tmp_path):
         "symbol": "NSE:SBIN", "timeframe": "1d",
         "timestamp": _ts("2025-06-01").to_pydatetime(),
         "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
-        "provider": "fyers", "exchange": "NSE", "contract_id": "NSE:SBIN",
+        "provider": "upstox", "exchange": "NSE", "contract_id": "NSE:SBIN",
     }
     fut = Instrument.future("NFO", "NIFTY", "2025-06-26")
     fut_row = {
         "symbol": "NIFTY25JUNFUT", "timeframe": "1d",
         "timestamp": _ts("2025-06-01").to_pydatetime(),
         "open": 1, "high": 2, "low": 0.5, "close": 1.5, "volume": 10,
-        "provider": "fyers", "exchange": "NFO", "contract_id": fut.contract_id,
+        "provider": "upstox", "exchange": "NFO", "contract_id": fut.contract_id,
     }
     assert store.upsert_many([eq_row]) == 1
     assert store.upsert_many([fut_row]) == 1
@@ -299,7 +299,7 @@ def test_derivative_backfill_normalization(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 5)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, start=None, end=None, **k: frame)
     # Register the derivative so contract_id resolves.
     instr = Instrument.future("NFO", "NIFTY", "2024-01-01", provider_symbol="NFO:NIFTY24JANFUT")
@@ -345,7 +345,7 @@ def test_equity_backfill_still_works(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 3)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, start=None, end=None, **k: frame)
     eng = BackfillEngine(prov, store, max_retries=0)
     res = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + pd.Timedelta(days=2))

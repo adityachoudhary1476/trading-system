@@ -157,12 +157,16 @@ class UpstoxMarketDataProvider(MarketDataProvider):
         return df[["open", "high", "low", "close", "volume"]]
 
     def get_latest_price(self, symbol: str) -> float:
-        up_sym = self._upstox_symbol(symbol)
-        data = self._get(f"/market-quote/quotes?symbol={up_sym}")
-        try:
-            return float(data["data"][up_sym]["last_price"])
-        except (KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"Upstox quote parse failed: {e}")
+            up_sym = self._upstox_symbol(symbol)
+            data = self._get(f"/market-quote/quotes?symbol={up_sym}")
+            try:
+                # Upstox quote endpoint returns data keyed with colon format (NSE_INDEX:Nifty 50)
+                # but the resolver returns pipe format (NSE_INDEX|Nifty 50).
+                # Normalize to colon format for the response key lookup.
+                lookup_key = up_sym.replace("|", ":") if "|" in up_sym else up_sym
+                return float(data["data"][lookup_key]["last_price"])
+            except (KeyError, IndexError, TypeError) as e:
+                raise RuntimeError(f"Upstox quote parse failed: {e}")
 
     def _get(self, path: str, params: Optional[dict] = None) -> dict:
         url = f"{_BASE}{path}"

@@ -1,4 +1,9 @@
-"""Indian market data layer (FYERS/Upstox adapters, instruments, sessions, aggregation)."""
+"""Indian market data layer (Upstox adapter, instruments, sessions, aggregation).
+
+NOTE: FYERS has been removed entirely. Upstox is the sole Indian market-data
+provider. All FYERS credentials, env vars, and the fyers-apiv3 SDK dependency
+have been scrubbed from the codebase.
+"""
 from .instruments import (
     Exchange,
     InstrumentType,
@@ -27,15 +32,6 @@ from .market_calendar import (
 )
 from .candle_aggregator import CandleAggregator, AggregatedBar, timeframe_minutes
 from .events import InternalMarketEvent, EventType
-from .fyers import (
-    FYERSMarketDataProvider,
-    FyersDataSocket,
-    FYERSError,
-    FYERSAuthError,
-    FYERSAPIError,
-    FYERSRateLimitError,
-    FYERSNetworkError,
-)
 from .upstox import (
     UpstoxMarketDataProvider,
     UpstoxDataSocket,
@@ -53,7 +49,6 @@ from .history_chunking import (
 )
 from .instrument_repository import InstrumentRepository
 from .derivatives import DerivativeRequest, to_fyers_derivative_symbol, from_fyers_derivative_symbol
-from .instrument_discovery import FyersInstrumentDiscovery
 from .upstox_discovery import UpstoxInstrumentDiscovery
 from .event_bus import EventBus, EventConsumer
 from .closed_candle_pipeline import (
@@ -90,13 +85,6 @@ __all__ = [
     "timeframe_minutes",
     "InternalMarketEvent",
     "EventType",
-    "FYERSMarketDataProvider",
-    "FyersDataSocket",
-    "FYERSError",
-    "FYERSAuthError",
-    "FYERSAPIError",
-    "FYERSRateLimitError",
-    "FYERSNetworkError",
     "UpstoxMarketDataProvider",
     "UpstoxDataSocket",
     "UpstoxError",
@@ -112,7 +100,6 @@ __all__ = [
     "DerivativeRequest",
     "to_fyers_derivative_symbol",
     "from_fyers_derivative_symbol",
-    "FyersInstrumentDiscovery",
     "UpstoxInstrumentDiscovery",
     "EventBus",
     "EventConsumer",
