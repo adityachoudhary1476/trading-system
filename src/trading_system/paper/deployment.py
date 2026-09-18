@@ -78,7 +78,7 @@ class PaperDeploymentConfig(BaseModel):
     # When True, StrategySignals may carry an ``options_selection`` and the
     # deployment may open/flatten option positions. When False (default, backward
     # compatible), any options_selection on a signal is rejected by the gate.
-    options_enabled: bool = Field(default=False)
+    options_enabled: bool = Field(default=True)
 
     # Restrict which option rights may be selected. Empty list = both allowed.
     allowed_option_types: list[str] = Field(default_factory=lambda: ["CE", "PE"])

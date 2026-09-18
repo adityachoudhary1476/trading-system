@@ -77,6 +77,7 @@ class Phase23DeploymentPolicy:
                 take_profit_pct=spec.risk.take_profit_pct or 0.06,
                 max_loss_per_trade_pct=0.02,
                 warmup_bars=50,
+                options_enabled=True,
                 strategy_parameters=spec.model_dump(mode="json"),
             )
         except Exception as exc:
