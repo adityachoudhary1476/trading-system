@@ -44,6 +44,14 @@ railway-worker.toml
 trading-system-audit/
 vibetrading-inspection/
 
+# Embedded git submodules removed from index (not needed for deployment)
+# These dirs exist locally for reference but must not be tracked as gitlinks
+agency-agents/
+algo_trading_strategies_india/
+bhav/
+learn-trading-from-x/
+nifty-daily-moves-and-gaps/
+
 # AI Office local SQLite databases (test artifacts)
 .ai-office/*.db
 .ai-office/*.db-journal
