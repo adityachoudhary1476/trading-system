@@ -59,3 +59,4 @@ nifty-daily-moves-and-gaps/
 # OS
 Thumbs.db
 .DS_Store
+src/data/
