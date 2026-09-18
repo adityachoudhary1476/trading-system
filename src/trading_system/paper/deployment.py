@@ -230,7 +230,7 @@ class PaperDeploymentRecord(Base):
     activated_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
     notes = Column(Text, nullable=False, default="")
-    options_enabled = Column(Boolean, nullable=False, default=False)
+    options_enabled = Column(Boolean, nullable=False, default=True)
     allowed_option_types_json = Column(Text, nullable=False, default='["CE","PE"]')
     max_options_contracts_per_trade = Column(Integer, nullable=True)
     strategy_parameters_json = Column(Text, nullable=False, default="{}")
