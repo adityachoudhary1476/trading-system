@@ -497,3 +497,39 @@ class OptionsCapabilityResponse(BaseModel):
     autonomous_execution_active: bool = False
     last_error: Optional[str] = None
     schema_version: int = 1
+
+
+# --------------------------------------------------------------------------- #
+# Phase 1 — Option chain snapshot API models
+# --------------------------------------------------------------------------- #
+class OptionChainRowResponse(BaseModel):
+    """One normalized option-chain row returned by the read-only chain API.
+
+    Fields that are unavailable from the provider are preserved as ``None``
+    (never fabricated).
+    """
+
+    instrument_key: Optional[str] = None
+    strike: float
+    option_type: str  # "CE" or "PE"
+    ltp: Optional[float] = None
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    volume: Optional[int] = None
+    oi: Optional[int] = None
+    change_oi: Optional[int] = None
+    bid_iv: Optional[float] = None
+    ask_iv: Optional[float] = None
+
+
+class OptionChainSnapshotResponse(BaseModel):
+    """Latest validated option-chain snapshot for a symbol + expiry."""
+
+    underlying: str
+    expiry: str
+    spot_price: Optional[float] = None
+    strike_interval: Optional[float] = None
+    rows: list[OptionChainRowResponse] = Field(default_factory=list)
+    validation_status: str = "validated"
+    snapshot_id: Optional[str] = None
+    fetched_at: Optional[str] = None

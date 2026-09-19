@@ -95,7 +95,13 @@ _MONTH_ABBR = (
 
 @dataclass
 class OptionQuote:
-    """Bid/ask/quote for a single strike."""
+    """Bid/ask/quote for a single strike.
+
+    Extended fields (instrument_key, expiry, option_type, ltp, change_oi,
+    bid_iv, ask_iv) are populated by the Phase 1 option-chain provider and
+    are all Optional — legacy callers that only use strike/bid/ask/last
+    are unaffected.
+    """
 
     strike: float
     bid: float
@@ -103,6 +109,14 @@ class OptionQuote:
     last: Optional[float] = None
     volume: int = 0
     open_interest: int = 0
+    # Extended fields for Phase 1 chain snapshots (all optional)
+    instrument_key: Optional[str] = None
+    expiry: Optional[str] = None
+    option_type: Optional[str] = None  # "CE" or "PE"
+    ltp: Optional[float] = None
+    change_oi: Optional[int] = None
+    bid_iv: Optional[float] = None
+    ask_iv: Optional[float] = None
 
     @property
     def mid(self) -> float:
@@ -120,6 +134,10 @@ class OptionsChain:
     strikes: list[float] = field(default_factory=list)
     call_quotes: dict[float, OptionQuote] = field(default_factory=dict)
     put_quotes: dict[float, OptionQuote] = field(default_factory=dict)
+
+    @property
+    def all_quotes(self) -> list[OptionQuote]:
+        return list(self.call_quotes.values()) + list(self.put_quotes.values())
 
     def get_quote(self, strike: float, option_type: OptionType) -> Optional[OptionQuote]:
         if option_type == OptionType.CE:

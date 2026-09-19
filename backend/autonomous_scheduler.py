@@ -750,6 +750,18 @@ def _build_controller(
         except Exception:
             pass
     controller.set_chain_provider(None)
+
+    # Phase B — attach real option providers (discoverer, quote, chain)
+    try:
+        sf = getattr(persistence, "_Session", None) if persistence is not None else None
+        wiring = _build_options_wiring(
+            authenticated=bool(os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN")),
+            session_factory=sf,
+        )
+        _attach_options_wiring(controller, wiring)
+    except Exception:
+        logger.exception("options provider wiring failed — chain disabled")
+
     return controller
 
 
@@ -779,11 +791,12 @@ def _build_options_wiring(
     seed_instruments: Optional[list[Instrument]] = None,
     authenticated: bool = True,
     max_quote_age_seconds: float = 300.0,
+    session_factory=None,
 ) -> "OptionsPhaseBWiring":
     """Build a Phase B wiring with real providers backed by a repository."""
     from backend.options_phase_b import OptionsPhaseBWiring
     from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
-    from trading_system.autonomous.options_selector import CurrentOptionQuoteProvider
+    from trading_system.india.option_quotes import CurrentOptionQuoteProvider
     from trading_system.india.upstox import UpstoxMarketDataProvider
 
     repo = repository or InstrumentRepository()
@@ -799,11 +812,23 @@ def _build_options_wiring(
         max_quote_age_seconds=max_quote_age_seconds,
     )
 
+    # Phase 1 — option chain provider (real Upstox, fail-closed)
+    from trading_system.india.upstox_discovery import UpstoxInstrumentDiscovery
+    from trading_system.india.option_chain_provider import UpstoxOptionChainProvider
+
+    chain_provider = None
+    if access_token and authenticated:
+        upstox_discovery = UpstoxInstrumentDiscovery(provider=upstox)
+        chain_provider = UpstoxOptionChainProvider(
+            discovery=upstox_discovery,
+            session_factory=session_factory,
+        )
+
     return OptionsPhaseBWiring(
         repository=repo,
         discoverer=discoverer,
         quote_provider=quote_provider,
-        discovery=None,
+        chain_provider=chain_provider,
     )
 
 

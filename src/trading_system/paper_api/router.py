@@ -60,6 +60,8 @@ from .models import (
     HealthEndpointResponse,
     HealthResponse,
     LifecycleRequest,
+    OptionChainRowResponse,
+    OptionChainSnapshotResponse,
     OptionsCapabilityResponse,
     OptionsProviderStatus,
     PROVIDER_STATUS_AVAILABLE,
@@ -245,6 +247,13 @@ class PaperAPIRouter:
             r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/options-capability$",
             frozenset({"GET"}),
             self._route_options_capability,
+        )
+        # Phase 1 — Read-only option chain snapshot (observational only).
+        self._add(
+            r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/options/chain/"
+            r"(?P<symbol>[A-Za-z0-9:]+)$",
+            frozenset({"GET"}),
+            self._route_options_chain,
         )
 
         # Phase 6 — Autonomous Trading Operations Center
@@ -910,6 +919,73 @@ class PaperAPIRouter:
             capable=capable,
             autonomous_execution_active=False,
             last_error=last_error,
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_options_chain(self, ctx: RequestContext) -> ResponseEnvelope:
+        """Read-only option chain snapshot (Phase 1, observational only).
+
+        Returns the latest validated snapshot from the Upstox option-chain
+        provider for the given symbol and expiry. Does NOT place orders,
+        does NOT change the scheduler, does NOT enable autonomous option
+        execution.
+        """
+        symbol = ctx.params["symbol"]
+        expiry = ctx.query.get("expiry", "")
+
+        controller = self._controller
+        if controller is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="autonomous controller not attached",
+                status=404,
+            )
+
+        try:
+            chain_provider = controller._chain_provider  # type: ignore
+        except AttributeError:
+            chain_provider = None
+
+        if chain_provider is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="option chain provider is not attached",
+                status=404,
+            )
+
+        underlying = symbol.upper().replace("NSE:", "")
+        chain = chain_provider.get_chain(underlying, expiry)
+        if chain is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message=f"no option chain available for {underlying}",
+                status=404,
+            )
+
+        rows = [
+            OptionChainRowResponse(
+                instrument_key=q.instrument_key,
+                strike=round(q.strike, 2),
+                option_type=q.option_type or "",
+                ltp=q.ltp,
+                bid=q.bid if q.bid else None,
+                ask=q.ask if q.ask else None,
+                volume=q.volume,
+                oi=q.open_interest,
+                change_oi=q.change_oi,
+                bid_iv=q.bid_iv,
+                ask_iv=q.ask_iv,
+            )
+            for q in chain.all_quotes
+        ]
+
+        body = OptionChainSnapshotResponse(
+            underlying=chain.underlying,
+            expiry=chain.expiry,
+            spot_price=chain.spot_price,
+            strike_interval=chain.strike_interval,
+            rows=rows,
+            validation_status="validated",
         )
         return ResponseEnvelope(status=200, body=_safe_dump(body))
 

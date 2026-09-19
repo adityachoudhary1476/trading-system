@@ -683,7 +683,7 @@ class EvidenceStore:
             s.commit()
 
     # --- schema migration (Phase 17) ---
-    CURRENT_SCHEMA_VERSION = 4
+    CURRENT_SCHEMA_VERSION = 5
 
     def ensure_schema_current(self) -> int:
         """Idempotent forward migration. Returns the resulting schema version.
@@ -701,7 +701,9 @@ class EvidenceStore:
           * v4 — Phase 23 added scheduler heartbeat columns to ``paper_deployments``
             (``last_tick_at``, ``last_successful_tick_at``, ``last_market_data_at``,
             ``last_decision_at``, ``last_execution_at``, ``worker_id``,
-            ``worker_version``).
+            (``worker_version``).
+          * v5 — Phase 1 option chain snapshot tables (``option_chain_snapshots``,
+            ``option_chain_rows``) for NIFTY option-chain data foundation.
 
         In addition to version-gated migrations, idempotent column fixes are
         applied unconditionally on every call so that databases which were
@@ -713,6 +715,11 @@ class EvidenceStore:
         every startup; safe to re-run after partial failure.
         """
         from sqlalchemy import inspect as _inspect, text as _text
+        # Register Phase 1 option-chain models so create_all() creates the tables
+        from ..paper.option_chain_models import (  # noqa: F401
+            OptionChainSnapshotRecord,
+            OptionChainRowRecord,
+        )
 
         inspector = _inspect(self.engine)
         # ``create_all`` first: this adds any missing TABLES (e.g. when the
@@ -775,6 +782,12 @@ class EvidenceStore:
                         "DEFAULT '{}'"
                     ))
 
+        if current < 5:
+            # v5 — Phase 1 option chain snapshot tables
+            # Tables are created idempotently by Base.metadata.create_all()
+            # above; this step exists to bump the schema version for databases
+            # that predate the option-chain models.
+            pass
         self._set_schema_version(self.CURRENT_SCHEMA_VERSION)
         return self.CURRENT_SCHEMA_VERSION
 

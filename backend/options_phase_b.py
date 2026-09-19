@@ -14,6 +14,7 @@ Design constraints:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -70,7 +71,7 @@ class OptionsPhaseBWiring:
     repository: InstrumentRepository
     discoverer: CurrentOptionDiscoverer
     quote_provider: Any  # CurrentOptionQuoteProvider (duck-typed)
-    discovery: Optional[Any] = None
+    chain_provider: Optional[Any] = None  # Phase 1: UpstoxOptionChainProvider
 
     # Paper-only safety: never instantiate a synthetic chain provider.
     _synthetic_chain_attached: bool = field(default=False, repr=False)
@@ -104,6 +105,18 @@ class OptionsPhaseBWiring:
             controller.set_quote_provider(self.quote_provider)
         else:
             controller.set_quote_provider(None)
+
+        # Phase 1 — attach real option-chain provider (reject synthetic)
+        if self.chain_provider is not None:
+            from trading_system.autonomous.options_contract import (
+                InMemoryOptionsChainProvider,
+            )
+            if isinstance(self.chain_provider, InMemoryOptionsChainProvider):
+                logging.getLogger(__name__).warning(
+                    "rejecting synthetic InMemoryOptionsChainProvider"
+                )
+                return False
+            controller.set_chain_provider(self.chain_provider)
         return True
 
     def verify_deployment_capability(

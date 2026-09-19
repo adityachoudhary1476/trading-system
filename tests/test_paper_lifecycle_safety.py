@@ -506,6 +506,8 @@ class TestPhase18Safety:
                 "snapshot.py",
                 # Phase 23: liveness computation - pure heartbeat logic, no broker.
                 "liveness.py",
+                # Phase 1: option-chain snapshot persistence models — pure ORM.
+                "option_chain_models.py",
             ), f"{path.name} does not reference PaperBroker"
             # The runner MUST NOT import FyersBroker / UpstoxBroker etc.
             for live in ("FyersBroker", "UpstoxBroker", "ZerodhaBroker", "LiveBroker"):

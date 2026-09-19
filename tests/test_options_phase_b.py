@@ -176,7 +176,7 @@ def _build_wiring(
         repository=repository,
         discoverer=discoverer,
         quote_provider=quote_provider,
-        discovery=None,
+        chain_provider=None,
     )
 
 
