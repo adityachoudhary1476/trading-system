@@ -3,7 +3,10 @@ import sys
 from sqlalchemy import create_engine, text
 
 db_url = os.environ.get('MARKET_DATA_DB_URL')
-print(f"DB URL: {db_url[:60] if db_url else 'NOT SET'}", flush=True)
+if not db_url:
+    print("MARKET_DATA_DB_URL not set — skipping update_notes.py", flush=True)
+    sys.exit(0)
+print(f"DB URL: {db_url[:60]}", flush=True)
 
 engine = create_engine(db_url)
 with engine.connect() as conn:
