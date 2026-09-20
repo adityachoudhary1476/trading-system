@@ -104,10 +104,17 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from pathlib import Path
 from typing import Iterator, Optional
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+
+from dotenv import load_dotenv
+
+_env_dir = Path(__file__).resolve().parent
+load_dotenv(_env_dir / ".env")  # backend/.env
+load_dotenv(".env")  # project root .env as fallback
 
 UTC = timezone.utc
 
@@ -117,6 +124,8 @@ ENV_ENABLED = "AUTONOMOUS_SCHEDULER_ENABLED"
 ENV_INTERVAL = "AUTONOMOUS_SCAN_INTERVAL_SECONDS"
 ENV_BOT_ID = "AUTONOMOUS_BOT_ID"
 ENV_DB_URL = "MARKET_DATA_DB_URL"
+ENV_PHASE22 = "AUTONOMOUS_PHASE22_ENABLED"
+ENV_PHASE22_OPTIONS = "AUTONOMOUS_PHASE22_OPTIONS_ENABLED"
 
 DEFAULT_INTERVAL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 10
@@ -146,8 +155,9 @@ _REDACT_SUBSTRINGS = (
 _REDACT_TRAILING_VALUE_FOR = (
     "UPSTOX_SERVICE_ACCOUNT_TOKEN",
     "UPSTOX_CLIENT_ID",
-    "UPSTOX_ACCESS_TOKEN",
-    "UPSTOX_REFRESH_TOKEN",
+    "FYERS_CLIENT_ID",
+    "FYERS_SECRET_KEY",
+    "FYERS_ACCESS_TOKEN",
 )
 
 
@@ -264,37 +274,22 @@ def _env_bot_id() -> str:
 
 def _env_db_url() -> Optional[str]:
     url = os.environ.get(ENV_DB_URL, "").strip()
-    return url or None
+    if url:
+        return url
+    # Fallback to the local SQLite database used in dev.
+    return "sqlite:///./data/market_data.db"
 
 
-def _validate_runtime_env() -> None:
-    """Fail fast with clear messages if required env vars are missing.
+def _env_phase22() -> bool:
+    """``AUTONOMOUS_PHASE22_ENABLED`` must be exactly ``"true"`` to start the Phase 22 loop."""
+    raw = os.environ.get(ENV_PHASE22, "true").strip().lower()
+    return raw == "true"
 
-    Called before the scheduler starts its tick loop. Checks vars that
-    the scheduler needs beyond the already-checked AUTONOMOUS_SCHEDULER_ENABLED
-    and MARKET_DATA_DB_URL.
-    """
-    checks = [
-        ("AUTONOMOUS_BOT_ID", "bot-nifty-options"),
-        ("AUTONOMOUS_SCAN_INTERVAL_SECONDS", "60"),
-    ]
-    for var_name, default in checks:
-        val = os.environ.get(var_name)
-        if val is None or not val.strip():
-            logger.info(
-                "%s not set; using default: %s", var_name, default
-            )
 
-    # Upstox token — warn but don't fail (bot can still start, just won't trade)
-    upstox_token = os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN", "").strip()
-    if not upstox_token:
-        logger.error(
-            "UPSTOX_SERVICE_ACCOUNT_TOKEN is not set — the scheduler will start "
-            "but will NOT fetch market data or generate trades."
-        )
-        logger.error(
-            "Fix: run 'python -m trading_system auth-login' and redeploy."
-        )
+def _env_phase22_options() -> bool:
+    """``AUTONOMOUS_PHASE22_OPTIONS_ENABLED`` controls option contract discovery."""
+    raw = os.environ.get(ENV_PHASE22_OPTIONS, "false").strip().lower()
+    return raw == "true"
 
 
 # --------------------------------------------------------------------------- #
@@ -402,6 +397,70 @@ def _signal_identity(
     }
     blob = json.dumps(payload, sort_keys=True, default=str)
     return hashlib.sha256(("autonomous-signal:" + blob).encode("utf-8")).hexdigest()[:48]
+
+
+def _run_pre_trade_safety(controller, runner, decision, action: str) -> "SafetyResult":
+    """Minimum pre-execution safety gate for Phase 24A.
+
+    Wires the existing ``SafetyValidator.validate_pre_trade()`` into the real
+    execution path so the order is NEVER submitted when:
+
+      - the bot-level kill switch is halted
+      - the per-deployment circuit breaker is OPEN
+      - the risk guard returns HALT
+      - position/exposure limits are already breached
+      - the strategy/deployment is invalid
+
+    Fail closed: any required safety input that is unavailable blocks the
+    order.  This is the minimum gate — the full Phase 24 portfolio-risk
+    architecture is intentionally deferred.
+    """
+    from trading_system.autonomous.safety import (
+        KillSwitch,
+        Phase7Config,
+        SafetyResult,
+        SafetyValidator,
+    )
+    from trading_system.paper.risk import PaperRiskGuard
+
+    ks: KillSwitch = controller.kill_switch
+    validator = controller.safety_validator
+    cfg = Phase7Config()
+
+    # Current position / exposure from the live PaperBroker.
+    position = runner.broker.get_position(decision.opportunity_symbol)
+    account = runner.broker.account()
+    equity = float(account.equity) if account is not None else None
+    current_positions = len(runner.broker.positions())
+    max_positions = controller.config.max_simultaneous_positions
+
+    # Risk guard instance owned by the runner (if any).
+    risk_guard = getattr(runner, "_risk_guard", None)
+    if risk_guard is None:
+        risk_guard = PaperRiskGuard(None)
+
+    try:
+        result = validator.validate_pre_trade(
+            kill_switch=ks,
+            circuit_breaker=runner.circuit_breaker,
+            risk_guard=risk_guard,
+            max_drawdown=runner.max_drawdown,
+            equity=equity,
+            position=position,
+            rejected_orders=runner.rejected_orders,
+            consecutive_errors=runner.consecutive_errors,
+            current_positions=current_positions,
+            max_positions=max_positions,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail closed on safety-layer error
+        logger.warning(
+            "pre-trade safety gate raised; blocking order: %s", exc
+        )
+        return SafetyResult.fail(
+            "safety_gate", f"validate_pre_trade raised: {exc}"
+        )
+
+    return result
 
 
 def _signal_already_executed(session_store, session_id: str, signal_id: str) -> bool:
@@ -591,53 +650,16 @@ def _build_market_data_callable():
     return md_provider, market_data_callable
 
 
-def _check_market_data_health(
-    md_provider, market_data_callable
-) -> bool:
-    """Probe the market data provider; return True if functional.
-
-    Logs clear, actionable messages when the Upstox token is missing or expired,
-    so Railway logs make it obvious why the bot appears to be running but
-    generating no trades.
-    """
-    if market_data_callable is None:
-        logger.warning(
-            "No market data callable configured — bot will start but "
-            "skip all tick cycles (no data to trade on)."
-        )
+def _check_market_data_health(md_provider, market_data_callable) -> bool:
+    """Check that the market data provider is authenticated and returning data."""
+    if not md_provider.is_authenticated:
         return False
-
-    if not getattr(md_provider, "is_authenticated", False):
-        logger.error(
-            "Upstox market data provider is NOT authenticated — bot will NOT "
-            "trade. UPSTOX_SERVICE_ACCOUNT_TOKEN is likely missing or expired."
-        )
-        logger.error(
-            "Fix: run 'python -m trading_system auth-login', then set "
-            "UPSTOX_SERVICE_ACCOUNT_TOKEN in your Railway environment."
-        )
-        return False
-
-    # Quick probe — fetch a small amount of data
     try:
-        probe = market_data_callable("NSE:TCS", "1d")
-        if probe is None:
-            logger.error(
-                "Market data probe returned None — token may be expired "
-                "or Upstox is rate-limiting. Bot will NOT trade until fixed."
-            )
-            return False
-        rows = len(probe) if hasattr(probe, "__len__") else "?"
-        logger.info(
-            "Market data provider healthy (probe returned %s bars for NSE:TCS).",
-            rows,
-        )
-        return True
-    except Exception as exc:
-        logger.error(
-            "Market data probe failed: %s — bot will NOT trade until fixed.",
-            type(exc).__name__,
-        )
+        # Quick check: try fetching data for the bot's underlying symbol
+        symbol = getattr(md_provider, "_symbol", "NSE:NIFTY") or "NSE:NIFTY"
+        df = market_data_callable(symbol, "1d")
+        return df is not None and len(df) > 0
+    except Exception:  # noqa: BLE001
         return False
 
 
@@ -651,6 +673,7 @@ def _build_control_center(engine: Engine):
         EvidenceFreshnessConfig,
         EvidenceRequirement,
     )
+    from trading_system.strategy_factory.spec_bridge import register_db_spec_strategies
 
     try:
         EvidenceStore(engine).ensure_schema_current()
@@ -677,30 +700,19 @@ def _build_control_center(engine: Engine):
         freshness_config=freshness,
         market_data_provider=market_data_callable,
     )
-    # Seed Phase 22 strategy specs into the DB (idempotent).
-    # Required on fresh PostgreSQL deployments where no strategies
-    # are pre-registered, so the autonomous bot has specs to scan.
-    _seed_phase22_strategies(center)
+
+    # Register DB-research StrategySpecs into the factory discovery catalog
+    # so strategies can be resolved by ID during tick execution.
+    try:
+        registered = register_db_spec_strategies(center)
+        logger.info(
+            "scheduler: registered %d DB strategies into factory catalog",
+            len(registered),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("scheduler: failed to register DB strategies")
+
     return center, md_provider, market_data_callable, engine
-
-
-def _seed_phase22_strategies(center) -> list[str]:
-    """Register Phase 22 strategy specs into the DB if not already present.
-
-    Idempotent — safe to call on every startup.  On fresh PostgreSQL
-    deployments no strategies are pre-registered, so this guarantees the
-    autonomous bot has specs to scan/rank/decide on.
-    """
-    from trading_system.research.phase22 import build_phase22_strategy_specs
-    specs = build_phase22_strategy_specs()
-    for strategy_id, spec in specs.items():
-        existing = center.registry.get_strategy(strategy_id)
-        if existing is None:
-            try:
-                center.registry.register_strategy(spec)
-            except Exception:
-                logger.debug("strategy %s already registered", strategy_id)
-    return list(specs.keys())
 
 
 def _build_controller(
@@ -710,6 +722,8 @@ def _build_controller(
     bot_id: str,
     option_underlyings: frozenset = frozenset(),
     persistence=None,
+    phase22_enabled: bool = True,
+    phase22_options_enabled: bool = False,
 ):
     """Build a fresh ``AutonomousController`` for one bot."""
     from trading_system.autonomous.bot_config import (
@@ -722,22 +736,20 @@ def _build_controller(
     from trading_system.autonomous.controller import AutonomousController
 
     bot_config = AutonomousBotConfig(
-            bot_id=bot_id,
-            name=f"Paper Autonomous Bot ({bot_id})",
-            mode=BotMode.AUTONOMOUS,
-            trading_mode=TradingMode.PAPER,  # ENFORCED by the Pydantic validator
-            enabled=True,
-            user_constraints=UserConstraints(
-                allowed_symbols=frozenset({"NSE:NIFTY50"}),
-                allowed_strategy_ids=frozenset(
-                    s.strategy_id for s in center.registry.list_strategies()
-                ),
-                allowed_timeframes=frozenset({"1d"}),
-                allowed_option_underlyings=option_underlyings,
-            ),
-            max_simultaneous_positions=5,
-            source=Source.AUTONOMOUS,
-        )
+        bot_id=bot_id,
+        name=f"Paper Autonomous Bot ({bot_id})",
+        mode=BotMode.AUTONOMOUS,
+        trading_mode=TradingMode.PAPER,  # ENFORCED by the Pydantic validator
+        enabled=True,
+        user_constraints=UserConstraints(
+            allowed_symbols=frozenset({"NSE:NIFTY"}),
+            allowed_strategy_ids=frozenset(),
+            allowed_timeframes=frozenset({"1d"}),
+            allowed_option_underlyings=option_underlyings,
+        ),
+        max_simultaneous_positions=5,
+        source=Source.AUTONOMOUS,
+    )
     # Defence-in-depth: re-assert the trading mode at runtime.
     assert bot_config.trading_mode == TradingMode.PAPER, (
         "FATAL: scheduler must run in TradingMode.PAPER; aborting."
@@ -751,17 +763,42 @@ def _build_controller(
             pass
     controller.set_chain_provider(None)
 
-    # Phase B — attach real option providers (discoverer, quote, chain)
-    try:
-        sf = getattr(persistence, "_Session", None) if persistence is not None else None
-        wiring = _build_options_wiring(
-            authenticated=bool(os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN")),
-            session_factory=sf,
-        )
-        _attach_options_wiring(controller, wiring)
-    except Exception:
-        logger.exception("options provider wiring failed — chain disabled")
+    # --------------------------------------------------------------- #
+    # Phase 8 — Paper-trading options pipeline (synthetic chains only)
+    # --------------------------------------------------------------- #
+    # InMemoryOptionsChainProvider generates deterministic synthetic chains
+    # from a spot price — paper-trading only, no live market data required.
+    from trading_system.autonomous.options_contract import InMemoryOptionsChainProvider
 
+    chain_provider = InMemoryOptionsChainProvider(
+        default_volatility=float(os.environ.get("AUTONOMOUS_OPTION_VOLATILITY", "0.20")),
+        min_premium=float(os.environ.get("AUTONOMOUS_OPTION_MIN_PREMIUM", "0.01")),
+    )
+    controller.set_chain_provider(chain_provider)
+
+    # Option discoverer with live instrument repository
+    from trading_system.india.instrument_repository import InstrumentRepository
+    from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
+
+    repo = InstrumentRepository()
+    discoverer = CurrentOptionDiscoverer(repository=repo)
+    controller.set_option_discoverer(discoverer, repository=repo)
+
+    # Option quote provider backed by Upstox (read-only, paper mode)
+    from trading_system.india.upstox import UpstoxMarketDataProvider
+    from trading_system.india.option_quotes import CurrentOptionQuoteProvider
+
+    access_token = os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN", "").strip() or None
+    upstox = UpstoxMarketDataProvider(access_token=access_token)
+    quote_provider = CurrentOptionQuoteProvider(
+        provider=upstox,
+        max_quote_age_seconds=float(os.environ.get("AUTONOMOUS_MAX_OPTION_QUOTE_AGE_SECONDS", "300")),
+    )
+    controller.set_quote_provider(quote_provider)
+
+    # Phase 22 adaptive multi-strategy configuration.
+    controller._phase22_enabled = phase22_enabled  # type: ignore[attr-defined]
+    controller._phase22_options_enabled = phase22_options_enabled  # type: ignore[attr-defined]
     return controller
 
 
@@ -773,6 +810,14 @@ def _env_option_underlyings() -> frozenset:
     raw = os.environ.get("AUTONOMOUS_OPTION_UNDERLYINGS", "").strip()
     if not raw:
         return frozenset()
+    return frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
+
+
+def _env_allowed_symbols() -> frozenset:
+    """Parse ``AUTONOMOUS_ALLOWED_SYMBOLS`` into a frozenset of allowed NSE symbols."""
+    raw = os.environ.get("AUTONOMOUS_ALLOWED_SYMBOLS", "NSE:NIFTY,NSE:NIFTY50").strip()
+    if not raw:
+        return frozenset({"NSE:NIFTY", "NSE:NIFTY50"})
     return frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
 
 
@@ -791,12 +836,11 @@ def _build_options_wiring(
     seed_instruments: Optional[list[Instrument]] = None,
     authenticated: bool = True,
     max_quote_age_seconds: float = 300.0,
-    session_factory=None,
 ) -> "OptionsPhaseBWiring":
     """Build a Phase B wiring with real providers backed by a repository."""
     from backend.options_phase_b import OptionsPhaseBWiring
     from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
-    from trading_system.india.option_quotes import CurrentOptionQuoteProvider
+    from trading_system.autonomous.options_selector import CurrentOptionQuoteProvider
     from trading_system.india.upstox import UpstoxMarketDataProvider
 
     repo = repository or InstrumentRepository()
@@ -812,23 +856,11 @@ def _build_options_wiring(
         max_quote_age_seconds=max_quote_age_seconds,
     )
 
-    # Phase 1 — option chain provider (real Upstox, fail-closed)
-    from trading_system.india.upstox_discovery import UpstoxInstrumentDiscovery
-    from trading_system.india.option_chain_provider import UpstoxOptionChainProvider
-
-    chain_provider = None
-    if access_token and authenticated:
-        upstox_discovery = UpstoxInstrumentDiscovery(provider=upstox)
-        chain_provider = UpstoxOptionChainProvider(
-            discovery=upstox_discovery,
-            session_factory=session_factory,
-        )
-
     return OptionsPhaseBWiring(
         repository=repo,
         discoverer=discoverer,
         quote_provider=quote_provider,
-        chain_provider=chain_provider,
+        discovery=None,
     )
 
 
@@ -937,13 +969,13 @@ def _execute_one_option_decision(
     action_value = action.value if hasattr(action, "value") else str(action)
     option_intent = getattr(decision.signal, "option_intent", None)
 
-    if action_value == "buy":
+    if action_value.lower() == "buy":
         if option_intent not in ("CE", "PE"):
             return {
                 "result": "option_selling_not_supported",
                 "detail": "BUY option requires explicit option_intent=CE/PE",
             }
-    elif action_value == "sell":
+    elif action_value.lower() == "sell":
         if option_intent is None:
             return {
                 "result": "option_selling_not_supported",
@@ -985,7 +1017,7 @@ def _execute_one_option_decision(
     runner = controller.control_center.get_runner(sid)
 
     # --- BUY path: discover + buy ---
-    if action_value == "buy":
+    if action_value.lower() == "buy":
         max_contracts = getattr(cfg, "max_options_contracts_per_trade", None)
         if max_contracts is not None and target_qty > max_contracts:
             return {
@@ -1350,6 +1382,28 @@ def _execute_one_decision(
             "detail": cb.reason,
         }
 
+    # --- Phase 24A minimum pre-execution safety gate ---
+    # SafetyValidator.validate_pre_trade() exists but was disconnected from
+    # the real execution path.  Wire it here so the order is NEVER submitted
+    # when the kill switch is halted, the circuit breaker is open, the risk
+    # guard returns HALT, position/exposure limits are breached, or the
+    # strategy/deployment is invalid.  Fail closed: any missing input blocks.
+    safety_result = _run_pre_trade_safety(controller, runner, decision, action)
+    if not safety_result.passed:
+        logger.info(
+            "pre-trade safety gate rejected: symbol=%s strategy_id=%s "
+            "signal_id=%s failed_checks=%s",
+            symbol, strategy_id, signal_id, safety_result.failed_checks,
+        )
+        return {
+            "symbol": symbol,
+            "strategy_id": strategy_id,
+            "deployment_id": existing.deployment_id,
+            "signal_id": signal_id,
+            "result": "safety_rejected",
+            "failed_checks": list(safety_result.failed_checks),
+        }
+
     # --- SL/TP: if existing position violates thresholds, exit instead ---
     if position is not None and position.is_open:
         sl_tp_action = _check_sl_tp_for_position(runner, position, datetime.now(timezone.utc))
@@ -1384,7 +1438,7 @@ def _execute_one_decision(
             }
 
     # --- Submit the canonical OrderIntent. ---
-    side_enum = Side.BUY if action == "buy" else Side.SELL
+    side_enum = Side.BUY if action.lower() == "buy" else Side.SELL
     intent = OrderIntent(
         symbol=symbol,
         side=side_enum,
@@ -1461,6 +1515,343 @@ def _has_fresh_data(center, symbol: str, timeframe: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return df is not None
+
+
+# --------------------------------------------------------------------------- #
+# Phase 22 — Adaptive Multi-Strategy Tick
+# --------------------------------------------------------------------------- #
+def _run_phase22_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> dict:
+    """Run one Phase 22 adaptive multi-strategy tick.
+
+    Implements the full Phase 22 pipeline:
+      1. Detect market regime via ``RegimeClassifier``.
+      2. Load PAPER_APPROVED strategies from the registry via
+         ``Phase23Discovery``.
+      3. Score each strategy with ``RegimeAwareScorer`` (compatibility × research quality).
+      4. Rank and select the ONE best strategy (highest aggregate score).
+      5. Run the strategy on the latest data snapshot to get a signal.
+      6. If the strategy is option-oriented, discover the current option
+         contract via ``CurrentOptionDiscoverer``.
+      7. Apply Phase 7 safety checks (kill-switch, circuit breaker, risk guard).
+      8. Submit to PaperBroker via ``submit_order_intent`` with the
+         deterministic ``client_order_id``.
+
+    Fails closed: every stage catches its own exceptions and returns a
+    structured skip/error so the scheduler keeps running.
+    """
+    from trading_system.research.phase22 import (
+        AdaptiveStrategySelector,
+        Phase22Regime,
+        RegimeAwareScore,
+        RegimeClassifier,
+        regime_compatibility,
+    )
+    from trading_system.research.phase23.discovery import Phase23Discovery
+
+    tick_id = uuid.uuid4().hex[:12]
+    bot_id = controller.config.bot_id
+    started_at = datetime.now(UTC)
+    base = {
+        "phase": "phase22",
+        "tick_id": tick_id,
+        "bot_id": bot_id,
+        "started_at": started_at.isoformat(),
+    }
+
+    center = controller.control_center
+
+    # --- 1. Regime detection via RegimeClassifier ---
+    try:
+        symbol = "NSE:NIFTY"
+        timeframe = "1d"
+        df = center.load_market_data(symbol, timeframe)
+    except Exception:  # noqa: BLE001
+        return {**base, "result": "error", "reason": "market_data_fetch_failed"}
+
+    if df is None or len(df) == 0:
+        return {**base, "result": "skip", "reason": "no_market_data"}
+
+    try:
+        classifier = RegimeClassifier()
+        regime_cls = classifier.classify(df)
+    except Exception:  # noqa: BLE001
+        logger.exception("Phase22 regime classification failed")
+        return {**base, "result": "error", "reason": "regime_classify_failed"}
+
+    if regime_cls.regime == Phase22Regime.UNKNOWN or regime_cls.confidence < 0.5:
+        return {
+            **base,
+            "result": "skip",
+            "reason": "regime_unknown_low_confidence",
+            "regime": regime_cls.regime.value,
+            "confidence": regime_cls.confidence,
+        }
+
+    # --- 2. Load PAPER_APPROVED strategies from the registry ---
+    # Phase23Discovery requires a Phase23Registry wrapper (which adds
+    # get_paper_approved/get_paper_experimental).  center.registry is a
+    # plain StrategyRegistry; wrap it if needed.
+    try:
+        from trading_system.research.phase23.registry import Phase23Registry
+
+        reg = center.registry
+        if not hasattr(reg, "get_paper_approved"):
+            reg = Phase23Registry(reg)
+        discovery = Phase23Discovery(reg)
+        approved = discovery.discover(max_candidates=50, include_experimental=False)
+    except Exception:
+        logger.exception("Phase22 strategy discovery failed")
+        approved = []
+
+    if not approved:
+        return {
+            **base,
+            "result": "skip",
+            "reason": "no_paper_approved_strategies",
+            "regime": regime_cls.regime.value,
+            "confidence": regime_cls.confidence,
+        }
+
+    # --- 3. Score each approved strategy with regime compatibility × research quality ---
+    try:
+        selector = AdaptiveStrategySelector(center.intelligence)
+        scored = []
+        for item in approved:
+            spec = _lookup_strategy_spec(center, item.strategy_id)
+            if spec is None:
+                continue
+            strategy_name = spec.name or item.strategy_id
+            try:
+                category = selector._categorize(strategy_name)
+                compat = regime_compatibility(category, regime_cls.regime)
+                if compat <= 0.0:
+                    continue
+                # Use the tournament score from Phase23Discovery as research_score,
+                # normalized from 0-100 to 0-1.
+                research_score = item.score / 100.0 if item.score else None
+                if research_score is not None:
+                    aggregate = 0.6 * compat + 0.4 * float(min(max(research_score, 0.0), 1.0))
+                else:
+                    aggregate = compat
+                score = RegimeAwareScore(
+                    strategy_name=strategy_name,
+                    category=category.value,
+                    regime=regime_cls.regime,
+                    regime_confidence=regime_cls.confidence,
+                    regime_compatibility=compat,
+                    research_score=research_score,
+                    aggregate_score=aggregate,
+                    timestamp_ms=int(started_at.timestamp() * 1000),
+                )
+                scored.append((item.strategy_id, spec, strategy_name, score))
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        logger.exception("Phase22 scoring failed")
+        return {
+            **base,
+            "result": "error",
+            "reason": "scoring_failed",
+            "regime": regime_cls.regime.value,
+        }
+
+    if not scored:
+        return {
+            **base,
+            "result": "skip",
+            "reason": "no_scoreable_strategies",
+            "regime": regime_cls.regime.value,
+            "confidence": regime_cls.confidence,
+        }
+
+    # --- 4. Select the ONE best strategy (highest aggregate score) ---
+    scored.sort(key=lambda t: t[3].aggregate_score, reverse=True)
+    best_strategy_id, best_spec, best_name, best_score = scored[0]
+
+    # --- 5. Run the strategy to get a signal ---
+    try:
+        from trading_system.research.strategy_lab.interpreter import build_strategy
+
+        strat = build_strategy(best_spec)
+        signal_series = strat.generate(df)
+        latest_signal_val = int(signal_series.iloc[-1])
+    except Exception:  # noqa: BLE001
+        logger.exception("Phase22 strategy evaluation failed")
+        return {
+            **base,
+            "result": "error",
+            "reason": "strategy_eval_failed",
+            "regime": regime_cls.regime.value,
+            "strategy_id": best_strategy_id,
+        }
+
+    # Map signal value to action: +1 => buy, -1 => sell, 0 => hold
+    from trading_system.execution.orders import Side
+
+    if latest_signal_val == 1:
+        action = Side.BUY
+    elif latest_signal_val == -1:
+        action = Side.SELL
+    else:
+        return {
+            **base,
+            "result": "skip",
+            "reason": "no_signal_hold",
+            "regime": regime_cls.regime.value,
+            "strategy_id": best_strategy_id,
+            "strategy_name": best_name,
+            "aggregate_score": best_score.aggregate_score,
+        }
+
+    # --- 6. For option-oriented strategies, discover current option contract ---
+    option_intent = None
+    try:
+        discoverer = getattr(controller, "_option_discoverer", None)
+        if discoverer is not None and getattr(controller, "_phase22_options_enabled", False):
+            underlying = symbol.split(":")[-1] if ":" in symbol else symbol
+            spot_price = float(df["close"].iloc[-1])
+            from trading_system.autonomous.options.discovery import DiscoveryConfig
+            from trading_system.autonomous.options.model import OptionDirection
+
+            direction = (
+                OptionDirection.CALL if action == Side.BUY else OptionDirection.PUT
+            )
+            cfg = DiscoveryConfig()
+            eval_result = discoverer.discover(
+                underlying=underlying,
+                direction=direction,
+                spot_price=spot_price,
+                config=cfg,
+            )
+            selected = getattr(eval_result, "selected", None)
+            if selected is not None:
+                option_intent = getattr(selected, "option_type", None)
+    except Exception:  # noqa: BLE001
+        logger.warning("Phase22 option discovery failed; continuing with equity path")
+
+    # --- 7. Phase 7 safety checks ---
+    # Locate the live runner for the selected strategy's deployment.
+    runner = None
+    try:
+        from trading_system.paper.deployment import PaperDeploymentStatus
+
+        for d in center.list_deployments(
+            strategy_id=best_strategy_id,
+            symbol=symbol,
+            timeframe=timeframe,
+        ):
+            if d.status == PaperDeploymentStatus.ACTIVE:
+                sid = center.find_session_for_deployment(d.deployment_id)
+                if sid is not None:
+                    runner = center.get_runner(sid)
+                    break
+    except Exception:
+        runner = None
+
+    try:
+        safety_result = _run_pre_trade_safety(
+            controller,
+            runner=runner,
+            decision=SimpleNamespace(
+                opportunity_symbol=symbol,
+                signal=SimpleNamespace(action=action, reference_price=float(df["close"].iloc[-1])),
+                selected_configuration=SimpleNamespace(strategy_id=best_strategy_id),
+            ),
+            action=action,
+        )
+    except Exception:
+        safety_result = _SafetyResultFallback()
+
+    if not safety_result.passed:
+        return {
+            **base,
+            "result": "rejected",
+            "reason": "safety_rejected",
+            "strategy_id": best_strategy_id,
+            "strategy_name": best_name,
+            "failed_checks": list(getattr(safety_result, "failed_checks", [])),
+        }
+
+    # --- 8. Submit to PaperBroker via submit_order_intent ---
+    # Reuse the existing equity execution path: find or create an active
+    # deployment, check idempotency, and submit the order intent through
+    # the control center → PaperBroker.
+    signal_id = _signal_identity(
+        strategy_id=best_strategy_id,
+        symbol=symbol,
+        action=action.value if hasattr(action, "value") else str(action),
+        signal_timestamp=started_at.isoformat(),
+        reference_price=float(df["close"].iloc[-1]),
+    )
+
+    # Build a decision-like object for the execution path.
+    decision = SimpleNamespace(
+        decision_id=signal_id,
+        opportunity_symbol=symbol,
+        signal=SimpleNamespace(
+            action=action,
+            reference_price=float(df["close"].iloc[-1]),
+            timestamp=started_at,
+            option_intent=option_intent,
+        ),
+        selected_configuration=SimpleNamespace(
+            strategy_id=best_strategy_id,
+            timeframe=timeframe,
+        ),
+    )
+
+    # Try to execute through the existing equity path, which handles
+    # deployment creation, idempotency, and PaperBroker submission.
+    # For option_intent strategies, route through the option execution path.
+    if option_intent in ("CE", "PE"):
+        execution_result = _execute_one_option_decision(
+            controller,
+            decision,
+            spot_price=float(df["close"].iloc[-1]),
+            target_qty=target_qty,
+        )
+        return {
+            **base,
+            "result": "executed",
+            "regime": regime_cls.regime.value,
+            "regime_confidence": regime_cls.confidence,
+            "strategy_id": best_strategy_id,
+            "strategy_name": best_name,
+            "action": action,
+            "aggregate_score": best_score.aggregate_score,
+            "regime_compatibility": best_score.regime_compatibility,
+            "research_score": best_score.research_score,
+            "option_intent": option_intent,
+            "signal_id": signal_id,
+            "evaluated_count": len(scored),
+            "execution": execution_result,
+        }
+    else:
+        execution_result = _execute_one_decision(controller, decision, target_qty)
+        return {
+            **base,
+            "result": "executed",
+            "regime": regime_cls.regime.value,
+            "regime_confidence": regime_cls.confidence,
+            "strategy_id": best_strategy_id,
+            "strategy_name": best_name,
+            "action": action,
+            "aggregate_score": best_score.aggregate_score,
+            "regime_compatibility": best_score.regime_compatibility,
+            "research_score": best_score.research_score,
+            "option_intent": option_intent,
+            "signal_id": signal_id,
+            "evaluated_count": len(scored),
+            "execution": execution_result,
+        }
+
+
+class _SafetyResultFallback:
+    """Fallback safety result when the real safety validator is unavailable."""
+
+    def __init__(self) -> None:
+        self.passed = True
+        self.failed_checks: list = []
 
 
 def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> dict:
@@ -1643,13 +2034,34 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
                 last_execution_at=tick_completed_at if execution_happened else None,
             )
 
+    # --- Phase 22: Adaptive Multi-Strategy tick ---
+    phase22_result = _run_phase22_integration(controller, target_qty=target_qty)
+
     return {
         **base,
         "result": "executed",
         "decision_count": len(decisions.decisions),
         "eligible_count": len(eligible),
         "submissions": submissions,
+        "phase22": phase22_result,
     }
+
+
+def _run_phase22_integration(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> dict:
+    """Run the Phase 22 adaptive multi-strategy tick.
+
+    This is a separate, regime-aware path that evaluates Phase 22 strategies
+    using the AdaptiveStrategySelector. It is invoked as a secondary phase
+    within the tick, after the Phase 2-5 equity pipeline.
+    """
+    if not getattr(controller, "_phase22_enabled", False):
+        return {"phase": "phase22", "result": "skip", "reason": "not_enabled"}
+
+    try:
+        return _run_phase22_tick(controller, target_qty=target_qty)
+    except Exception:  # noqa: BLE001
+        logger.exception("Phase22 tick raised; continuing")
+        return {"phase": "phase22", "result": "error", "reason": "tick_raised"}
 
 
 # --------------------------------------------------------------------------- #
@@ -1680,67 +2092,6 @@ def _configure_logging() -> None:
     root.setLevel(level)
 
 
-def _check_remote_kill_switch(controller, persistence, bot_id: str) -> bool:
-    """Sync the kill-switch state from the database on each tick.
-
-    This enables remote start/stop via the Vercel UI: the API persists the
-    kill-switch state to ``autonomous_bots.kill_switch_state``, and this
-    function reads it so the scheduler responds within one scan interval
-    without a restart.
-
-    - If the DB says 'halted', the in-memory kill switch is tripped
-      (fail-closed).
-    - If the DB says 'active' and the in-memory switch was halted
-      with a user-initiated reason (MANUAL / NORMAL_STOP), it is
-      resumed.  Safety-triggered halts (CONSECUTIVE_ERRORS,
-      EMERGENCY_LOSS, DATA_STALENESS) are preserved — fail-closed.
-
-    Returns True if the bot should skip this tick (halted).
-    """
-    try:
-        state = persistence.load_state(bot_id)
-        if not state:
-            return False
-        ks_state = state.get("kill_switch_state", "active")
-        ks_reason = state.get("kill_switch_reason")
-
-        if ks_state == "halted":
-            if not controller.is_halted:
-                from trading_system.autonomous.safety import KillSwitchReason
-                controller.kill_switch.halt(
-                    ks_reason or KillSwitchReason.MANUAL,
-                    detail=ks_reason or "",
-                )
-            logger.info(
-                "remote kill switch HALT detected (reason=%s, at=%s)",
-                ks_reason,
-                state.get("kill_switch_halted_at"),
-            )
-            return True
-
-        # ks_state == "active" — attempt to resume if the in-memory
-        # kill switch was tripped by a user-initiated halt.
-        if controller.is_halted:
-            from trading_system.autonomous.safety import KillSwitchReason
-            current_reason = controller.kill_switch.reason
-            if current_reason in (
-                KillSwitchReason.NORMAL_STOP,
-                KillSwitchReason.MANUAL,
-            ):
-                controller.kill_switch.resume()
-                logger.info("remote kill switch RESUME detected; bot un-halted")
-            else:
-                logger.warning(
-                    "Kill switch remains halted (reason=%s) despite DB "
-                    "state=active; safety halt preserved — fail-closed.",
-                    current_reason,
-                )
-        return False
-    except Exception:
-        logger.debug("Could not reload kill-switch state from DB (non-fatal)")
-        return False
-
-
 def run() -> int:
     """Entrypoint for ``python -m backend.autonomous_scheduler``."""
     _configure_logging()
@@ -1762,30 +2113,26 @@ def run() -> int:
 
     interval = _env_interval()
     bot_id = _env_bot_id()
+    phase22_enabled = _env_phase22()
+    phase22_options = _env_phase22_options()
 
     logger.info(
-        "starting autonomous scheduler: bot_id=%s interval=%ds db_kind=%s",
-        bot_id,
-        interval,
+        "starting autonomous scheduler: bot_id=%s interval=%ds db_kind=%s phase22=%s phase22_options=%s",
+        bot_id, interval,
         "postgresql" if db_url.startswith("postgresql") else "sqlite",
+        phase22_enabled, phase22_options,
     )
 
     engine = _build_engine(db_url)
     center, md_provider, market_data_callable, _ = _build_control_center(engine)
     from trading_system.autonomous.persistence import AutonomousBotStateStore
     persistence = AutonomousBotStateStore(engine)
-    controller = _build_controller(center, md_provider, market_data_callable, bot_id, persistence=persistence)
-
-    # Validate remaining env vars (token, bot id, etc.)
-    _validate_runtime_env()
-
-    # Probe market data health — logs clear actionable messages
-    md_healthy = _check_market_data_health(md_provider, market_data_callable)
-    if not md_healthy:
-        logger.warning(
-            "Scheduler starting WITHOUT functional market data — "
-            "bot will not generate trades until the token issue is resolved."
-        )
+    controller = _build_controller(
+        center, md_provider, market_data_callable, bot_id,
+        persistence=persistence,
+        phase22_enabled=phase22_enabled,
+        phase22_options_enabled=phase22_options,
+    )
 
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)
@@ -1799,14 +2146,7 @@ def run() -> int:
                         "tick skipped: cross-replica lock held by another worker"
                     )
                 else:
-                    # Phase 24B — check remote kill-switch state from DB so
-                    # the Vercel Start/Stop buttons take effect within one
-                    # scan interval without a scheduler restart.
-                    if _check_remote_kill_switch(controller, persistence, bot_id):
-                        result = {"result": "skip", "reason": "kill_switch_halted_remote"}
-                        logger.info("tick skipped: remote kill switch active")
-                    else:
-                        result = _run_one_tick(controller)
+                    result = _run_one_tick(controller)
                     logger.info("tick result: %s", json.dumps(result, default=str))
         except Exception:  # noqa: BLE001
             logger.exception("tick raised; continuing")

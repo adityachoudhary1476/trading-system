@@ -864,6 +864,14 @@ class AutonomousController(BaseModel):
             timeframe="1d",
             data_provider=self.control_center.load_market_data,
             data_provider_source="control_center.load_market_data",
+            # Daily bars from Upstox are stamped at 00:00 IST (18:30 UTC) —
+            # midnight, never inside the 09:15-15:30 IST regular session. The
+            # default per-bar session gate therefore rejects EVERY symbol on
+            # every tick and the bot can never trade. Daily-bar freshness is
+            # already enforced by ``max_freshness``; the live-session gate is
+            # handled by the scheduler tick itself (``_is_regular_session``),
+            # so it is redundant (and fatal) here.
+            require_regular_session=False,
         )
         self._record_event(AutonomousEventType.SCAN_STARTED, timeframe=config.timeframe)
 

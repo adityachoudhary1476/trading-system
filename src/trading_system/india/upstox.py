@@ -28,10 +28,13 @@ _BASE = "https://api.upstox.com/v2"
 _WS_URL = "wss://ws-api.upstox.com/v2/feed"
 
 _INTERVAL_MAP = {
-    "1m": "1minute", "2m": "1minute", "3m": "1minute", "5m": "5minute",
-    "10m": "5minute", "15m": "15minute", "20m": "15minute", "30m": "30minute",
-    "45m": "30minute", "60m": "1hour", "1h": "1hour", "2h": "1hour",
-    "3h": "1hour", "4h": "1hour", "1d": "day", "1w": "week", "1M": "month",
+    # Upstox v2 historical-candle only accepts 1minute / 30minute /
+    # day / week / month. Map every supported bot timeframe onto one of
+    # those (15m/1h are NOT accepted by the API and raised HTTP 400).
+    "1m": "1minute", "2m": "1minute", "3m": "1minute", "5m": "1minute",
+    "10m": "1minute", "15m": "1minute", "20m": "1minute", "30m": "30minute",
+    "45m": "30minute", "60m": "30minute", "1h": "30minute", "2h": "30minute",
+    "3h": "30minute", "4h": "30minute", "1d": "day", "1w": "week", "1M": "month",
 }
 
 
@@ -91,7 +94,9 @@ class UpstoxMarketDataProvider(MarketDataProvider):
 
     @property
     def is_authenticated(self) -> bool:
-        return bool(self.client_id) and bool(self.access_token)
+        # A raw Upstox API token is sufficient — no client_id (API key) is needed
+        # for read-only market-data endpoints (Bearer token auth only).
+        return bool(self.access_token)
 
     def _resolve(self, internal_symbol: str) -> Instrument:
         return self.registry.resolve(internal_symbol)
@@ -154,6 +159,11 @@ class UpstoxMarketDataProvider(MarketDataProvider):
             df[c] = df[c].astype(float)
         df = df.set_index("epoch")
         df.index.name = "timestamp"
+        # Upstox returns candles newest-first. Every downstream consumer
+        # (indicators, regime/trend analysis, backtester) assumes ascending
+        # chronological order — with ``.iloc[-1]`` as the LATEST bar. Sorting
+        # here keeps the boundary honest instead of silently inverting trends.
+        df = df.sort_index()
         return df[["open", "high", "low", "close", "volume"]]
 
     def get_latest_price(self, symbol: str) -> float:

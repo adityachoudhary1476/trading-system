@@ -21,6 +21,24 @@ from .instrument_repository import InstrumentRepository
 from .upstox import UpstoxMarketDataProvider
 
 
+# Canonical Upstox index instrument keys. Upstox identifies indices by a
+# human-readable name (``NSE_INDEX|Nifty 50``), NOT by the trading symbol
+# (``NSE_INDEX|NIFTY``). Using the trading symbol returns an empty payload /
+# HTTP 404, so the mapping is explicit and verified against the live API.
+_INDEX_INSTRUMENT_KEYS = {
+    "NIFTY": "Nifty 50",
+    "NIFTY50": "Nifty 50",
+    "NIFTY 50": "Nifty 50",
+    "BANKNIFTY": "Nifty Bank",
+    "NIFTYBANK": "Nifty Bank",
+    "NIFTY BANK": "Nifty Bank",
+    "FINNIFTY": "Nifty Fin Service",
+    "NIFTY FIN SERVICE": "Nifty Fin Service",
+    "MIDCPNIFTY": "NIFTY MID SELECT",
+    "MIDCAP": "NIFTY MID SELECT",
+}
+
+
 class UpstoxInstrumentDiscovery:
     """Discover derivative contracts via the Upstox v2 option-chain endpoint."""
 
@@ -31,80 +49,171 @@ class UpstoxInstrumentDiscovery:
     ) -> None:
         self._provider = provider
         self.repo = repo or InstrumentRepository()
+        # instrument_key -> lot_size, learned from /option/contract
+        self._lot_sizes: dict[str, int] = {}
 
     def index_symbol(self, underlying: str) -> str:
-        """Upstox instrument key for the option-chain endpoint.
+        """Upstox instrument key for index/equity option-chain lookups.
 
-        Index underlyings use the ``NSE_INDEX`` segment; equities use ``NSE_EQ``.
-        The option-chain endpoint is called with this key as the path segment.
+        Index underlyings use the canonical ``NSE_INDEX|<Index Name>`` key;
+        equities use ``NSE_EQ|<SYMBOL>``.
         """
-        u = underlying.upper()
-        _INDICES = {"NIFTY", "NIFTY50", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "MIDCAP"}
-        if u in _INDICES:
-            return f"NSE_INDEX|{u}"
+        u = underlying.upper().strip()
+        index_name = _INDEX_INSTRUMENT_KEYS.get(u)
+        if index_name is not None:
+            return f"NSE_INDEX|{index_name}"
         return f"NSE_EQ|{u}"
+
+    # ------------------------------------------------------------------ #
+    # Expiry + chain retrieval
+    # ------------------------------------------------------------------ #
+    def list_expiries(self, underlying: str) -> List[str]:
+        """Expiry dates (ISO, ascending) currently listed for an underlying.
+
+        Uses the read-only ``/option/contract`` endpoint. Returns an empty
+        list on any failure — never fabricates an expiry.
+        """
+        if not self._provider.is_authenticated:
+            return []
+        key = self.index_symbol(underlying)
+        try:
+            resp = self._provider._get("/option/contract", params={"instrument_key": key})
+        except Exception:
+            return []
+        if not isinstance(resp, dict):
+            return []
+        rows = resp.get("data")
+        if not isinstance(rows, list):
+            return []
+        expiries: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            iso = self._coerce_iso(row.get("expiry"))
+            if iso:
+                expiries.add(iso)
+            # learn lot sizes while we are here (chain rows omit them)
+            ik = row.get("instrument_key")
+            lot = row.get("lot_size")
+            if isinstance(ik, str) and lot is not None:
+                try:
+                    self._lot_sizes[ik] = int(lot)
+                except (TypeError, ValueError):
+                    pass
+        return sorted(expiries)
+
+    def fetch_chain_rows(self, underlying: str, expiry: str) -> List[dict]:
+        """Raw ``/option/chain`` rows for one expiry (empty on failure)."""
+        if not self._provider.is_authenticated:
+            return []
+        key = self.index_symbol(underlying)
+        try:
+            resp = self._provider._get(
+                "/option/chain",
+                params={"instrument_key": key, "expiry_date": expiry},
+            )
+        except Exception:
+            return []
+        if not isinstance(resp, dict):
+            return []
+        data = resp.get("data")
+        if isinstance(data, dict):
+            data = data.get("optionChain") or data.get("option_chain") or data.get("records")
+        if not isinstance(data, list):
+            return []
+        return [r for r in data if isinstance(r, dict)]
 
     def discover_options(
         self,
         underlying: str,
         strikecount: int = 20,
+        expiries: int = 2,
     ) -> List[Instrument]:
-        """Fetch the option chain for an underlying and register normalized contracts.
+        """Fetch live option chains and register normalized contracts.
 
-        Returns the list of discovered ``Instrument`` objects (empty on failure /
-        auth error). No orders are placed; the only network call is read-only.
+        Uses the read-only ``/option/chain`` endpoint (which requires an
+        ``expiry_date``) for the nearest ``expiries`` listed expiries.
+        Returns the list of discovered ``Instrument`` objects (empty on
+        failure / auth error). No orders are placed.
         """
         if not self._provider.is_authenticated:
             return []
 
-        key = self.index_symbol(underlying)
-        path = f"/option-chain/{key}"
-
-        try:
-            resp = self._provider._get(path, params={"strikecount": strikecount})
-        except Exception:
+        expiry_list = self.list_expiries(underlying)
+        if not expiry_list:
             return []
-
-        if not isinstance(resp, dict):
-            return []
-
-        data = resp.get("data") or resp
-        if not isinstance(data, dict):
-            return []
-
-        chain = (
-            data.get("optionChain")
-            or data.get("option_chain")
-            or data.get("records")
-        )
-        if not isinstance(chain, list):
-            # Some Upstox responses are dicts keyed by strike
-            if isinstance(chain, dict):
-                chain = list(chain.values())
-            else:
-                return []
 
         discovered: list[Instrument] = []
-        for entry in chain:
-            if not isinstance(entry, dict):
-                continue
-            for leg_key, ot in (("ce", OptionType.CE), ("pe", OptionType.PE)):
-                leg = entry.get(leg_key)
-                if leg is None and entry.get("callOption") is not None:
-                    leg = entry.get("callOption") if leg_key == "ce" else entry.get("putOption")
-                if not isinstance(leg, dict):
-                    continue
-                instr = self._entry_to_instrument(underlying, entry, ot)
-                if instr is not None:
+        seen: set[tuple] = set()
+        for expiry in expiry_list[: max(1, int(expiries))]:
+            rows = self.fetch_chain_rows(underlying, expiry)
+            for entry in rows:
+                for option_type, leg in self.iter_chain_legs(entry):
+                    instr = self._entry_to_instrument(underlying, entry, option_type, leg=leg)
+                    if instr is None:
+                        continue
+                    identity = (
+                        (instr.underlying or "").upper(),
+                        instr.expiry,
+                        instr.strike,
+                        instr.option_type,
+                    )
+                    if identity in seen:
+                        continue
+                    seen.add(identity)
                     self.repo.register(instr)
                     discovered.append(instr)
         return discovered
 
+    @staticmethod
+    def iter_chain_legs(entry: dict):
+        """Yield ``(OptionType, leg_dict)`` for every leg present in a chain row.
+
+        Handles the current Upstox v2 shape (``call_options`` / ``put_options``)
+        as well as the legacy ``ce`` / ``pe`` and ``callOption`` / ``putOption``
+        shapes, so callers never depend on one provider revision.
+        """
+        pairs = (
+            ("ce", "pe", OptionType.CE, OptionType.PE),
+            ("callOption", "putOption", OptionType.CE, OptionType.PE),
+            ("call_options", "put_options", OptionType.CE, OptionType.PE),
+        )
+        for call_key, put_key, ce_type, pe_type in pairs:
+            for key, otype in ((call_key, ce_type), (put_key, pe_type)):
+                leg = entry.get(key)
+                if isinstance(leg, dict):
+                    yield otype, leg
+
+    @staticmethod
+    def leg_field(leg: dict, *names):
+        """Read the first non-None field from a leg, including nested market data.
+
+        Upstox v2 nests quoted values under ``market_data`` /
+        ``option_greeks``; legacy shapes put them at the top level.
+        """
+        nested = [
+            leg.get("market_data"),
+            leg.get("marketData"),
+            leg.get("option_greeks"),
+            leg.get("optionGreeks"),
+        ]
+        for name in names:
+            if leg.get(name) is not None:
+                return leg.get(name)
+            for sub in nested:
+                if isinstance(sub, dict) and sub.get(name) is not None:
+                    return sub.get(name)
+        return None
+
     def _entry_to_instrument(
-        self, underlying: str, entry: dict, option_type: OptionType
+        self,
+        underlying: str,
+        entry: dict,
+        option_type: OptionType,
+        leg: Optional[dict] = None,
     ) -> Optional[Instrument]:
         """Convert one option-chain row into a normalized Instrument."""
-        strike_raw = entry.get("strikePrice") or entry.get("strike")
+        strike_raw = entry.get("strikePrice") or entry.get("strike_price") or entry.get("strike")
         if strike_raw is None:
             return None
         try:
@@ -128,11 +237,15 @@ class UpstoxInstrumentDiscovery:
         ot = "CE" if option_type == OptionType.CE else "PE"
         # Derive the Upstox instrument key if present
         provider_key = None
-        sub = entry.get("ce") if option_type == OptionType.CE else entry.get("pe")
-        if not isinstance(sub, dict):
-            sub = entry.get("callOption") if option_type == OptionType.CE else entry.get("putOption")
-        if isinstance(sub, dict):
-            provider_key = sub.get("instrument_key") or sub.get("instrumentKey")
+        if leg is None:
+            sub = entry.get("ce") if option_type == OptionType.CE else entry.get("pe")
+            if not isinstance(sub, dict):
+                sub = entry.get("callOption") if option_type == OptionType.CE else entry.get("putOption")
+            leg = sub if isinstance(sub, dict) else None
+        if isinstance(leg, dict):
+            provider_key = self.leg_field(leg, "instrument_key", "instrumentKey", "key")
+            if provider_key is None and isinstance(leg.get("market_data"), dict):
+                provider_key = leg["market_data"].get("instrument_key")
 
         instr = Instrument.option(
             "NSE", underlying.upper(), expiry_iso, strike_f, ot,
@@ -140,9 +253,14 @@ class UpstoxInstrumentDiscovery:
         )
         if provider_key:
             instr.provider_symbol = provider_key
-        # Exchange lot size (Phase D)
-        # Try to extract lotSize from the API response; if absent, lot_size stays None.
-        lot_size_raw = entry.get("lotSize") or entry.get("lot_size") or entry.get("lot size")
+        # Exchange lot size (Phase D) — chain rows omit it, so fall back to the
+        # value learned from /option/contract for the same instrument key.
+        lot_size_raw = (
+            entry.get("lotSize")
+            or entry.get("lot_size")
+            or entry.get("lot size")
+            or (self._lot_sizes.get(provider_key) if provider_key else None)
+        )
         if lot_size_raw is not None:
             try:
                 instr.lot_size = int(lot_size_raw)

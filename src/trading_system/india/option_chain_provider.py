@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from collections import Counter
 from dataclasses import dataclass, field
@@ -31,6 +32,12 @@ from .instruments import OptionType
 from .upstox_discovery import UpstoxInstrumentDiscovery
 
 logger = logging.getLogger(__name__)
+
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+class _ExpiryError(ValueError):
+    """Raised when an expiry cannot be parsed into ISO YYYY-MM-DD."""
 
 
 # --------------------------------------------------------------------------- #
@@ -60,6 +67,29 @@ def _to_int(v: Any) -> Optional[int]:
         return int(v)
     except (TypeError, ValueError):
         return None
+
+
+def _leg_value(leg: dict, *names: str) -> Optional[Any]:
+    """Read the first present field from an option leg.
+
+    Upstox v2 nests the quoted values under ``market_data`` (and greeks under
+    ``option_greeks``) while earlier revisions put them at the top level, so
+    look in both places. Falls back to ``0.0``-valued fields so the caller's
+    own validation (positive premium, freshness) still applies.
+    """
+    nested = [
+        leg.get("market_data"),
+        leg.get("marketData"),
+        leg.get("option_greeks"),
+        leg.get("optionGreeks"),
+    ]
+    for name in names:
+        if leg.get(name) is not None:
+            return leg[name]
+        for sub in nested:
+            if isinstance(sub, dict) and sub.get(name) is not None:
+                return sub[name]
+    return None
 
 
 def _normalize_expiry(raw: Any) -> str:
@@ -162,9 +192,9 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
 
     # -- public protocol method --
     def get_chain(self, underlying: str, expiry: str) -> Optional[OptionsChain]:
-        symbol = f"NSE:{underlying.upper()}"
+        symbol = f"NSE:{underlying.upper()}" if ":" not in underlying else underlying.upper()
         try:
-            raw = self._fetch_raw(symbol)
+            raw = self._fetch_raw(symbol, expiry)
         except _AuthError:
             logger.error("option chain fetch: auth failed for %s", symbol)
             return None
@@ -187,14 +217,29 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
         return result.chain
 
     # -- HTTP fetch (reuses UpstoxInstrumentDiscovery) --
-    def _fetch_raw(self, symbol: str) -> Optional[dict]:
-        exchange, raw_symbol, instr_type = self._discovery._parse_symbol(symbol)
-        # Upstox: GET /v3/market/option-chain?symbol=NSE:NIFTY
-        # The _get() helper already prepends the Upstox v3 base URL.
-        key = f"{exchange.upper()}:{raw_symbol}"
+    def _fetch_raw(self, symbol: str, expiry: str = "") -> Optional[dict]:
+        # ``symbol`` arrives either as the full scan key ("NSE:NIFTY") or as a
+        # bare underlying ("NIFTY").  Parse defensively instead of depending on
+        # a discovery helper that no longer exists.
+        raw_symbol = symbol.split(":")[-1].strip().upper() if symbol else ""
+        if not raw_symbol:
+            raise _ExpiryError(f"no listed expiry available for {symbol!r}")
+        # Upstox v2: GET /v2/option/chain?instrument_key=NSE_INDEX|Nifty 50
+        #                                  &expiry_date=YYYY-MM-DD
+        # ``expiry_date`` is REQUIRED by the endpoint (HTTP 400 without it), so
+        # when the caller does not name an expiry we resolve the nearest listed
+        # expiry through the read-only /option/contract endpoint.
+        inst_key = self._discovery.index_symbol(raw_symbol)
+        expiry_iso = _normalize_expiry(expiry) if expiry else ""
+        if not expiry_iso:
+            expiry_iso = self._nearest_expiry(raw_symbol)
+        if not expiry_iso or not _ISO_DATE_RE.match(expiry_iso):
+            # No usable expiry — fail closed (never invent dates).
+            raise _ExpiryError(f"no listed expiry available for {symbol!r}")
+        params = {"instrument_key": inst_key, "expiry_date": expiry_iso}
         resp = self._discovery._provider._get(
-            "/market/option-chain",
-            params={"symbol": key, "strikecount": self.MAX_STRIKES},
+            "/option/chain",
+            params=params,
         )
         if resp is None:
             raise _AuthError("empty or None response from Upstox")
@@ -204,10 +249,27 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
             raise _AuthError(str(errors))
         return resp
 
+    def _nearest_expiry(self, raw_symbol: str) -> str:
+        """Nearest listed expiry (ISO) for an underlying, or ``""``."""
+        lister = getattr(self._discovery, "list_expiries", None)
+        if callable(lister):
+            try:
+                expiries = lister(raw_symbol)
+            except Exception:  # noqa: BLE001
+                expiries = []
+            if expiries:
+                return _normalize_expiry(expiries[0])
+        return ""
+
     # -- normalize + validate --
     def _normalize(self, resp: dict, symbol: str, expiry: str) -> Optional[ChainFetchResult]:
         data = resp.get("data") or resp
-        chain = _extract(data, "optionChain", "option_chain", "records")
+        # v2 API: {"data": [...]} — data IS the chain list
+        # Legacy V2/V3: {"data": {"optionChain": [...]}} — data is a dict
+        if isinstance(data, list):
+            chain = data
+        else:
+            chain = _extract(data, "optionChain", "option_chain", "records")
         if not isinstance(chain, list) or not chain:
             return None  # malformed — fail closed
 
@@ -231,6 +293,21 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
         spot_f = _to_float(
             _extract(data, "spotPrice", "spot_price", "underlyingSpot", "spot")
         )
+        if spot_f is None or spot_f <= 0:
+            # Upstox v2 returns the spot on every chain row, not the envelope.
+            for entry in chain:
+                if isinstance(entry, dict):
+                    spot_f = _to_float(
+                        _extract(
+                            entry,
+                            "underlying_spot_price",
+                            "underlyingSpotPrice",
+                            "underlying_spot",
+                            "spotPrice",
+                        )
+                    )
+                    if spot_f and spot_f > 0:
+                        break
         if spot_f is None or spot_f <= 0:
             spot_f = 0.0
 
@@ -258,7 +335,8 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
                 continue
 
             for leg_key, ot in (("ce", OptionType.CE), ("pe", OptionType.PE),
-                                ("callOption", OptionType.CE), ("putOption", OptionType.PE)):
+                                ("callOption", OptionType.CE), ("putOption", OptionType.PE),
+                                ("call_options", OptionType.CE), ("put_options", OptionType.PE)):
                 leg = entry.get(leg_key)
                 if leg is None:
                     continue
@@ -272,14 +350,14 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
                     )
                     continue
 
-                ltp = _to_float(_extract(leg, "ltp", "lastPrice", "last_price", "last"))
-                bid = _to_float(_extract(leg, "bidPrice", "bid", "bid_price"))
-                ask = _to_float(_extract(leg, "askPrice", "ask", "ask_price"))
-                volume = _to_int(_extract(leg, "volume", "tradedVolume", "traded_volume", "vol"))
-                oi = _to_int(_extract(leg, "oi", "openInterest", "open_interest"))
-                change_oi = _to_int(_extract(leg, "changeOI", "change_oi", "changeinOI", "change_oi"))
-                bid_iv = _to_float(_extract(leg, "bidIv", "bid_iv", "bidIV", "iv_bid"))
-                ask_iv = _to_float(_extract(leg, "askIv", "ask_iv", "askIV", "iv_ask"))
+                ltp = _to_float(_leg_value(leg, "ltp", "lastPrice", "last_price", "last"))
+                bid = _to_float(_leg_value(leg, "bidPrice", "bid", "bid_price"))
+                ask = _to_float(_leg_value(leg, "askPrice", "ask", "ask_price"))
+                volume = _to_int(_leg_value(leg, "volume", "tradedVolume", "traded_volume", "vol"))
+                oi = _to_int(_leg_value(leg, "oi", "openInterest", "open_interest"))
+                change_oi = _to_int(_leg_value(leg, "changeOI", "change_oi", "changeinOI"))
+                bid_iv = _to_float(_leg_value(leg, "bidIv", "bid_iv", "bidIV", "iv_bid", "iv"))
+                ask_iv = _to_float(_leg_value(leg, "askIv", "ask_iv", "askIV", "iv_ask", "iv"))
 
                 # --- validation rules (Step 5) ---
                 if volume is not None and volume < 0:
@@ -303,7 +381,7 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
                     instrument_key=instrument_key,
                     underlying=underlying_clean,
                     expiry=req_expiry,
-                    strike=strike if strike is not None else 0.0,
+                    strike=strike,
                     option_type=ot.value,
                     ltp=ltp,
                     bid=bid,
@@ -317,7 +395,7 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
                 rows.append(row)
 
                 quote = OptionQuote(
-                    strike=strike if strike is not None else 0.0,
+                    strike=strike,
                     bid=bid if bid is not None else 0.0,
                     ask=ask if ask is not None else 0.0,
                     last=ltp,

@@ -16,6 +16,8 @@ from trading_system.india.option_chain_provider import (
     _to_int,
     _normalize_expiry,
     _infer_strike_interval,
+    _ExpiryError,
+    _ISO_DATE_RE,
 )
 from trading_system.india.instruments import OptionType
 
@@ -377,6 +379,151 @@ class TestPersistence:
         assert len(snapshot_records) == 1
         parsed = json.loads(snapshot_records[0].raw_json)
         assert parsed["status"] == "success"
+
+
+# --------------------------------------------------------------------------- #
+# Request format / endpoint / expiry conversion tests
+# --------------------------------------------------------------------------- #
+class TestRequestFormat:
+    """Verify _fetch_raw hits the correct v2 endpoint with correct params."""
+
+    def test_uses_correct_v2_path(self):
+        """The endpoint must be /option/chain — not /market/option-chain or /v3/..."""
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        provider._fetch_raw("NSE:NIFTY", "2025-01-30")
+        call = provider._discovery._provider._get.call_args
+        assert call is not None
+        path = call.args[0] if call.args else call.kwargs.get("path")
+        assert path == "/option/chain"
+        assert path != "/market/option-chain"
+
+    def test_sends_instrument_key_not_symbol(self):
+        """Must send instrument_key=NSE_INDEX|NIFTY, not symbol=NSE:NIFTY."""
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        provider._fetch_raw("NSE:NIFTY", "2025-01-30")
+        params = provider._discovery._provider._get.call_args.kwargs.get("params", {})
+        assert params.get("instrument_key") == "NSE_INDEX|NIFTY"
+        assert "symbol" not in params
+        assert "strikecount" not in params
+
+    def test_sends_expiry_date_param(self):
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        provider._fetch_raw("NSE:NIFTY", "2025-01-30")
+        params = provider._discovery._provider._get.call_args.kwargs.get("params", {})
+        assert params.get("expiry_date") == "2025-01-30"
+
+    def test_empty_expiry_omits_param(self):
+        """health check calls _fetch_raw without expiry."""
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        provider._fetch_raw("NSE:NIFTY", "")
+        params = provider._discovery._provider._get.call_args.kwargs.get("params", {})
+        assert "expiry_date" not in params
+        assert params.get("instrument_key") == "NSE_INDEX|NIFTY"
+
+    def test_nse_symbol_normalized_to_index_key(self):
+        """NSE:NIFTY must be normalized to NSE_INDEX|NIFTY for Upstox."""
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        provider._fetch_raw("NSE:NIFTY", "2025-01-30")
+        params = provider._discovery._provider._get.call_args.kwargs.get("params", {})
+        assert params["instrument_key"] == "NSE_INDEX|NIFTY"
+        assert params["instrument_key"] != "NSE:NIFTY"
+
+
+class TestExpiryConversion:
+    """Expiry conversion at the _fetch_raw boundary (before sending to Upstox)."""
+
+    def test_dd_mmm_yyyy_converted_to_iso(self):
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        provider._fetch_raw("NSE:NIFTY", "30-Jan-2025")
+        params = provider._discovery._provider._get.call_args.kwargs.get("params", {})
+        assert params["expiry_date"] == "2025-01-30"
+
+    def test_already_iso_unchanged(self):
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        provider._fetch_raw("NSE:NIFTY", "2025-01-30")
+        params = provider._discovery._provider._get.call_args.kwargs.get("params", {})
+        assert params["expiry_date"] == "2025-01-30"
+
+    def test_invalid_expiry_raises_and_fails_closed(self):
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        try:
+            provider._fetch_raw("NSE:NIFTY", "not-a-date")
+            assert False, "expected _ExpiryError"
+        except _ExpiryError:
+            pass
+        # get_chain catches the exception and returns None
+        assert provider.get_chain("NIFTY", "not-a-date") is None
+
+    def test_iso_regex_validates_format(self):
+        assert _ISO_DATE_RE.match("2025-01-30")
+        assert not _ISO_DATE_RE.match("30-Jan-2025")
+        assert not _ISO_DATE_RE.match("not-a-date")
+
+
+class TestV2ListFormat:
+    """V2 API returns {"data": [...]} (list directly), vs legacy {"data": {"optionChain": [...]}}."""
+
+    V2_LIST_RESPONSE = {
+        "status": "success",
+        "data": [
+            {
+                "instrument_key": "NSE_INDEX|NIFTY",
+                "expiry_date": "2025-01-30",
+                "strike_price": 18400.0,
+                "ce": {
+                    "instrumentKey": "CE1",
+                    "ltp": 145.3,
+                    "bidPrice": 145.0,
+                    "askPrice": 145.6,
+                    "volume": 1000,
+                    "oi": 5000,
+                    "changeOI": 100,
+                },
+                "pe": {
+                    "instrumentKey": "PE1",
+                    "ltp": 55.7,
+                    "bidPrice": 55.5,
+                    "askPrice": 56.0,
+                    "volume": 800,
+                    "oi": 3000,
+                    "changeOI": 50,
+                },
+            },
+        ],
+    }
+
+    def test_list_format_parsed(self):
+        provider = make_provider(raw_response=self.V2_LIST_RESPONSE)
+        chain = provider.get_chain("NIFTY", "2025-01-30")
+        assert chain is not None
+        assert 18400.0 in chain.call_quotes
+        assert 18400.0 in chain.put_quotes
+        assert chain.call_quotes[18400.0].open_interest == 5000
+        assert chain.put_quotes[18400.0].open_interest == 3000
+        assert len(chain.all_quotes) == 2
+
+
+class TestHealthCheck:
+    def test_healthy_when_data_returned(self):
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        assert provider.is_healthy() is True
+
+    def test_unhealthy_on_exception(self):
+        provider = make_provider(fetch_side_effect=ConnectionError("timeout"))
+        assert provider.is_healthy() is False
+
+    def test_unhealthy_on_auth_error(self):
+        provider = make_provider(
+            raw_response={"status": "Unauthorized", "errors": ["bad token"]}
+        )
+        assert provider.is_healthy() is False
+
+    def test_healthy_call_has_no_expiry_date_param(self):
+        provider = make_provider(raw_response=SAMPLE_V2_CHAIN)
+        assert provider.is_healthy() is True
+        params = provider._discovery._provider._get.call_args.kwargs.get("params", {})
+        assert "expiry_date" not in params
+        assert params.get("instrument_key") == "NSE_INDEX|NIFTY"
 
 
 # --------------------------------------------------------------------------- #
