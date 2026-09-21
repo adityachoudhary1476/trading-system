@@ -38,6 +38,10 @@ class PriceField(str, Enum):
     LOW = "low"
     CLOSE = "close"
     VOLUME = "volume"
+    PREV_OPEN = "prev_open"
+    PREV_CLOSE = "prev_close"
+    PREV_HIGH = "prev_high"
+    PREV_LOW = "prev_low"
 
 
 class OperandKind(str, Enum):
