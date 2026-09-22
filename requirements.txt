@@ -8,3 +8,9 @@ tabulate==0.10.0
 pydantic==2.13.4
 pytest==9.1.1
 websocket-client==1.7.0
+# Backend API deps (for api/index.py Vercel Python function)
+fastapi==0.115.0
+cryptography==43.0.1
+# Install the trading_system package from pyproject.toml (src/ layout)
+.
+

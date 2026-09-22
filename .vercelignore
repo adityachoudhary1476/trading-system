@@ -17,6 +17,12 @@ frontend/node_modules
 .kilo
 ai-office-worktrees
 
+# Backend (deployed via Railway, not needed for Vercel)
+backend
+
+# Tests (not needed for deployment)
+tests
+
 # Secrets and local data
 .env
 .env.backup
