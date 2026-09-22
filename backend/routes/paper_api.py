@@ -203,7 +203,9 @@ def _get_api_router():
     # routes have their own degraded fallback returning 200 + warning.
     try:
         EvidenceStore(engine).ensure_schema_current()
-        AutonomousBotStateStore(engine).ensure_schema()
+        bot_store = AutonomousBotStateStore(engine)
+        bot_store.ensure_schema()
+        bot_store.ensure_portfolio_schema()
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             "paper_deployments migration helper raised: %r; deployment "

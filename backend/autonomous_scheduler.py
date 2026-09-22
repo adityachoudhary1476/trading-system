@@ -17,8 +17,8 @@ without an opt-in):
     ``AUTONOMOUS_SCAN_INTERVAL_SECONDS`` default ``60`` — integer seconds
                                         between ticks. Smallest allowed: 10.
 ``AUTONOMOUS_BOT_ID``               default ``"bot-nifty-options"`` —
-                                         matches the bot id used by the API
-                                         (``routes/paper_api.py``).
+                                           matches the bot id used by the API
+                                           (``routes/paper_api.py``).
     ``MARKET_DATA_DB_URL``              required — same persistent
                                         PostgreSQL database the FastAPI
                                         paper API uses. On SQLite the
@@ -126,6 +126,7 @@ ENV_BOT_ID = "AUTONOMOUS_BOT_ID"
 ENV_DB_URL = "MARKET_DATA_DB_URL"
 ENV_PHASE22 = "AUTONOMOUS_PHASE22_ENABLED"
 ENV_PHASE22_OPTIONS = "AUTONOMOUS_PHASE22_OPTIONS_ENABLED"
+ENV_PORTFOLIO = "AUTONOMOUS_PORTFOLIO_ENABLED"
 
 DEFAULT_INTERVAL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 10
@@ -290,6 +291,12 @@ def _env_phase22_options() -> bool:
     """``AUTONOMOUS_PHASE22_OPTIONS_ENABLED`` controls option contract discovery."""
     raw = os.environ.get(ENV_PHASE22_OPTIONS, "false").strip().lower()
     return raw == "true"
+
+
+def _env_portfolio() -> bool:
+    """``AUTONOMOUS_PORTFOLIO_ENABLED`` (default true) runs the V1 portfolio tick."""
+    raw = os.environ.get(ENV_PORTFOLIO, "true").strip().lower()
+    return raw != "false"
 
 
 # --------------------------------------------------------------------------- #
@@ -799,6 +806,7 @@ def _build_controller(
     # Phase 22 adaptive multi-strategy configuration.
     controller._phase22_enabled = phase22_enabled  # type: ignore[attr-defined]
     controller._phase22_options_enabled = phase22_options_enabled  # type: ignore[attr-defined]
+    controller._portfolio_enabled = True  # type: ignore[attr-defined]
     return controller
 
 
@@ -2037,6 +2045,9 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
     # --- Phase 22: Adaptive Multi-Strategy tick ---
     phase22_result = _run_phase22_integration(controller, target_qty=target_qty)
 
+    # --- V1: Autonomous Portfolio tick (portfolio-level paper trading) ---
+    portfolio_result = _run_portfolio_tick(controller)
+
     return {
         **base,
         "result": "executed",
@@ -2044,7 +2055,25 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         "eligible_count": len(eligible),
         "submissions": submissions,
         "phase22": phase22_result,
+        "portfolio": portfolio_result,
     }
+
+
+def _run_portfolio_tick(controller) -> dict:
+    """Run one autonomous-portfolio tick (fail-closed, paper-only).
+
+    The portfolio reuses the controller's kill switch, option execution path
+    and event log; all positions belong to ONE paper account and the
+    aggregated portfolio snapshot is published for the API/UI read model.
+    """
+    portfolio_enabled = getattr(controller, "_portfolio_enabled", True)
+    if not portfolio_enabled:
+        return {"phase": "portfolio", "result": "skip", "reason": "not_enabled"}
+    try:
+        return controller.portfolio.tick()
+    except Exception:  # noqa: BLE001 — one bad tick must not kill the scheduler
+        logger.exception("portfolio tick raised; continuing")
+        return {"phase": "portfolio", "result": "error", "reason": "tick_raised"}
 
 
 def _run_phase22_integration(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> dict:
@@ -2115,24 +2144,30 @@ def run() -> int:
     bot_id = _env_bot_id()
     phase22_enabled = _env_phase22()
     phase22_options = _env_phase22_options()
+    portfolio_enabled = _env_portfolio()
 
     logger.info(
-        "starting autonomous scheduler: bot_id=%s interval=%ds db_kind=%s phase22=%s phase22_options=%s",
+        "starting autonomous scheduler: bot_id=%s interval=%ds db_kind=%s phase22=%s phase22_options=%s portfolio=%s",
         bot_id, interval,
         "postgresql" if db_url.startswith("postgresql") else "sqlite",
-        phase22_enabled, phase22_options,
+        phase22_enabled, phase22_options, portfolio_enabled,
     )
 
     engine = _build_engine(db_url)
     center, md_provider, market_data_callable, _ = _build_control_center(engine)
     from trading_system.autonomous.persistence import AutonomousBotStateStore
     persistence = AutonomousBotStateStore(engine)
+    try:
+        persistence.ensure_portfolio_schema()
+    except Exception:  # noqa: BLE001 — schema best effort; portfolio still runs
+        logger.exception("portfolio state schema creation failed")
     controller = _build_controller(
         center, md_provider, market_data_callable, bot_id,
         persistence=persistence,
         phase22_enabled=phase22_enabled,
         phase22_options_enabled=phase22_options,
     )
+    controller._portfolio_enabled = portfolio_enabled  # type: ignore[attr-defined]
 
     stop_event = threading.Event()
     _install_signal_handlers(stop_event)

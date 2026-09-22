@@ -1,3 +1,4 @@
+
 """Phase 21 — Pure routing layer.
 
 The :class:`PaperAPIRouter` is a transport-agnostic dispatcher. It maps
@@ -48,6 +49,8 @@ from .models import (
     AutonomousDeploymentsResponse,
     AutonomousEventsResponse,
     AutonomousLifecycleResponse,
+    AutonomousPortfolioResponse,
+    AutonomousPortfolioTickResponse,
     AutonomousScanResponse,
     CheckpointRequest,
     CircuitBreakerResponse,
@@ -266,6 +269,10 @@ class PaperAPIRouter:
         self._add(r"^/autonomous/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/stop$",
                   frozenset({"POST"}), self._route_autonomous_stop_deployment)
         self._add(r"^/autonomous/events$", frozenset({"GET"}), self._route_autonomous_events)
+
+        # V1 — Autonomous Portfolio (portfolio-level autonomous paper trading)
+        self._add(r"^/autonomous/portfolio$", frozenset({"GET"}), self._route_autonomous_portfolio)
+        self._add(r"^/autonomous/portfolio/tick$", frozenset({"POST"}), self._route_autonomous_portfolio_tick)
 
         # Phase 22 - Adaptive Multi-Strategy Market Intelligence
         self._add(r"^/regime$", frozenset({"GET"}), self._route_regime)
@@ -1583,5 +1590,96 @@ class PaperAPIRouter:
         body = AutonomousEventsResponse(
             events=[e.model_dump() for e in events],
             count=len(events),
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    # ------------------------------------------------------------------ #
+    # V1 — Autonomous Portfolio routes
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _json_safe_dict(payload: dict) -> dict:
+        """Replace non-finite floats so ``_safe_dump`` cannot reject a read model."""
+        def _clean(value):
+            if isinstance(value, float):
+                return value if value == value and value not in (
+                    float("inf"), float("-inf")
+                ) else 0.0
+            if isinstance(value, dict):
+                return {k: _clean(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_clean(v) for v in value]
+            return value
+
+        return _clean(payload)  # type: ignore[return-value]
+
+    def _route_autonomous_portfolio(self, ctx: RequestContext) -> ResponseEnvelope:
+        """GET /autonomous/portfolio — the autonomous portfolio read model.
+
+        Read-only: P&L (today/realized/unrealized/total), positions, capital,
+        strategy attribution and the recent autonomous actions feed.
+        """
+        controller = self._require_controller()
+        try:
+            snapshot = controller.portfolio.read_snapshot()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("autonomous portfolio snapshot failed")
+            bot_id = ""
+            try:
+                bot_id = str(controller.config.bot_id or "")
+            except Exception:  # noqa: BLE001
+                bot_id = ""
+            return ResponseEnvelope(
+                status=200,
+                body={
+                    "portfolio": {
+                        "portal": "autonomous-portfolio",
+                        "bot_id": bot_id,
+                        "trading_mode": "paper",
+                        "data_source": "none",
+                        "stale": True,
+                        "warning": f"portfolio snapshot failed: {exc.__class__.__name__}",
+                    },
+                    "schema_version": 1,
+                },
+            )
+        body = AutonomousPortfolioResponse(
+            portfolio=self._json_safe_dict(snapshot)
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_autonomous_portfolio_tick(self, ctx: RequestContext) -> ResponseEnvelope:
+        """POST /autonomous/portfolio/tick — run ONE autonomous portfolio tick.
+
+        Uses the exact same fail-closed pipeline as the scheduler worker
+        (kill switch → market data → regime → exits → entries → snapshot).
+        Paper-only; never contacts a live broker.
+        """
+        controller = self._require_controller()
+        try:
+            result = controller.portfolio.tick()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("autonomous portfolio tick failed")
+            return ResponseEnvelope(
+                status=200,
+                body={
+                    "result": {
+                        "phase": "portfolio",
+                        "result": "error",
+                        "reason": f"tick_failed:{exc.__class__.__name__}",
+                    },
+                    "portfolio": None,
+                    "schema_version": 1,
+                },
+            )
+        try:
+            snapshot = controller.portfolio.read_snapshot()
+        except Exception:  # noqa: BLE001
+            snapshot = None
+        body = AutonomousPortfolioTickResponse(
+            result=self._json_safe_dict(result),
+            portfolio=(
+                self._json_safe_dict(snapshot) if snapshot is not None else None
+            ),
         )
         return ResponseEnvelope(status=200, body=_safe_dump(body))

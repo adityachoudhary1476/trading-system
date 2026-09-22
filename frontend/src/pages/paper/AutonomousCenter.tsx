@@ -9,6 +9,7 @@ import type {
   AutonomousDeploymentsResponse,
   AutonomousDeploymentSummary,
   AutonomousEventsResponse,
+  AutonomousPortfolioSnapshot,
   OptionsCapabilityResponse,
   OptionsProviderStatus,
   TradingDecision,
@@ -41,10 +42,43 @@ export default function AutonomousCenter() {
   const [optionsCapability, setOptionsCapability] = useState<
     SectionState<OptionsCapabilityResponse>
   >({ status: "idle" });
+  const [portfolio, setPortfolio] = useState<
+    SectionState<AutonomousPortfolioSnapshot>
+  >({ status: "idle" });
+  const [tickLoading, setTickLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState(false);
   const [decisionsLoading, setDecisionsLoading] = useState(false);
+
+  const fetchPortfolio = async () => {
+    try {
+      const res = await paperApi.getAutonomousPortfolio();
+      setPortfolio({ status: "ok", data: res.portfolio });
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to load portfolio";
+      setPortfolio({ status: "error", message });
+    }
+  };
+
+  const handlePortfolioTick = async () => {
+    setTickLoading(true);
+    try {
+      const res = await paperApi.tickAutonomousPortfolio();
+      if (res.portfolio) {
+        setPortfolio({ status: "ok", data: res.portfolio });
+      } else {
+        await fetchPortfolio();
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Portfolio tick failed (fail-closed)"
+      );
+    } finally {
+      setTickLoading(false);
+    }
+  };
 
   const fetchBot = async () => {
     setBotState({ status: "loading" });
@@ -130,6 +164,7 @@ export default function AutonomousCenter() {
       fetchScan(),
       fetchEvents(),
       fetchDeployments(),
+      fetchPortfolio(),
     ]);
     // After deployments are populated, fetch capability for the first one.
     setDeployments((prev) => {
@@ -151,6 +186,7 @@ export default function AutonomousCenter() {
         return;
       }
       await fetchBot();
+      await fetchPortfolio();
     } catch (err) {
       setError(err instanceof Error ? err.message : `Failed to ${action} bot`);
     } finally {
@@ -411,6 +447,58 @@ export default function AutonomousCenter() {
           <p className="muted">{error}</p>
         </div>
       )}
+
+      {/* V1 — AUTONOMOUS PORTFOLIO (primary panel) */}
+      <Panel
+        title="Autonomous Portfolio"
+        actions={
+          <div style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={tickLoading || actionLoading}
+              onClick={handlePortfolioTick}
+              title="Run one autonomous portfolio evaluation now (paper-only, fail-closed)"
+            >
+              {tickLoading ? "Evaluating…" : "Run tick now"}
+            </Button>
+            {bot && bot.state !== "running" && (
+              <Button
+                variant="primary"
+                size="sm"
+                disabled={actionLoading}
+                onClick={() => handleLifecycle("start")}
+              >
+                Start autonomous
+              </Button>
+            )}
+            {bot && bot.state === "running" && (
+              <Button
+                variant="danger-solid"
+                size="sm"
+                disabled={actionLoading}
+                onClick={() => handleLifecycle("stop")}
+              >
+                Stop autonomous
+              </Button>
+            )}
+          </div>
+        }
+      >
+        {portfolio.status === "ok" ? (
+          <AutonomousPortfolioPanel data={portfolio.data} />
+        ) : portfolio.status === "error" ? (
+          <div className="error-state" role="alert">
+            <div className="es-title">Portfolio unavailable</div>
+            <div className="es-hint">{portfolio.message}</div>
+            <Button variant="secondary" size="sm" onClick={fetchPortfolio}>
+              Retry
+            </Button>
+          </div>
+        ) : (
+          <Loading label="Loading portfolio…" />
+        )}
+      </Panel>
 
       {/* Bot Summary Metrics */}
       {bot && (
@@ -983,6 +1071,264 @@ function ProviderStatusRow({
       <span className="muted" style={{ fontSize: 12 }}>
         {provider.detail || "—"}
       </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// V1 — Autonomous Portfolio read model panel
+// ---------------------------------------------------------------------------
+
+function formatINR(value: number | null | undefined): string {
+  if (value === null || value === undefined || Number.isNaN(value)) return "—";
+  const sign = value < 0 ? "-" : "";
+  return `${sign}₹${Math.abs(value).toLocaleString("en-IN", {
+    maximumFractionDigits: 2,
+  })}`;
+}
+
+function pnlTone(value: number | null | undefined): "pos" | "neg" | undefined {
+  if (value === null || value === undefined || value === 0) return undefined;
+  return value > 0 ? "pos" : "neg";
+}
+
+function portfolioActionTone(action: string): "pos" | "neg" | "warn" | undefined {
+  if (action === "ENTERED" || action === "STARTED") return "pos";
+  if (
+    action === "FAIL_CLOSED" ||
+    action === "SIGNAL_REJECTED" ||
+    action === "DATA_UNAVAILABLE"
+  )
+    return "neg";
+  if (action === "POSITION_LIMIT_REACHED" || action === "EXITED") return "warn";
+  return undefined;
+}
+
+function formatActionTime(ts: string): string {
+  try {
+    return new Date(ts).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return ts;
+  }
+}
+
+export function AutonomousPortfolioPanel({
+  data,
+}: {
+  data: AutonomousPortfolioSnapshot;
+}) {
+  const running = data.status === "running";
+  const pnl = data.pnl;
+  const capital = data.capital;
+  const positions = data.positions || [];
+  const actions = (data.actions || []).slice(-12).reverse();
+  const strategies = data.strategies;
+
+  return (
+    <div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 12,
+          flexWrap: "wrap",
+          marginBottom: 12,
+        }}
+      >
+        <StatusIndicator status={running ? "active" : "stopped"} />
+        <strong>{running ? "RUNNING" : "STOPPED"}</strong>
+        <Pill tone={data.stale ? "warn" : undefined}>
+          {data.data_source === "live"
+            ? "live paper data"
+            : data.data_source === "persisted"
+              ? "persisted (waiting for worker)"
+              : "no data"}
+        </Pill>
+        <span className="muted" style={{ fontSize: 12 }}>
+          bot {data.bot_id} · paper-only · updated{" "}
+          {formatActionTime(data.updated_at)}
+        </span>
+        {data.safety?.kill_switch_state &&
+          data.safety.kill_switch_state !== "active" && (
+            <Pill tone="neg">
+              kill switch: {data.safety.kill_switch_state}
+              {data.safety.kill_switch_reason
+                ? ` (${data.safety.kill_switch_reason})`
+                : ""}
+            </Pill>
+          )}
+      </div>
+
+      {data.warning && (
+        <p className="muted" style={{ marginTop: 0 }}>
+          {data.warning}
+        </p>
+      )}
+
+      <div className="metric-grid">
+        <MetricItem
+          label="Today's P&L"
+          value={formatINR(pnl?.today)}
+          tone={pnlTone(pnl?.today)}
+        />
+        <MetricItem
+          label="Realized P&L"
+          value={formatINR(pnl?.realized)}
+          tone={pnlTone(pnl?.realized)}
+        />
+        <MetricItem
+          label="Unrealized P&L"
+          value={formatINR(pnl?.unrealized)}
+          tone={pnlTone(pnl?.unrealized)}
+        />
+        <MetricItem
+          label="Total P&L"
+          value={formatINR(pnl?.total)}
+          tone={pnlTone(pnl?.total)}
+        />
+      </div>
+
+      <div className="metric-grid" style={{ marginTop: 12 }}>
+        <MetricItem
+          label="Open positions"
+          value={`${data.open_position_count} / ${data.max_positions}`}
+        />
+        <MetricItem label="Capital deployed" value={formatINR(capital?.invested)} />
+        <MetricItem
+          label="Available paper capital"
+          value={formatINR(capital?.available)}
+        />
+        <MetricItem
+          label="Strategies available"
+          value={String(strategies?.available_count ?? 0)}
+        />
+      </div>
+
+      {/* Open positions */}
+      <p style={{ margin: "16px 0 6px" }}>
+        <strong>Open positions</strong>
+      </p>
+      {positions.length === 0 ? (
+        <p className="muted" style={{ margin: 0 }}>
+          No open positions. The portfolio opens paper option positions only on
+          valid strategy signals with live quotes.
+        </p>
+      ) : (
+        <div style={{ overflowX: "auto" }}>
+          <table className="pt-table" style={{ width: "100%" }}>
+            <thead>
+              <tr>
+                <th>Symbol / contract</th>
+                <th>CE/PE</th>
+                <th>Qty</th>
+                <th>Entry</th>
+                <th>Current</th>
+                <th>Unrealized P&L</th>
+                <th>Strategy</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {positions.map((pos) => (
+                <tr key={`${pos.symbol}:${pos.contract_id}`}>
+                  <td>
+                    {pos.symbol}
+                    {pos.strike !== null && pos.strike !== undefined
+                      ? ` · ${pos.strike}`
+                      : ""}
+                    {pos.expiry ? ` · ${pos.expiry}` : ""}
+                  </td>
+                  <td>{pos.option_type || "—"}</td>
+                  <td>{pos.quantity}</td>
+                  <td>{formatINR(pos.avg_entry_price)}</td>
+                  <td>{formatINR(pos.current_price)}</td>
+                  <td>
+                    <Pill tone={pnlTone(pos.unrealized_pnl)}>
+                      {formatINR(pos.unrealized_pnl)}
+                    </Pill>
+                  </td>
+                  <td>{pos.strategy_id || "—"}</td>
+                  <td>{pos.status}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* Strategy attribution (secondary) */}
+      {(data.attribution || []).length > 0 && (
+        <>
+          <p style={{ margin: "16px 0 6px" }}>
+            <strong>P&L attribution by strategy</strong>
+          </p>
+          <div className="metric-grid">
+            {data.attribution.slice(0, 4).map((row) => (
+              <MetricItem
+                key={row.strategy_id}
+                label={row.strategy_id}
+                value={formatINR(row.total_pnl)}
+                tone={pnlTone(row.total_pnl)}
+              />
+            ))}
+          </div>
+        </>
+      )}
+
+      {/* Recent autonomous actions */}
+      <p style={{ margin: "16px 0 6px" }}>
+        <strong>Recent autonomous actions</strong>
+      </p>
+      {actions.length === 0 ? (
+        <p className="muted" style={{ margin: 0 }}>
+          No autonomous actions recorded yet.
+        </p>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {actions.map((act, idx) => (
+            <div
+              key={`${act.timestamp}:${idx}`}
+              style={{
+                display: "flex",
+                gap: 10,
+                alignItems: "baseline",
+                flexWrap: "wrap",
+                padding: "4px 0",
+                borderBottom: "1px solid var(--panel-border)",
+              }}
+            >
+              <span className="muted" style={{ fontSize: 12, minWidth: 48 }}>
+                {formatActionTime(act.timestamp)}
+              </span>
+              <Pill tone={portfolioActionTone(act.action)}>{act.action}</Pill>
+              <span style={{ fontWeight: 600 }}>
+                {act.symbol || act.contract_id || "—"}
+              </span>
+              {act.strategy_name || act.strategy_id ? (
+                <span className="muted" style={{ fontSize: 12 }}>
+                  Strategy: {act.strategy_name || act.strategy_id}
+                </span>
+              ) : null}
+              {act.pnl !== null && act.pnl !== undefined ? (
+                <Pill tone={pnlTone(act.pnl)}>P&L: {formatINR(act.pnl)}</Pill>
+              ) : null}
+              {act.reason ? (
+                <span className="muted" style={{ fontSize: 12 }}>
+                  {act.reason}
+                </span>
+              ) : null}
+              {act.detail ? (
+                <span className="muted" style={{ fontSize: 12 }}>
+                  {act.detail}
+                </span>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

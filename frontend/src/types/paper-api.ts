@@ -739,3 +739,126 @@ export interface OptionsCapabilityResponse {
   last_error: string | null;
   schema_version: number;
 }
+
+// ---------------------------------------------------------------------------
+// V1 — Autonomous Portfolio (portfolio-level autonomous paper trading)
+// Mirrors the backend portfolio read model published by the scheduler/API.
+// ---------------------------------------------------------------------------
+
+export interface PortfolioPnl {
+  today: number;
+  today_realized: number;
+  realized: number;
+  unrealized: number;
+  total: number;
+  starting_capital: number;
+  return_pct: number;
+}
+
+export interface PortfolioCapital {
+  initial: number;
+  cash: number;
+  available: number;
+  equity: number;
+  invested: number;
+}
+
+export interface PortfolioPositionRow {
+  symbol: string;
+  contract_id: string;
+  option_type: string;
+  strike: number | null;
+  expiry: string | null;
+  quantity: number;
+  contract_size: number;
+  avg_entry_price: number;
+  current_price: number;
+  unrealized_pnl: number;
+  market_value: number;
+  strategy_id: string;
+  status: string;
+}
+
+export interface PortfolioAttributionRow {
+  strategy_id: string;
+  open_positions: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  total_pnl: number;
+}
+
+export interface PortfolioStrategyRow {
+  strategy_id: string;
+  symbol: string;
+  timeframe: string;
+  score: number | null;
+}
+
+export interface PortfolioActionRow {
+  timestamp: string;
+  action: string;
+  symbol: string;
+  strategy_id: string;
+  strategy_name: string;
+  contract_id: string;
+  option_type: string;
+  strike: number | null;
+  expiry: string | null;
+  quantity: number | null;
+  price: number | null;
+  pnl: number | null;
+  reason: string;
+  detail: string;
+}
+
+export interface PortfolioSafety {
+  kill_switch_state: string;
+  kill_switch_reason: string | null;
+  paper_only: boolean;
+}
+
+export interface AutonomousPortfolioSnapshot {
+  portal: string;
+  bot_id: string;
+  trading_mode: string;
+  status: string;
+  data_source: string;
+  stale: boolean;
+  updated_at: string;
+  trading_day: string;
+  deployment_id: string | null;
+  session_id: string | null;
+  max_positions: number;
+  open_position_count: number;
+  capital: PortfolioCapital;
+  pnl: PortfolioPnl;
+  positions: PortfolioPositionRow[];
+  attribution: PortfolioAttributionRow[];
+  strategies: {
+    available_count: number;
+    available: PortfolioStrategyRow[];
+    last_evaluated_at: string | null;
+  };
+  actions: PortfolioActionRow[];
+  safety: PortfolioSafety;
+  warning?: string;
+}
+
+export interface AutonomousPortfolioResponse {
+  portfolio: AutonomousPortfolioSnapshot;
+  schema_version: number;
+}
+
+export interface AutonomousPortfolioTickResponse {
+  result: {
+    phase: string;
+    result: string;
+    reason?: string | null;
+    open_positions?: number;
+    max_positions?: number;
+    pnl?: PortfolioPnl;
+    [key: string]: unknown;
+  };
+  portfolio: AutonomousPortfolioSnapshot | null;
+  schema_version: number;
+}

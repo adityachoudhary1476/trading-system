@@ -117,6 +117,12 @@ from .safety import (
     SafetyResult,
     SafetyValidator,
 )
+from .portfolio import (
+    AutonomousPortfolio,
+    PortfolioAction,
+    PortfolioActionType,
+    StrategyOpportunity,
+)
 
 __all__ = [
     # Configuration
@@ -209,4 +215,9 @@ __all__ = [
     "ResolveResult",
     "OptionsStructureBuilder",
     "DEFAULT_OPTIONS_CONFIG",
+    # V1 — Autonomous Portfolio (portfolio-level paper trading)
+    "AutonomousPortfolio",
+    "PortfolioAction",
+    "PortfolioActionType",
+    "StrategyOpportunity",
 ]

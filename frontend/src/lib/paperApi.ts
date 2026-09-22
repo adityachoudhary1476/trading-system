@@ -8,6 +8,8 @@ import type {
   AutonomousDeploymentsResponse,
   AutonomousEventsResponse,
   AutonomousLifecycleResponse,
+  AutonomousPortfolioResponse,
+  AutonomousPortfolioTickResponse,
   AutonomousScanResponse,
   CircuitBreakerResponse,
   DashboardSnapshotResponse,
@@ -367,6 +369,18 @@ export const paperApi = {
   ): Promise<OptionsCapabilityResponse> {
     return this.request<OptionsCapabilityResponse>(
       `/deployments/${encodeURIComponent(deploymentId)}/options-capability`
+    )
+  },
+
+  // V1 — Autonomous Portfolio (portfolio-level autonomous paper trading)
+  async getAutonomousPortfolio(): Promise<AutonomousPortfolioResponse> {
+    return this.request<AutonomousPortfolioResponse>("/autonomous/portfolio")
+  },
+
+  async tickAutonomousPortfolio(): Promise<AutonomousPortfolioTickResponse> {
+    return this.request<AutonomousPortfolioTickResponse>(
+      "/autonomous/portfolio/tick",
+      { method: "POST" }
     )
   },
 };

@@ -26,6 +26,21 @@ class AutonomousBotRecord(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class AutonomousPortfolioRecord(Base):
+    """Cross-process read model for the autonomous paper portfolio.
+
+    Stores the last published portfolio snapshot (P&L, positions, attribution,
+    recent actions) keyed by bot_id so the API process can render the
+    portfolio without owning the live paper session.
+    """
+
+    __tablename__ = "autonomous_portfolio_state"
+
+    bot_id = Column(String(64), primary_key=True)
+    payload_json = Column(String, nullable=False, default="{}")
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 def _to_bool(value: str) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
@@ -53,6 +68,40 @@ class AutonomousBotStateStore:
     def ensure_schema(self) -> None:
         """Create the autonomous_bots table if it does not exist."""
         Base.metadata.create_all(self.engine, tables=[AutonomousBotRecord.__table__])
+
+    def ensure_portfolio_schema(self) -> None:
+        """Create the autonomous_portfolio_state table if it does not exist."""
+        Base.metadata.create_all(
+            self.engine, tables=[AutonomousPortfolioRecord.__table__]
+        )
+
+    def load_portfolio_state(self, bot_id: str) -> dict[str, Any]:
+        """Load the last published portfolio snapshot, or ``{}``."""
+        with self._Session() as s:
+            rec = s.get(AutonomousPortfolioRecord, bot_id)
+            if rec is None:
+                return {}
+            try:
+                import json
+
+                payload = json.loads(rec.payload_json)
+            except Exception:  # noqa: BLE001 — corrupt payload behaves as empty
+                return {}
+            return payload if isinstance(payload, dict) else {}
+
+    def save_portfolio_state(self, bot_id: str, payload: dict[str, Any]) -> None:
+        """Persist the portfolio read model (last write wins, per bot)."""
+        import json
+
+        with self._Session() as s:
+            rec = s.get(AutonomousPortfolioRecord, bot_id)
+            now = datetime.now(timezone.utc)
+            if rec is None:
+                rec = AutonomousPortfolioRecord(bot_id=bot_id)
+                s.add(rec)
+            rec.payload_json = json.dumps(payload, default=str)
+            rec.updated_at = now
+            s.commit()
 
     def load_state(self, bot_id: str) -> dict[str, Any]:
         with self._Session() as s:

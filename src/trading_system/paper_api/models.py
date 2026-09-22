@@ -426,6 +426,25 @@ class AutonomousEventsResponse(BaseModel):
     schema_version: int = 1
 
 
+class AutonomousPortfolioResponse(BaseModel):
+    """Response for ``GET /autonomous/portfolio`` — the portfolio read model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    portfolio: dict[str, Any]
+    schema_version: int = 1
+
+
+class AutonomousPortfolioTickResponse(BaseModel):
+    """Response for ``POST /autonomous/portfolio/tick`` — one autonomous tick."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    result: dict[str, Any]
+    portfolio: Optional[dict[str, Any]] = None
+    schema_version: int = 1
+
+
 # --------------------------------------------------------------------------- #
 # Phase 8 — Options capability surface (Phase A, observational only)
 # --------------------------------------------------------------------------- #

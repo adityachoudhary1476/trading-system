@@ -155,6 +155,7 @@ class AutonomousController(BaseModel):
     _option_discoverer: Optional[CurrentOptionDiscoverer] = None
     _instrument_repo: Optional[InstrumentRepository] = None
     _quote_provider: Optional[object] = None
+    _portfolio: Optional[Any] = None
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -185,6 +186,25 @@ class AutonomousController(BaseModel):
     def event_log(self) -> AutonomousEventLog:
         """Return the in-memory autonomous event log for this bot."""
         return self._event_log
+
+    @property
+    def portfolio(self) -> Any:
+        """The single autonomous paper portfolio for this bot (V1).
+
+        Lazily constructed so existing entry points (API, scheduler, tests)
+        keep working unchanged. The portfolio reuses this controller's kill
+        switch, option execution path and event log; ``persistence`` is shared
+        so the API process can read the portfolio snapshot the scheduler
+        publishes.
+        """
+        if self._portfolio is None:
+            from .portfolio import AutonomousPortfolio
+
+            self._portfolio = AutonomousPortfolio(
+                self,
+                persistence=getattr(self, "_persistence", None),
+            )
+        return self._portfolio
 
     @property
     def kill_switch(self) -> KillSwitch:
@@ -360,6 +380,14 @@ class AutonomousController(BaseModel):
             # --- Auto-provision deployments from PAPER_APPROVED strategies ---
             self._ensure_autonomous_deployments()
 
+            # --- Provision the autonomous portfolio account (V1) ---
+            # The portfolio is the primary autonomous experience; ensure its
+            # deployment/session exist so the RUNNING bot has an account.
+            try:
+                self.portfolio.on_start()
+            except Exception:  # noqa: BLE001 — never block bot start on the read model
+                pass
+
             # --- Startup validation ---
             # 1. Verify canonical paper deployment exists and belongs to this bot
             bot_deployments = [
@@ -501,6 +529,12 @@ class AutonomousController(BaseModel):
                 KillSwitchReason.NORMAL_STOP,
                 detail="bot stopped by operator",
             )
+
+            # Publish the STOPPED portfolio read model (best effort).
+            try:
+                self.portfolio.on_stop()
+            except Exception:  # noqa: BLE001 — never block bot stop on the read model
+                pass
 
             self._record_event(AutonomousEventType.BOT_STOPPED)
 
