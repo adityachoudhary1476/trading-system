@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { paperApi } from "@/lib/paperApi";
 import type {
   AutonomousBot,
@@ -11,7 +11,6 @@ import type {
   AutonomousEventsResponse,
   AutonomousPortfolioSnapshot,
   OptionsCapabilityResponse,
-  OptionsProviderStatus,
   TradingDecision,
 } from "@/types/paper-api";
 import {
@@ -23,6 +22,7 @@ import {
   StatusIndicator,
   MetricItem,
   Loading,
+  Kpi,
 } from "@/components/ui";
 
 type SectionState<T> =
@@ -318,8 +318,8 @@ export default function AutonomousCenter() {
       {/* Header with status and lifecycle controls */}
       <div className="pt-section">
         <div>
-          <h1 className="page-title">Autonomous Trading Operations Center</h1>
-          <span className="subtitle">Phase 6 — Paper Trading</span>
+          <h1 className="page-title">Autonomous Portfolio</h1>
+          <span className="subtitle">Paper-only · Bot {bot?.bot_id ?? "bot-nifty-options"}</span>
         </div>
         <div
           style={{
@@ -379,58 +379,35 @@ export default function AutonomousCenter() {
               Scheduler: {schedulerStatus === "running" ? "RUNNING" : schedulerStatus === "not_running" ? "NOT RUNNING" : "N/A"}
             </div>
           )}
-          <div style={{ display: "inline-flex", gap: 8, flexWrap: "wrap" }}>
-            {bot && bot.state !== "running" && (
-              <Button
-                variant="primary"
-                size="sm"
-                disabled={actionLoading}
-                onClick={() => handleLifecycle("start")}
-              >
-                Start
-              </Button>
-            )}
-            {bot && bot.state === "running" && (
-              <>
-                <Button
-                  variant="secondary"
-                  size="sm"
-                  disabled={actionLoading}
-                  onClick={() => handleLifecycle("pause")}
-                >
-                  Pause
-                </Button>
-                <Button
-                  variant="danger-solid"
-                  size="sm"
-                  disabled={actionLoading}
-                  onClick={() => handleLifecycle("stop")}
-                >
-                  Stop
-                </Button>
-              </>
-            )}
-            {bot && bot.state === "paused" && (
-              <Button
-                variant="primary"
-                size="sm"
-                disabled={actionLoading}
-                onClick={() => handleLifecycle("resume")}
-              >
-                Resume
-              </Button>
-            )}
-            {bot && bot.state === "error" && bot.safety?.kill_switch_state === "active" && (
-              <Button
-                variant="primary"
-                size="sm"
-                disabled={actionLoading}
-                onClick={() => handleLifecycle("resume")}
-              >
-                Resume
-              </Button>
-            )}
-          </div>
+          {/* Run tick now */}          <Button
+            variant="secondary"
+            size="sm"
+            disabled={tickLoading || actionLoading}
+            onClick={handlePortfolioTick}
+            title="Run one autonomous portfolio evaluation now (paper-only, fail-closed)"
+          >
+            {tickLoading ? "Evaluating…" : "Run tick now"}
+          </Button>
+          {/* Single Start/Stop control driven by bot state */}          {bot && bot.state !== "running" && (
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={actionLoading || tickLoading}
+              onClick={() => handleLifecycle("start")}
+            >
+              {actionLoading ? "Starting…" : "Start autonomous"}
+            </Button>
+          )}
+          {bot && bot.state === "running" && (
+            <Button
+              variant="danger-solid"
+              size="sm"
+              disabled={actionLoading || tickLoading}
+              onClick={() => handleLifecycle("stop")}
+            >
+              {actionLoading ? "Stopping…" : "Stop autonomous"}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -451,39 +428,7 @@ export default function AutonomousCenter() {
       {/* V1 — AUTONOMOUS PORTFOLIO (primary panel) */}
       <Panel
         title="Autonomous Portfolio"
-        actions={
-          <div style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-            <Button
-              variant="secondary"
-              size="sm"
-              disabled={tickLoading || actionLoading}
-              onClick={handlePortfolioTick}
-              title="Run one autonomous portfolio evaluation now (paper-only, fail-closed)"
-            >
-              {tickLoading ? "Evaluating…" : "Run tick now"}
-            </Button>
-            {bot && bot.state !== "running" && (
-              <Button
-                variant="primary"
-                size="sm"
-                disabled={actionLoading}
-                onClick={() => handleLifecycle("start")}
-              >
-                Start autonomous
-              </Button>
-            )}
-            {bot && bot.state === "running" && (
-              <Button
-                variant="danger-solid"
-                size="sm"
-                disabled={actionLoading}
-                onClick={() => handleLifecycle("stop")}
-              >
-                Stop autonomous
-              </Button>
-            )}
-          </div>
-        }
+
       >
         {portfolio.status === "ok" ? (
           <AutonomousPortfolioPanel data={portfolio.data} />
@@ -642,64 +587,6 @@ export default function AutonomousCenter() {
               }
             />
           </div>
-        </Panel>
-      )}
-
-      {/* Active Deployments — fetched independently; never crashes the page */}
-      {deployments.status === "loading" && (
-        <Panel title="Active Deployments">
-          <Loading label="Loading deployments…" />
-        </Panel>
-      )}
-      {deployments.status === "error" && (
-        <Panel title="Active Deployments">
-          <EmptyState
-            title="Deployments unavailable"
-            hint={`Could not load deployments: ${deployments.message}. The autonomous bot remains operational; this section will refresh automatically.`}
-          />
-          <Button variant="secondary" size="sm" onClick={fetchDeployments}>
-            Retry
-          </Button>
-        </Panel>
-      )}
-      {deployments.status === "ok" &&
-        Array.isArray(deployments.data) &&
-        deployments.data.length > 0 && (
-          <Panel title="Active Deployments">
-            <table className="data dense">
-              <thead>
-                <tr>
-                  <th>Deployment ID</th>
-                  <th>Symbol</th>
-                  <th>Status</th>
-                  <th>Strategy</th>
-                  <th>Timeframe</th>
-                  <th>Created</th>
-                </tr>
-              </thead>
-              <tbody>
-                {deployments.data.map((dep) => (
-                  <tr key={dep.deployment_id}>
-                    <td className="td-id">{dep.deployment_id}</td>
-                    <td>{dep.symbol}</td>
-                    <td>
-                      <StatusIndicator status={dep.status} />
-                    </td>
-                    <td className="mono">{dep.strategy_id}</td>
-                    <td>{dep.timeframe}</td>
-                    <td className="td-muted">{dep.created_at}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </Panel>
-        )}
-      {deployments.status === "ok" && Array.isArray(deployments.data) && deployments.data.length === 0 && (
-        <Panel title="Active Deployments">
-          <EmptyState
-            title="No active deployments"
-            hint="The autonomous bot has not linked any paper deployments yet."
-          />
         </Panel>
       )}
 

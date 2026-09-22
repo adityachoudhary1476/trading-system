@@ -99,6 +99,13 @@ import os
 import signal
 import sys
 import threading
+
+# Ensure the src/ directory is on the Python path so that
+# trading_system.* modules (e.g. strategy_factory.spec_bridge) are resolvable
+# regardless of the working directory from which the script is invoked.
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 import time
 import uuid
 from contextlib import contextmanager

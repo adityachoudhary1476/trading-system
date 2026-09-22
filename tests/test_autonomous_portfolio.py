@@ -497,9 +497,6 @@ def test_tick_skips_when_no_market_data():
     assert result["result"] == "skip"
     assert result["reason"] in {"no_market_data", "market_closed"}
     assert controller.execution_calls == []
-    # Market-data-unavailable may be recorded for every such tick or only for
-    # the first one that fails the freshness window; accept either w.r.t. the
-    # last action while still asserting the skip reason above.
     assert portfolio.actions[-1].action in {
         PortfolioActionType.DATA_UNAVAILABLE,
         PortfolioActionType.SKIPPED,
