@@ -1,4 +1,4 @@
-import { useEffect, useState, useMemo, useCallback } from "react";
+import { useEffect, useState } from "react";
 import { paperApi } from "@/lib/paperApi";
 import type {
   AutonomousBot,
@@ -11,6 +11,7 @@ import type {
   AutonomousEventsResponse,
   AutonomousPortfolioSnapshot,
   OptionsCapabilityResponse,
+  OptionsProviderStatus,
   TradingDecision,
 } from "@/types/paper-api";
 import {
@@ -22,7 +23,6 @@ import {
   StatusIndicator,
   MetricItem,
   Loading,
-  Kpi,
 } from "@/components/ui";
 
 type SectionState<T> =

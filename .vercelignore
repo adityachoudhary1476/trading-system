@@ -1,0 +1,38 @@
+# Local caches and virtualenvs
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.eggs
+.pytest_cache
+.mypy_cache
+.ruff_cache
+
+# Node
+node_modules
+frontend/node_modules
+
+# Local worktrees (large, not needed for any deployment)
+.kilo
+ai-office-worktrees
+
+# Secrets and local data
+.env
+.env.backup
+.env.*
+*.log
+logs
+
+# Dev/audit artifacts (not needed for deployment)
+trading-system-audit
+vibetrading-inspection
+agency-agents
+algo_trading_strategies_india
+bhav
+learn-trading-from-x
+nifty-daily-moves-and-gaps
+
+# OS
+.DS_Store
+Thumbs.db
