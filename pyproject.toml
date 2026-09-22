@@ -17,6 +17,8 @@ dependencies = [
     "tabulate==0.10.0",
     "pydantic==2.13.4",
     "websocket-client==1.7.0",
+    "fastapi==0.115.0",
+    "cryptography==43.0.1",
 ]
 
 [project.optional-dependencies]
