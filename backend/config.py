@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # Application
     environment: str = "development"
     log_level: str = "INFO"
+    db_access_token: str = ""
 
     # Live pipeline configuration
     live_pipeline_enabled: bool = False

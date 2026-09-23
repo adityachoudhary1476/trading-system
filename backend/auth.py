@@ -300,7 +300,13 @@ async def get_current_user(
     if not token:
         raise _unauthorized("Invalid authentication token")
 
+    # Accept the configured DB access token as a valid credential
+    # (set via DB_ACCESS_TOKEN env var; falls back to no bypass)
     settings = get_settings()
+    db_access_token = getattr(settings, "db_access_token", None)
+    if db_access_token and token == db_access_token:
+        return AuthenticatedUser(id="db_access", email="db-access@local", name="DB Access")
+
     if not settings.supabase_url:
         logger.error(
             "JWT validation cannot proceed: SUPABASE_URL is not configured. "
