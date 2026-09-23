@@ -120,7 +120,7 @@ def _cookie_kwargs() -> dict:
 
 
 @app.get("/api/upstox/auth")
-def upstox_auth(response: JSONResponse | None = None):
+def upstox_auth():
     manager = _manager()
     state = secrets.token_urlsafe(24)
     signed = _sign_state({"nonce": state, "exp": int(time.time()) + _STATE_TTL})
