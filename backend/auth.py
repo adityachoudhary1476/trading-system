@@ -305,7 +305,7 @@ async def get_current_user(
     settings = get_settings()
     db_access_token = getattr(settings, "db_access_token", None)
     if db_access_token and token == db_access_token:
-        return AuthenticatedUser(id="db_access", email="db-access@local", name="DB Access")
+        return AuthenticatedUser(user_id="db_access", email="db-access@local")
 
     if not settings.supabase_url:
         logger.error(
