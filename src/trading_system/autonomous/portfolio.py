@@ -1679,9 +1679,9 @@ class AutonomousPortfolio:
             "open_position_count": 0,
             "capital": {
                 "initial": self.capital,
-                "cash": 0.0,
-                "available": 0.0,
-                "equity": 0.0,
+                "cash": self.capital,
+                "available": self.capital,
+                "equity": self.capital,
                 "invested": 0.0,
             },
             "pnl": {
