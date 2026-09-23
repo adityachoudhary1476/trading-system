@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "outputDirectory": "frontend/dist",
   "builds": [
     {
       "src": "frontend/package.json",
@@ -28,7 +29,7 @@
     { "src": "/api/upstox/(auth|callback|status|disconnect)", "dest": "/api/index.py" },
     { "src": "/api/paper/(.*)", "dest": "/frontend/api/paper/[...path].ts" },
     { "src": "/api/(.*)", "dest": "/frontend/api/$1.ts" },
-    { "src": "/assets/(.*)", "dest": "/frontend/dist/assets/$1" },
-    { "src": "/(.*)", "dest": "/frontend/dist/index.html" }
+    { "src": "/assets/(.*)", "dest": "/assets/$1" },
+    { "src": "/(.*)", "dest": "/index.html" }
   ]
 }
