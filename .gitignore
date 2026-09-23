@@ -10,6 +10,10 @@ __pycache__/
 .eggs/
 build/
 dist/
+# Force-include pre-built frontend/dist for Vercel auto-deploy (was excluded by dist/ above)
+!frontend/dist/
+!frontend/dist/**
+!frontend/dist/**/*
 
 # Virtual env
 .venv/

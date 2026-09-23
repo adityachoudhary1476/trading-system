@@ -1,5 +1,5 @@
 node_modules/
-dist/
+# dist/  # Commented out: frontend/dist/ is committed for Vercel auto-deploy
 *.local
 .env
 .env.*
