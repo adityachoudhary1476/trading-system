@@ -1538,7 +1538,7 @@ def _assert_deployment_transition(
         PaperDeploymentStatus.PAUSED: {PaperDeploymentStatus.ACTIVE,
                                        PaperDeploymentStatus.STOPPED,
                                        PaperDeploymentStatus.FAILED},
-        PaperDeploymentStatus.STOPPED: set(),
+        PaperDeploymentStatus.STOPPED: {PaperDeploymentStatus.ACTIVE},
         PaperDeploymentStatus.FAILED: set(),
     }
     if target not in allowed.get(current, set()):

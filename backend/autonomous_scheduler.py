@@ -890,15 +890,22 @@ def _list_options_enabled_deployments(
 ) -> list:
     """Return active options-enabled deployments.
 
-    When ``allowed_underlyings`` is empty, all options-enabled deployments
-    are returned (no underlying filtering).
+    When ``allowed_underlyings`` is empty, all *active* options-enabled
+    deployments are returned (no underlying filtering).
     """
+    from trading_system.paper.deployment import PaperDeploymentStatus
     try:
         center = controller.control_center
     except Exception:  # noqa: BLE001
         return []
     results = []
     for dep in center.list_deployments():
+        # Skip non-ACTIVE deployments: stopped/failed deployments must not
+        # be picked up by the scheduler — their sessions are detached and
+        # their orders are rejected by the STATUS_ACCEPTS_ORDERS gate in
+        # submit_order.
+        if dep.status != PaperDeploymentStatus.ACTIVE:
+            continue
         cfg = getattr(dep, "config", None)
         if cfg is None:
             continue

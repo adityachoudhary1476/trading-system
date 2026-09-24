@@ -311,7 +311,8 @@ class TestDeploymentLifecycle:
         d = center.stop_deployment(deployment.deployment_id)
         assert d.status == PaperDeploymentStatus.STOPPED
 
-    def test_invalid_transition_fails(self, center):
+    def test_resume_stopped_deployment(self, center):
+        """STOPPED is no longer terminal — resume should reactivate."""
         spec = _spec()
         _, deployment, _ = _build_eligible(
             center.registry.store, center.registry, center.intelligence, center.gate,
@@ -321,8 +322,13 @@ class TestDeploymentLifecycle:
             s.merge(deployment.as_record())
             s.commit()
         center.stop_deployment(deployment.deployment_id)
-        with pytest.raises(InvalidLifecycleTransitionError):
-            center.resume_deployment(deployment.deployment_id)
+        assert center.get_deployment(deployment.deployment_id).status == \
+            PaperDeploymentStatus.STOPPED
+        # Resume: STOPPED -> ACTIVE now succeeds (deployment reactivated).
+        d = center.resume_deployment(deployment.deployment_id)
+        assert d.status == PaperDeploymentStatus.ACTIVE
+        assert center.get_deployment(deployment.deployment_id).status == \
+            PaperDeploymentStatus.ACTIVE
 
     def test_create_to_stopped_valid(self, center):
         spec = _spec()
@@ -352,6 +358,7 @@ class TestDeploymentLifecycle:
             PaperDeploymentStatus.ACTIVE
 
     def test_terminal_states_cannot_transition(self, center):
+        """FAILED remains terminal; STOPPED can resume but cannot pause."""
         spec = _spec()
         _, deployment, _ = _build_eligible(
             center.registry.store, center.registry, center.intelligence, center.gate,
@@ -361,10 +368,24 @@ class TestDeploymentLifecycle:
             s.merge(deployment.as_record())
             s.commit()
         center.stop_deployment(deployment.deployment_id)
+        # STOPPED -> PAUSED is still not allowed (stopping is a hard stop,
+        # not a temporary pause).
+        with pytest.raises(InvalidLifecycleTransitionError):
+            center.pause_deployment(deployment.deployment_id)
+        # FAILED is fully terminal — no outgoing transitions at all.
+        failed_spec = _spec(name="Phase20 spec FAILED", symbol="NSE:SBIN")
+        _, failed_dep, _ = _build_eligible(
+            center.registry.store, center.registry, center.intelligence, center.gate,
+            failed_spec,
+        )
+        with center.registry.store._Session() as s:
+            s.merge(failed_dep.as_record())
+            s.commit()
+        center.fail_deployment(failed_dep.deployment_id)
         for op in (center.activate_deployment, center.pause_deployment,
                    center.resume_deployment):
             with pytest.raises(InvalidLifecycleTransitionError):
-                op(deployment.deployment_id)
+                op(failed_dep.deployment_id)
 
     def test_unknown_deployment_raises(self, center):
         with pytest.raises(UnknownDeploymentError):

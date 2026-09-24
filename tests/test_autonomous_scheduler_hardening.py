@@ -568,6 +568,34 @@ class TestSchedulerDeploymentLifecycle:
         rows = [d for d in center.list_deployments() if d.notes.startswith("bot:bot-lifecycle-stopped")]
         assert len(rows) == 1
 
+    def test_stopped_deployment_excluded_from_option_pool(self):
+        """_list_options_enabled_deployments must return only ACTIVE deployments.
+
+        Before the fix: the function returned ALL options-enabled deployments
+        (including STOPPED), which caused _execute_one_option_decision to pick
+        a stopped deployment, attempt order submission, and get rejected by the
+        STATUS_ACCEPTS_ORDERS gate in submit_order.
+        """
+        from backend.autonomous_scheduler import _list_options_enabled_deployments
+        center, controller, dep, strategy_id, spec = (
+            self._build_running_deployment("bot-lifecycle-stopped-pool")
+        )
+        # Confirm the running deployment shows up in the pool.
+        active_deps = _list_options_enabled_deployments(controller, frozenset())
+        assert dep.deployment_id in [d.deployment_id for d in active_deps]
+
+        # Stop it.
+        center.stop_deployment(dep.deployment_id)
+        assert center.get_deployment(dep.deployment_id).status == \
+            PaperDeploymentStatus.STOPPED
+
+        # Now it must NOT be in the options-enabled pool.
+        filtered = _list_options_enabled_deployments(controller, frozenset())
+        assert dep.deployment_id not in [d.deployment_id for d in filtered]
+        assert all(
+            d.status == PaperDeploymentStatus.ACTIVE for d in filtered
+        )
+
     def test_duplicate_creation_in_same_tick_blocked(self):
         """Repeated ticks must not create duplicate deployments."""
         center, controller, dep, strategy_id, spec = (
