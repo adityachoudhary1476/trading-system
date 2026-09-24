@@ -1621,12 +1621,24 @@ class AutonomousPortfolio:
     def read_snapshot(self) -> dict[str, Any]:
         """Read the portfolio state without mutating anything.
 
-        Prefers the snapshot last published by the scheduler/worker (so the
-        API process renders the same data the trading process sees), falling
-        back to a live in-process snapshot. Never raises.
+        When the live broker has no positions (API process reads its own empty
+        in-memory broker — fills happen in the scheduler process), fall back
+        to the most recently persisted snapshot so the UI still shows positions
+        opened by the scheduler.
         """
         try:
-            return self.snapshot()
+            snapshot = self.snapshot()
+            # API process (separate from scheduler) sees empty broker — use
+            # persisted snapshot from the scheduler's last _publish_snapshot
+            if not snapshot.get("positions") and self._load_persisted_state():
+                persisted = self._load_persisted_state()
+                if persisted.get("positions"):
+                    payload = dict(persisted)
+                    payload["data_source"] = "persisted"
+                    payload["stale"] = True
+                    payload["max_positions"] = self.max_positions
+                    return payload
+            return snapshot
         except Exception:  # noqa: BLE001
             persisted = self._load_persisted_state()
             if persisted:
