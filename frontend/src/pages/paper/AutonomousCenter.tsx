@@ -196,7 +196,7 @@ export default function AutonomousCenter() {
 
   useEffect(() => {
     fetchAll();
-    const interval = setInterval(fetchAll, 10000);
+    const interval = setInterval(fetchAll, 1000);
     return () => clearInterval(interval);
   }, []);
 
