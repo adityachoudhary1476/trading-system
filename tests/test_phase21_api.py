@@ -494,10 +494,19 @@ class TestLifecycleEndpoints:
         assert env.status == 200
         assert env.body["deployment"]["status"] == "stopped"
 
-    def test_invalid_transition_after_stop(self, router, fixture):
+    def test_resume_stopped_deployment(self, router, fixture):
+        """STOPPED -> ACTIVE is now allowed (resume reactivates)."""
         _center, dep, *_ = fixture
         router.dispatch("POST", f"/deployments/{dep.deployment_id}/stop")
         env = router.dispatch("POST", f"/deployments/{dep.deployment_id}/activate")
+        assert env.status == 200
+        assert env.body["deployment"]["status"] == "active"
+
+    def test_stop_then_pause_still_rejected(self, router, fixture):
+        """STOPPED -> PAUSED remains invalid (stopping is a hard stop)."""
+        _center, dep, *_ = fixture
+        router.dispatch("POST", f"/deployments/{dep.deployment_id}/stop")
+        env = router.dispatch("POST", f"/deployments/{dep.deployment_id}/pause")
         assert env.status == 409
         assert env.body["error"]["code"] == "invalid_lifecycle_transition"
 

@@ -78,7 +78,7 @@ class PaperDeploymentConfig(BaseModel):
     # When True, StrategySignals may carry an ``options_selection`` and the
     # deployment may open/flatten option positions. When False (default, backward
     # compatible), any options_selection on a signal is rejected by the gate.
-    options_enabled: bool = Field(default=True)
+    options_enabled: bool = Field(default=False)
 
     # Restrict which option rights may be selected. Empty list = both allowed.
     allowed_option_types: list[str] = Field(default_factory=lambda: ["CE", "PE"])
@@ -230,7 +230,7 @@ class PaperDeploymentRecord(Base):
     activated_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), nullable=False)
     notes = Column(Text, nullable=False, default="")
-    options_enabled = Column(Boolean, nullable=False, default=True)
+    options_enabled = Column(Boolean, nullable=False, default=False)
     allowed_option_types_json = Column(Text, nullable=False, default='["CE","PE"]')
     max_options_contracts_per_trade = Column(Integer, nullable=True)
     strategy_parameters_json = Column(Text, nullable=False, default="{}")

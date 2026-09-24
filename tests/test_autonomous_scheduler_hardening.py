@@ -502,7 +502,10 @@ class TestSchedulerDeploymentLifecycle:
             strategy_id=strategy_id,
             timeframe="1d",
             strategy_spec=spec,
-            deployment_config=PaperDeploymentConfig(initial_cash=100_000.0, allow_short=False),
+            deployment_config=PaperDeploymentConfig(
+                initial_cash=100_000.0, allow_short=False,
+                options_enabled=True,
+            ),
         )
         assert result == DeploymentCreationResult.SUCCESS
         return center, controller, dep, strategy_id, spec
@@ -558,7 +561,10 @@ class TestSchedulerDeploymentLifecycle:
             strategy_id=strategy_id,
             timeframe="1d",
             strategy_spec=spec,
-            deployment_config=PaperDeploymentConfig(initial_cash=100_000.0, allow_short=False),
+            deployment_config=PaperDeploymentConfig(
+                initial_cash=100_000.0, allow_short=False,
+                options_enabled=True,
+            ),
         )
         # The deployment row is the same — it transitions STOPPED -> ACTIVE.
         assert dep2.deployment_id == dep.deployment_id
@@ -777,7 +783,7 @@ class TestSchedulerSafetyGates:
         decision = self._build_buy_decision(controller, strategy_id)
         with _FakeSpecLookup(_build_spec_for_test()):
             result = _execute_one_decision(controller, decision, target_qty=1)
-        assert result["result"] == "rejected"
+        assert result["result"] == "safety_rejected"
         assert _count_orders(center, sid) == 0
 
     def test_trading_mode_must_be_paper(self):

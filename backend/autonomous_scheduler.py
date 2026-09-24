@@ -946,10 +946,17 @@ def _run_phase_b_validation(
     observations: list[dict] = []
     for dep in deps:
         underlying = (getattr(dep, "symbol", "") or "").split(":")[-1]
+        timeframe = getattr(dep, "timeframe", "1d")
+        # Fetch the current spot price from market data instead of using
+        # a hardcoded placeholder.  Falls back to 25000.0 when market data
+        # is unavailable (dry-run / offline).
+        spot_price = _fetch_current_spot_price(
+            controller, getattr(dep, "symbol", ""), timeframe
+        )
         obs = wiring.verify_deployment_capability(
             underlying=underlying,
             direction=OptionDirection.CALL,
-            spot_price=25000.0,
+            spot_price=spot_price,
             max_quote_age_seconds=max_quote_age_seconds,
         )
         for o in obs:
@@ -1539,6 +1546,24 @@ def _has_fresh_data(center, symbol: str, timeframe: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return df is not None
+
+
+def _fetch_current_spot_price(
+    controller, symbol: str, timeframe: str
+) -> float:
+    """Fetch the latest close price for *symbol* from the market data provider.
+
+    Falls back to 25000.0 when market data is unavailable (dry-run / offline),
+    so Phase B validation never hard-fails on a missing price feed.
+    """
+    try:
+        center = controller.control_center
+        df = center.load_market_data(symbol, timeframe)
+        if df is not None and len(df) > 0:
+            return float(df["close"].iloc[-1])
+    except Exception:  # noqa: BLE001
+        pass
+    return 25000.0
 
 
 # --------------------------------------------------------------------------- #
