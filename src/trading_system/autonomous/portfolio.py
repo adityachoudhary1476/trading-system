@@ -307,6 +307,7 @@ class AutonomousPortfolio:
         self._attribution: dict[str, str] = {}
         self._actions: list[PortfolioAction] = []
         self._deployment_id: Optional[str] = None
+        self._session_id: Optional[str] = None
 
         # Cross-process read model (best effort; never fatal).
         state = self._load_persisted_state()
@@ -539,12 +540,15 @@ class AutonomousPortfolio:
 
         sid = center.find_session_for_deployment(dep.deployment_id)
         if sid is not None:
+            self._session_id = sid
             return sid
 
         # Fresh process: reconstruct the live session from the persisted
         # checkpoint via the existing control-center recovery path.
         try:
-            return center.ensure_live_session(dep.deployment_id)
+            sid = center.ensure_live_session(dep.deployment_id)
+            self._session_id = sid
+            return sid
         except Exception:  # noqa: BLE001
             return None
 
@@ -660,6 +664,11 @@ class AutonomousPortfolio:
 
     @property
     def session_id(self) -> Optional[str]:
+        # Use the session_id from the most recent ensure_account() call if set,
+        # otherwise look it up fresh. This ensures snapshot() sees the same
+        # session that enter_opportunities() used to submit orders.
+        if self._session_id is not None:
+            return self._session_id
         dep = self.find_portfolio_deployment()
         if dep is None:
             return None
@@ -1537,7 +1546,10 @@ class AutonomousPortfolio:
         dep = self.find_portfolio_deployment()
         deployment_id = dep.deployment_id if dep is not None else self._deployment_id
 
-        if account is None:
+        # When the live broker has no positions (API process reads its own empty
+        # in-memory broker — fills happen in the scheduler process), fall back
+        # to the last snapshot published by the scheduler worker.
+        if account is None or not account.positions:
             if persisted:
                 payload = dict(persisted)
                 payload["data_source"] = "persisted"
