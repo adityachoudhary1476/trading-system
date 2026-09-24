@@ -2235,34 +2235,5 @@ def run() -> int:
     return 0
 
 
-def _find_matching_option_position(controller, decision, option_intent):
-    """Find an existing open option position matching the decision."""
-    try:
-        center = controller.control_center
-    except Exception:  # noqa: BLE001
-        return None
-
-    for checkpoint in center.list_sessions():
-        runner = center.get_runner(checkpoint.session_id)
-        if runner is None:
-            continue
-        for position in runner.broker.positions().values():
-            if position is None or position.qty <= 0:
-                continue
-            if not getattr(position, "is_option", False):
-                continue
-            if option_intent and getattr(position, "option_type", None) != option_intent:
-                continue
-            return position
-    return None
-
-
-def _option_position_matches_contract_exit(position, decision, explicit_option_type):
-    """Verify the existing position matches the requested option contract."""
-    if explicit_option_type and getattr(position, "option_type", None) != explicit_option_type:
-        return False
-    return True
-
-
 if __name__ == "__main__":
     sys.exit(run())
