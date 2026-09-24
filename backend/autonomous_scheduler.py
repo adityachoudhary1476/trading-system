@@ -1184,6 +1184,7 @@ def _execute_one_option_decision(
                 action="sell",
                 reference_price=spot_price,
                 option_intent=option_intent,
+                option_contract_id=contract_id,
             ),
         )
 
@@ -1195,7 +1196,6 @@ def _execute_one_option_decision(
             order_quantity=target_qty,
             options_deployment_config=cfg,
             explicit_option_type=option_intent,
-            explicit_instrument=_instrument_from_position(matching_position),
             existing_position=matching_position,
         )
 
@@ -2228,28 +2228,6 @@ def _option_position_matches_contract_exit(position, decision, explicit_option_t
     if explicit_option_type and getattr(position, "option_type", None) != explicit_option_type:
         return False
     return True
-
-
-def _instrument_from_position(position):
-    """Reconstruct a minimal instrument-like object from an existing option position."""
-    from trading_system.india.instruments import Instrument, InstrumentType, InternalSymbol
-    internal = InternalSymbol(
-        exchange="NFO",
-        symbol=getattr(position, "options_contract_id", position.symbol),
-    )
-    instr = Instrument(
-        internal=internal,
-        instrument_type=InstrumentType.OPTION_CE if getattr(position, "option_type", None) == "CE" else InstrumentType.OPTION_PE,
-        name=position.symbol,
-    )
-    instr.provider_symbol = position.symbol
-    instr.exchange_full = "NFO"
-    instr.underlying = position.symbol
-    instr.expiry = getattr(position, "expiry", None)
-    instr.strike = getattr(position, "strike", None)
-    instr.option_type = getattr(position, "option_type", None)
-    instr.lot_size = getattr(position, "contract_size", 1)
-    return instr
 
 
 if __name__ == "__main__":
