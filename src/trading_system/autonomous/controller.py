@@ -1437,7 +1437,7 @@ class AutonomousController(BaseModel):
 
         # Deterministic client_order_id for idempotency (generated before
         # the idempotency guard so cached results can be looked up on replay).
-        action_for_id = decision.action
+        action_for_id = explicit_side if explicit_side is not None else decision.action
         if client_order_id is None:
             import hashlib
             client_order_id = hashlib.sha256(
@@ -1500,7 +1500,10 @@ class AutonomousController(BaseModel):
 
         # Pre-compute values needed for idempotency replay and OrderIntent.
         action = decision.action
-        side = Side.BUY if str(action).lower() == "buy" else Side.SELL
+        if explicit_side is not None:
+            side = Side.BUY if str(explicit_side).lower() == "buy" else Side.SELL
+        else:
+            side = Side.BUY if str(action).lower() == "buy" else Side.SELL
 
         # --- Feed premium to PaperBroker BEFORE order submission ---
         # This sets _last_price so the broker has a current market price for

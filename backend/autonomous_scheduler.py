@@ -1150,7 +1150,9 @@ def _execute_one_option_decision(
     elif action_value in ("sell", "exit"):
         open_positions = _get_open_option_positions(controller.control_center, deployment_id)
         matching_position = None
-        for pos in open_positions:
+        # Iterate newest-first (LIFO): when multiple option positions of the same
+        # type are open, prefer closing the most recently opened contract.
+        for pos in reversed(open_positions):
             if _option_position_matches_contract(pos, decision, option_intent):
                 matching_position = pos
                 break

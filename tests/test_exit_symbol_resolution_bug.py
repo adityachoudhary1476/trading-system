@@ -374,3 +374,202 @@ class TestExitSymbolResolution:
             if pos.is_option and pos.is_open and pos.option_type == "CE":
                 return pos
         return None
+
+
+class TestExplicitSideOverride:
+    """Bug fix: explicit_side parameter now controls the OrderIntent side."""
+
+    def setup_method(self):
+        self.center, self.spec, self.strategy_id = _build_center()
+        self.controller = _build_controller(self.center, "explicit-side-bot")
+        self.dep = _deploy(
+            self.controller, self.center, "explicit-side-bot",
+            self.strategy_id, self.spec,
+        )
+        self.sid = self.center.find_session_for_deployment(self.dep.deployment_id)
+        self.repo = _build_repo()
+        self.qp = ValidatingQuoteProvider(self.repo)
+        self.controller.set_option_discoverer(
+            CurrentOptionDiscoverer(repository=self.repo), repository=self.repo,
+        )
+        self.controller.set_quote_provider(self.qp)
+
+    def _buy_one(self, cid):
+        from trading_system.strategy_factory.contract import StrategySignal
+        sig = StrategySignal(
+            action=SignalAction.BUY, strategy_id=self.strategy_id,
+            timestamp=datetime.now(UTC), symbol="NSE:NIFTY",
+            reference_price=25000.0, confidence=0.9,
+            reason="buy", option_intent="CE",
+        )
+        decision = SimpleNamespace(
+            decision_id=f"buy-{cid}",
+            opportunity_symbol="NSE:NIFTY",
+            selected_configuration=SimpleNamespace(
+                strategy_id=self.strategy_id, timeframe="1d",
+            ),
+            signal=sig, action="buy",
+        )
+        result = self.controller.execute_option_order(
+            decision=decision,
+            spot_price=25000.0,
+            deployment_id=self.dep.deployment_id,
+            session_id=self.sid,
+            order_quantity=1,
+            options_deployment_config=self.dep.config,
+            explicit_option_type="CE",
+            client_order_id=f"buy-{cid}",
+        )
+        assert result is not None and result.status == "FILLED"
+        return result
+
+    def test_explicit_side_overrides_decision_action(self):
+        """With existing_position (EXIT path), explicit_side='sell' must
+        produce a SELL order even when decision.action='buy'."""
+        buy_result = self._buy_one("override")
+        runner = self.center.get_runner(self.sid)
+        pos = runner.broker.get_position(buy_result.symbol)
+        assert pos is not None and pos.qty == 1
+
+        # EXIT path but with decision.action="buy" (simulating a caller that
+        # sets action differently from the intended side).
+        class FakeExitQP:
+            def get_quote(self, instrument):
+                return OptionQuote(
+                    instrument=instrument, ltp=200.0,
+                    timestamp=datetime.now(UTC), fetched_at=datetime.now(UTC),
+                    source_symbol=instrument.provider_symbol,
+                )
+            def is_fresh(self, quote, max_age_seconds=None):
+                return True
+        self.controller.set_quote_provider(FakeExitQP())
+
+        decision = SimpleNamespace(
+            decision_id="exit-override",
+            opportunity_symbol="NSE:NIFTY",
+            selected_configuration=SimpleNamespace(
+                strategy_id=self.strategy_id, timeframe="1d",
+            ),
+            action="buy",  # would normally make side=BUY
+            signal=SimpleNamespace(
+                action="buy", reference_price=25000.0, option_intent="CE",
+            ),
+        )
+        result = self.controller.execute_option_order(
+            decision=decision,
+            spot_price=25000.0,
+            deployment_id=self.dep.deployment_id,
+            session_id=self.sid,
+            order_quantity=1,
+            options_deployment_config=self.dep.config,
+            explicit_option_type="CE",
+            explicit_side="sell",  # override → should be SELL
+            existing_position=pos,
+            client_order_id="exit-override-001",
+        )
+        assert result is not None, "EXIT with explicit_side should succeed"
+        assert result.side == "SELL", \
+            f"expected SELL from explicit_side, got {result.side!r}"
+        # Position should be flat (closed), not increased to 2
+        runner = self.center.get_runner(self.sid)
+        flat_pos = runner.broker.get_position(buy_result.symbol)
+        assert flat_pos.qty == 0
+
+
+class TestExitLIFOMatching:
+    """Exit matching: when multiple CE positions are open, close the most
+    recently opened (LIFO) rather than the oldest."""
+
+    def setup_method(self):
+        self.center, self.spec, self.strategy_id = _build_center()
+        self.controller = _build_controller(self.center, "lifo-bot")
+        self.dep = _deploy(
+            self.controller, self.center, "lifo-bot",
+            self.strategy_id, self.spec,
+        )
+        self.sid = self.center.find_session_for_deployment(self.dep.deployment_id)
+        self.repo = _build_repo()
+        self.qp = ValidatingQuoteProvider(self.repo)
+        self.controller.set_option_discoverer(
+            CurrentOptionDiscoverer(repository=self.repo), repository=self.repo,
+        )
+        self.controller.set_quote_provider(self.qp)
+
+    def _buy_at(self, spot, cid):
+        from trading_system.strategy_factory.contract import StrategySignal
+        sig = StrategySignal(
+            action=SignalAction.BUY, strategy_id=self.strategy_id,
+            timestamp=datetime.now(UTC), symbol="NSE:NIFTY",
+            reference_price=spot, confidence=0.9,
+            reason="buy", option_intent="CE",
+        )
+        decision = SimpleNamespace(
+            decision_id=f"buy-{cid}",
+            opportunity_symbol="NSE:NIFTY",
+            selected_configuration=SimpleNamespace(
+                strategy_id=self.strategy_id, timeframe="1d",
+            ),
+            signal=sig, action="buy",
+        )
+        result = self.controller.execute_option_order(
+            decision=decision,
+            spot_price=spot,
+            deployment_id=self.dep.deployment_id,
+            session_id=self.sid,
+            order_quantity=1,
+            options_deployment_config=self.dep.config,
+            explicit_option_type="CE",
+            client_order_id=f"buy-{cid}",
+        )
+        assert result is not None and result.status == "FILLED"
+        return result
+
+    def test_exit_closes_most_recent_position(self):
+        """Open two CE positions (different strikes), then SELL one.
+        The EXIT must close the most recently opened position (LIFO)."""
+        # First BUY — ATM near 25000 → strike 25000
+        r1 = self._buy_at(25000.0, "old")
+        # Second BUY — ATM near 24800 → strike 24800
+        r2 = self._buy_at(24800.0, "new")
+
+        # Collect open positions before EXIT
+        runner = self.center.get_runner(self.sid)
+        before = {
+            p.symbol: p for p in runner.broker.positions().values()
+            if p.is_option and p.is_open
+        }
+        assert len(before) == 2, f"expected 2 open positions, got {len(before)}"
+
+        from backend.autonomous_scheduler import _execute_one_option_decision
+        from tests.test_autonomous_scheduler_hardening import _FakeSpecLookup
+        from tests.test_f2_option_lifecycle import _build_spec_for_test
+
+        spec = _build_spec_for_test()
+        exit_decision = SimpleNamespace(
+            decision_id="lifo-exit",
+            opportunity_symbol="NSE:NIFTY",
+            selected_configuration=SimpleNamespace(
+                strategy_id=self.strategy_id, timeframe="1d",
+            ),
+            action="sell",
+            signal=SimpleNamespace(
+                action="sell", reference_price=25000.0, option_intent="CE",
+            ),
+        )
+        with _FakeSpecLookup(spec):
+            result = _execute_one_option_decision(
+                self.controller, exit_decision,
+                spot_price=25000.0, target_qty=1,
+            )
+        assert result["result"] == "submitted", \
+            f"EXIT failed: {result}"
+
+        # After EXIT: the most recent position (r2 symbol) should be closed;
+        # the older one (r1 symbol) should remain open.
+        runner = self.center.get_runner(self.sid)
+        old_pos = runner.broker.get_position(r1.symbol)
+        new_pos = runner.broker.get_position(r2.symbol)
+        assert old_pos is not None and old_pos.qty == 1, \
+            "older position should remain open"
+        assert new_pos is not None and new_pos.qty == 0, \
+            f"most recent position should be closed (LIFO), got qty={new_pos.qty}"
