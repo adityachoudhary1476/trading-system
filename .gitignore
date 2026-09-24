@@ -44,9 +44,12 @@ railway-worker.toml
 .mypy_cache/
 .ruff_cache/
 
-# Local inspection artifacts (not part of the project)
+# Local inspection / scratch scripts (not part of the project)
 trading-system-audit/
 vibetrading-inspection/
+check_now.py
+check_snapshot*.py
+_test_broker.py
 
 # Embedded git submodules removed from index (not needed for deployment)
 # These dirs exist locally for reference but must not be tracked as gitlinks
