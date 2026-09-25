@@ -39,7 +39,7 @@ from .parameters import ParameterDefinition, ParameterSchema, ParameterType
 # ---------------------------------------------------------------------------
 
 def _infer_family(spec: StrategySpec) -> StrategyFamily:
-    name = (spec.spec_name or "").lower()
+    name = (spec.name or "").lower()
     if any(w in name for w in ("trend", "ema", "ma", "sma")):
         return StrategyFamily.TREND
     if any(w in name for w in ("mean", "reversion", "rsi", "oscillator")):
@@ -55,23 +55,35 @@ def _infer_family(spec: StrategySpec) -> StrategyFamily:
 
 def _spec_params_to_schema(spec: StrategySpec) -> ParameterSchema:
     params: list[ParameterDefinition] = []
-    for key, val in (spec.parameters or {}).items():
-        params.append(ParameterDefinition(
-            name=key,
-            type=ParameterType.FLOAT,
-            default=float(val) if isinstance(val, (int, float)) else 0.0,
-            description=f"Auto-bridged parameter from {spec.spec_name}",
-        ))
+    # StrategySpec stores parameters inside the indicator definitions, not at top level.
+    for ind in (spec.indicators or []):
+        for key, val in (getattr(ind, "parameters", None) or {}).items():
+            params.append(ParameterDefinition(
+                name=key,
+                type=ParameterType.FLOAT,
+                default=float(val) if isinstance(val, (int, float)) else 0.0,
+                description=f"Auto-bridged parameter from {spec.name}",
+            ))
+    # Also pull any top-level numeric fields that look like parameters.
+    for field_name in ("stop_loss", "take_profit", "trailing_stop"):
+        val = getattr(spec, field_name, None)
+        if val is not None:
+            params.append(ParameterDefinition(
+                name=field_name,
+                type=ParameterType.FLOAT,
+                default=float(val) if isinstance(val, (int, float)) else 0.0,
+                description=f"Auto-bridged parameter from {spec.name}",
+            ))
     return ParameterSchema(parameters=params)
 
 
-def _spec_to_metadata(spec: StrategySpec) -> StrategyMetadata:
+def _spec_to_metadata(spec: StrategySpec, *, strategy_id: Optional[str] = None) -> StrategyMetadata:
     return StrategyMetadata(
-        strategy_id=spec.strategy_id or f"spec_{spec.spec_name}",
-        name=spec.name or spec.spec_name or "DB Strategy",
-        version=spec.version or "1.0.0",
+        strategy_id=strategy_id or f"spec_{spec.name}",
+        name=spec.name or "DB Strategy",
+        version="1.0.0",
         family=_infer_family(spec),
-        description=spec.description or f"Auto-bridged spec: {spec.spec_name}",
+        description=spec.description or f"Auto-bridged spec: {spec.name}",
         timeframes=[spec.timeframe] if spec.timeframe else ["1d"],
         supported_instruments=[spec.symbol] if spec.symbol else ["*"],
         required_data=["ohlcv"],
@@ -79,7 +91,7 @@ def _spec_to_metadata(spec: StrategySpec) -> StrategyMetadata:
         parameter_schema=_spec_params_to_schema(spec),
         author="db-bridge",
         tags=["db-bridged", "spec"],
-        long_short_support=spec.allow_short if hasattr(spec, "allow_short") else False,
+        long_short_support=getattr(spec, "allow_short", False),
         intraday=False,
         requires_volume=True,
         requires_ohlcv=True,
@@ -94,13 +106,13 @@ def _spec_to_metadata(spec: StrategySpec) -> StrategyMetadata:
 _STREAM_CACHE: dict[str, type[Strategy]] = {}
 
 
-def _make_factory_strategy_class(spec: StrategySpec) -> type[Strategy]:
+def _make_factory_strategy_class(spec: StrategySpec, *, strategy_id: Optional[str] = None) -> type[Strategy]:
     """Return (and cache) a factory ``Strategy`` subclass wrapping *spec*."""
-    sid = spec.strategy_id or f"spec_{spec.spec_name}"
+    sid = strategy_id or f"spec_{spec.name}"
     if sid in _STREAM_CACHE:
         return _STREAM_CACHE[sid]
 
-    metadata = _spec_to_metadata(spec)
+    metadata_obj = _spec_to_metadata(spec, strategy_id=strategy_id)
 
     class _SpecFactoryStrategy(Strategy):
         """Deterministic factory Strategy wrapping a persisted StrategySpec.
@@ -111,7 +123,7 @@ def _make_factory_strategy_class(spec: StrategySpec) -> type[Strategy]:
         ``StrategySignal``.
         """
 
-        metadata = metadata
+        metadata = metadata_obj
 
         def __init__(self, **params: Any) -> None:
             # Ignore caller overrides; the spec is the source of truth.
@@ -202,21 +214,21 @@ def register_db_spec_strategies(center: Any) -> List[str]:
         return registered
 
     for strategy in strategies:
+        spec_json = getattr(strategy, "spec_json", None)
+        if not spec_json:
+            continue
         try:
-            spec: Optional[StrategySpec] = getattr(strategy, "spec", None)
+            spec: Optional[StrategySpec] = StrategySpec.model_validate_json(spec_json)
         except Exception:  # noqa: BLE001
-            spec = None
-
-        if spec is None:
             continue
 
-        strategy_id = spec.strategy_id or f"spec_{spec.spec_name}"
+        strategy_id = strategy.strategy_id or spec.strategy_id or f"spec_{spec.spec_name}"
         if strategy_id in registered_strategy_ids():
             registered.append(strategy_id)
             continue
 
         try:
-            factory_cls = _make_factory_strategy_class(spec)
+            factory_cls = _make_factory_strategy_class(spec, strategy_id=strategy_id)
             register_strategy(factory_cls)
             registered.append(strategy_id)
         except Exception:  # noqa: BLE001
