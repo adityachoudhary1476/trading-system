@@ -313,6 +313,7 @@ class AutonomousPortfolio:
         state = self._load_persisted_state()
         if state:
             self._deployment_id = state.get("deployment_id") or None
+            self._session_id = state.get("session_id") or None
             for raw in (state.get("actions") or [])[-self._action_log_limit:]:
                 try:
                     self._actions.append(PortfolioAction.model_validate(raw))
@@ -1759,6 +1760,14 @@ class AutonomousPortfolio:
             if key and row.get("strategy_id"):
                 attribution[key] = row["strategy_id"]
         payload["attribution"] = attribution
+        # Don't clobber a richer persisted snapshot with an empty market-closed one.
+        # When the market is closed, positions will be empty — preserve any previously
+        # persisted positions/actions so the API still shows the last live state.
+        existing = self._load_persisted_state()
+        if not payload.get("positions") and existing.get("positions"):
+            payload["positions"] = existing["positions"]
+            payload["attribution"] = existing.get("attribution", attribution) or attribution
+            payload["actions"] = existing.get("actions", payload.get("actions")) or payload.get("actions", [])
         self._save_persisted_state(payload)
         return snapshot
 
