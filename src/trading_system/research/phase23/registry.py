@@ -298,11 +298,16 @@ class Phase23Registry:
         ]
 
     def get_paper_approved(self) -> list[Any]:
-        """Return strategies marked as paper-approved."""
-        results = []
+        """Return strategies that have ``PAPER_APPROVED`` evidence.
+
+        The evidence ``qualification_status == "PAPER_APPROVED"`` is the
+        authoritative gate. The strategy ``status`` field is metadata and
+        is not required to be ``VALIDATED`` — legacy DB records and direct
+        SQL inserts may carry PAPER_APPROVED evidence without having their
+        status updated.
+        """
+        results: list[Any] = []
         for s in self._registry.list_strategies():
-            if s.status != StrategyStatus.VALIDATED:
-                continue
             evidence = self._registry.list_evidence(strategy_id=s.strategy_id)
             for ev in evidence:
                 config = ev.configuration_json or {}
@@ -312,11 +317,14 @@ class Phase23Registry:
         return results
 
     def get_paper_experimental(self) -> list[Any]:
-        """Return strategies marked as paper-experimental (Phase 24 qualified but not fully approved)."""
-        results = []
+        """Return strategies that have ``PAPER_EXPERIMENTAL`` evidence.
+
+        The evidence ``qualification_status == "PAPER_EXPERIMENTAL"`` is the
+        authoritative gate — there is no corresponding ``StrategyStatus``
+        enum value (the status field is metadata, not a gate).
+        """
+        results: list[Any] = []
         for s in self._registry.list_strategies():
-            if s.status != StrategyStatus.PAPER_EXPERIMENTAL:
-                continue
             evidence = self._registry.list_evidence(strategy_id=s.strategy_id)
             for ev in evidence:
                 config = ev.configuration_json or {}

@@ -159,7 +159,7 @@ def _make_factory_strategy_class(spec: StrategySpec, *, strategy_id: Optional[st
                     symbol=state.symbol,
                     reference_price=state.latest_close,
                     confidence=0.5 if target != 0 else 0.0,
-                    reason=f"Spec[{spec.spec_name}] target={target}",
+                    reason=f"Spec[{spec.name}] target={target}",
                     target_position=target,
                     version=metadata.version,
                 )
