@@ -1556,6 +1556,14 @@ class AutonomousPortfolio:
                 payload["data_source"] = "persisted"
                 payload["stale"] = True
                 payload["max_positions"] = self.max_positions
+                # Merge live strategy discovery so the API reflects current
+                # discovery results even when the broker is empty.
+                try:
+                    strategies = self._strategy_rows()
+                    if strategies.get("available"):
+                        payload["strategies"] = strategies
+                except Exception:  # noqa: BLE001
+                    pass
                 return payload
             return self._empty_snapshot(
                 deployment_id=deployment_id, reason="no_live_portfolio_session"
@@ -1650,6 +1658,14 @@ class AutonomousPortfolio:
                     payload["data_source"] = "persisted"
                     payload["stale"] = True
                     payload["max_positions"] = self.max_positions
+                    # Merge live strategy discovery so the API reflects current
+                    # discovery results even when the broker is empty.
+                    try:
+                        strategies = self._strategy_rows()
+                        if strategies.get("available"):
+                            payload["strategies"] = strategies
+                    except Exception:  # noqa: BLE001
+                        pass
                     return payload
             return snapshot
         except Exception:  # noqa: BLE001
