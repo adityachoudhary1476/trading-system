@@ -1562,6 +1562,11 @@ class AutonomousPortfolio:
                     strategies = self._strategy_rows()
                     if strategies.get("available"):
                         payload["strategies"] = strategies
+                        # Update top-level available_count from live discovery
+                        # instead of the stale persisted value.
+                        payload["available_count"] = strategies.get(
+                            "available_count"
+                        )
                 except Exception:  # noqa: BLE001
                     pass
                 return payload
@@ -1664,6 +1669,11 @@ class AutonomousPortfolio:
                         strategies = self._strategy_rows()
                         if strategies.get("available"):
                             payload["strategies"] = strategies
+                            # Update top-level available_count from live discovery
+                            # instead of the stale persisted value.
+                            payload["available_count"] = strategies.get(
+                                "available_count"
+                            )
                     except Exception:  # noqa: BLE001
                         pass
                     return payload
