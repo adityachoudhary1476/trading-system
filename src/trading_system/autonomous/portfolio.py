@@ -1569,6 +1569,11 @@ class AutonomousPortfolio:
                         )
                 except Exception:  # noqa: BLE001
                     pass
+                # Refresh the timestamp so the API doesn't show a stale
+                # updated_at from the old persisted snapshot. The data may be
+                # persisted (stale=True) but the timestamp reflects when it was
+                # last accessed, not when it was originally created.
+                payload["updated_at"] = self._now().isoformat()
                 return payload
             return self._empty_snapshot(
                 deployment_id=deployment_id, reason="no_live_portfolio_session"
@@ -1676,6 +1681,11 @@ class AutonomousPortfolio:
                             )
                     except Exception:  # noqa: BLE001
                         pass
+                    # Refresh the timestamp so the API doesn't show a stale
+                    # updated_at from the old persisted snapshot. The data may be
+                    # persisted (stale=True) but the timestamp reflects when it was
+                    # last accessed, not when it was originally created.
+                    payload["updated_at"] = self._now().isoformat()
                     return payload
             return snapshot
         except Exception:  # noqa: BLE001
