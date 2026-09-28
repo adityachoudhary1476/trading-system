@@ -973,7 +973,12 @@ def _execute_one_option_decision(
 ) -> dict:
     """Execute one option decision via the controller's option path.
 
-    Supports BUY (new position) and SELL/EXIT (close existing position).
+    BUY opens/extends a long option and requires an explicit CE/PE direction.
+    SELL and EXIT both close an existing long option position; the contract
+    identity is read from the matched position, so ``option_intent`` is
+    optional and only narrows which position is closed (newest-first / LIFO).
+    HOLD and any non-contract action are no-ops.
+
     Returns a structured result dict. Never raises — all failures are
     captured in the result dict.
     """
@@ -1012,25 +1017,38 @@ def _execute_one_option_decision(
 
     action = getattr(decision.signal, "action", None)
     action_value = action.value if hasattr(action, "value") else str(action)
+    action_value = str(action_value).strip().lower()
     option_intent = getattr(decision.signal, "option_intent", None)
 
-    if action_value.lower() == "buy":
-        if option_intent not in ("CE", "PE"):
-            return {
-                "result": "option_selling_not_supported",
-                "detail": "BUY option requires explicit option_intent=CE/PE",
-            }
-    elif action_value.lower() == "sell":
-        if option_intent is None:
-            return {
-                "result": "option_selling_not_supported",
-                "detail": "SELL option requires explicit option_intent=CE/PE",
-            }
-    else:
+    # --- Action allow-list (SignalAction: buy / sell / exit / hold) ---
+    #   BUY  -> open/extend a long option; needs an explicit CE/PE direction.
+    #   SELL -> close/extend via the exit path; Phase 23 never opens naked
+    #           option shorts, so this resolves against open positions.
+    #   EXIT -> flatten an open option position; direction-agnostic.
+    #   HOLD -> no-op.
+    # Anything outside this set is a contract violation and must not be
+    # coerced into a side.
+    if action_value not in ("buy", "sell", "exit", "hold"):
         return {
             "result": "no_option_action",
-            "detail": f"action={action_value!r} does not trigger option execution",
+            "detail": f"action={action_value!r} is not an executable option action",
         }
+    if action_value == "hold":
+        return {
+            "result": "no_option_action",
+            "detail": "HOLD does not trigger option execution",
+        }
+
+    if action_value == "buy" and option_intent not in ("CE", "PE"):
+        # An entry needs an explicit direction. SELL must never be silently
+        # reinterpreted as a PUT buy (SELL-is-not-PUT invariant).
+        return {
+            "result": "option_intent_required",
+            "detail": "BUY option requires explicit option_intent=CE/PE",
+        }
+    # SELL/EXIT deliberately do NOT require option_intent. It only narrows
+    # which open position is matched; the contract identity is read from the
+    # matched position itself, so an exit is always resolvable.
 
     # Find the first options-enabled deployment.
     dep = deps[0]
@@ -1043,9 +1061,13 @@ def _execute_one_option_decision(
         }
 
     # --- Check allowed_option_types ---
+    # On SELL/EXIT option_intent may be absent (see above), so only gate when a
+    # direction is actually known. Exits must never be blocked by an entry-time
+    # policy that could strand capital; the controller re-validates the
+    # resolved contract's option_type before submitting (controller.py:1477).
     cfg = getattr(dep, "config", None)
     allowed_types = getattr(cfg, "allowed_option_types", []) or []
-    if option_intent not in allowed_types:
+    if option_intent is not None and option_intent not in allowed_types:
         return {
             "result": "option_type_not_allowed",
             "detail": f"{option_intent} not in {allowed_types}",
@@ -1054,7 +1076,7 @@ def _execute_one_option_decision(
 
     # --- Execute via controller ---
     runner = controller.control_center.get_runner(sid)
-    if action_value.lower() == "buy":
+    if action_value == "buy":
         max_contracts = getattr(cfg, "max_options_contracts_per_trade", None)
         if max_contracts is not None and target_qty > max_contracts:
             return {
@@ -1144,7 +1166,7 @@ def _execute_one_option_decision(
             order_quantity=target_qty,
             options_deployment_config=cfg,
             explicit_option_type=option_intent,
-            explicit_side="sell" if action_value == "sell" else "buy",
+            explicit_side="buy",
             explicit_instrument=explicit_instrument,
         )
 
@@ -1174,15 +1196,18 @@ def _execute_one_option_decision(
         matching_position = None
         # Iterate newest-first (LIFO): when multiple option positions of the same
         # type are open, prefer closing the most recently opened contract.
+        # option_intent may be None here, in which case the newest open option
+        # position is closed regardless of CE/PE.
         for pos in reversed(open_positions):
             if _option_position_matches_contract(pos, decision, option_intent):
                 matching_position = pos
                 break
 
         if matching_position is None:
+            wanted = option_intent or "option"
             return {
                 "result": "no_long_option_position",
-                "detail": f"no open {option_intent} position to close",
+                "detail": f"no open {wanted} position to close",
                 "deployment_id": deployment_id,
             }
 
@@ -1198,6 +1223,11 @@ def _execute_one_option_decision(
                 "detail": "existing position missing contract metadata",
                 "deployment_id": deployment_id,
             }
+
+        # The contract identity is authoritative from the matched position.
+        # Backfill so downstream reporting and the controller's Phase 7
+        # contract-validity check see a concrete CE/PE.
+        option_intent = pos_option_type
 
         exit_decision = SimpleNamespace(
             decision_id=getattr(decision, "decision_id", "exit") + "-exit",
@@ -1243,9 +1273,9 @@ def _execute_one_option_decision(
             "session_id": sid,
         }
 
-    # HOLD or unknown action
+    # Unreachable: the action allow-list above already rejected hold/unknown.
     return {
-        "result": "no_option_intent",
+        "result": "no_option_action",
         "detail": f"unsupported action={action_value!r} for options",
         "deployment_id": deployment_id,
     }

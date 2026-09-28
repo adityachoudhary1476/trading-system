@@ -97,6 +97,7 @@ class RSIMeanReversionStrategy(Strategy):
         oversold: float = 30.0,
         overbought: float = 70.0,
         allow_short: bool = False,
+        options_mode: bool = False,
     ) -> None:
         values = _PARAMETER_SCHEMA.validate_values(
             {
@@ -110,6 +111,7 @@ class RSIMeanReversionStrategy(Strategy):
         self._oversold = float(values["oversold"])
         self._overbought = float(values["overbought"])
         self._allow_short = bool(values["allow_short"])
+        self._options_mode = bool(options_mode)
         if self._oversold >= self._overbought:
             raise ValueError(
                 f"oversold ({self._oversold}) must be < overbought ({self._overbought})"
@@ -183,6 +185,18 @@ class RSIMeanReversionStrategy(Strategy):
 
         current = state.current_position_side()
         action, confidence, target = self._transition(current, desired)
+        option_intent = None
+        if self._options_mode:
+            if desired == 1 and action == SignalAction.BUY:
+                option_intent = "CE"
+            elif desired == -1 and action == SignalAction.SELL:
+                # In options mode a bearish signal enters via a long PUT
+                # (BUY the PE option contract, not short the underlying).
+                action = SignalAction.BUY
+                option_intent = "PE"
+            # EXIT and HOLD pass through unchanged: EXIT is a
+            # direction-agnostic flatten resolved from the open position, so
+            # rewriting it to a BUY would leave the position permanently open.
         return StrategySignal(
             action=action,
             strategy_id=self.metadata.strategy_id,
@@ -192,6 +206,7 @@ class RSIMeanReversionStrategy(Strategy):
             confidence=confidence,
             reason=f"{direction}; rsi={rsi_val:.6f}",
             target_position=target,
+            option_intent=option_intent,
             metadata={
                 "rsi": rsi_val,
                 "oversold": self._oversold,

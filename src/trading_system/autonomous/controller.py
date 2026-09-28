@@ -105,6 +105,37 @@ from .safety import (
 
 
 # --------------------------------------------------------------------------- #
+# Action -> broker side resolution
+# --------------------------------------------------------------------------- #
+
+# EXIT is a flatten, so it resolves to a sell-to-close. Phase 23 never opens
+# naked option shorts, so there is no long-to-short reversal to encode here.
+# HOLD and anything unrecognised are deliberately absent: they must fail
+# closed rather than be coerced into a sell.
+_OPTION_ACTION_TO_SIDE: dict[str, "Side"] = {
+    "buy": Side.BUY,
+    "sell": Side.SELL,
+    "exit": Side.SELL,
+}
+
+
+def _resolve_option_order_side(
+    *, explicit_side: object = None, action: object = None
+) -> Optional[Side]:
+    """Map a declared action onto a broker ``Side``.
+
+    ``explicit_side`` wins when supplied. Returns ``None`` when the value is
+    not an executable action, so callers fail closed instead of defaulting
+    to a sell.
+    """
+    raw = explicit_side if explicit_side is not None else action
+    if raw is None:
+        return None
+    key = str(getattr(raw, "value", raw)).strip().lower()
+    return _OPTION_ACTION_TO_SIDE.get(key)
+
+
+# --------------------------------------------------------------------------- #
 # AutonomousController — the primary orchestration service.
 # This is the "glue" that connects the autonomous layer to the existing
 # deployment/paper-trading engine. It does NOT contain any trading logic,
@@ -1291,6 +1322,24 @@ class AutonomousController(BaseModel):
             )
             return None
 
+        # --- Resolve the broker side up-front, before any quote fetch ---
+        # Rejecting a non-executable action here means a HOLD/typo can never be
+        # coerced into a fabricated sell, and it saves a wasted premium fetch.
+        side = _resolve_option_order_side(
+            explicit_side=explicit_side,
+            action=getattr(decision, "action", None),
+        )
+        if side is None:
+            self._record_event(
+                AutonomousEventType.ERROR,
+                symbol=decision.opportunity_symbol,
+                message=(
+                    "option execution skipped: non-executable action "
+                    f"explicit_side={explicit_side!r} action={getattr(decision, 'action', None)!r}"
+                ),
+            )
+            return None
+
         if self._quote_provider is None:
             self._record_event(
                 AutonomousEventType.ERROR,
@@ -1499,11 +1548,7 @@ class AutonomousController(BaseModel):
             return None
 
         # Pre-compute values needed for idempotency replay and OrderIntent.
-        action = decision.action
-        if explicit_side is not None:
-            side = Side.BUY if str(explicit_side).lower() == "buy" else Side.SELL
-        else:
-            side = Side.BUY if str(action).lower() == "buy" else Side.SELL
+        # `side` was resolved (and validated) at the top of this method.
 
         # --- Feed premium to PaperBroker BEFORE order submission ---
         # This sets _last_price so the broker has a current market price for

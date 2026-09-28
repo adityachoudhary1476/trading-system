@@ -175,6 +175,10 @@ class EMACrossoverStrategy(Strategy):
                 # (BUY the PE option contract, not short the underlying).
                 action = SignalAction.BUY
                 option_intent = "PE"
+            # EXIT and HOLD pass through unchanged. EXIT is a direction-agnostic
+            # flatten: the close path resolves the contract from the open
+            # position, so it must not be rewritten to a BUY here or the
+            # position would never be closed.
         return StrategySignal(
             action=action,
             strategy_id=self.metadata.strategy_id,

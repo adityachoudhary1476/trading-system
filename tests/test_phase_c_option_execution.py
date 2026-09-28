@@ -358,6 +358,10 @@ def _make_decision(
     ``option_intent``. The controller's ``execute_option_order`` only
     inspects the signal's ``option_intent``, ``action``, and
     ``reference_price`` plus the decision's ``opportunity_symbol``.
+
+    ``action`` accepts every ``SignalAction`` member (buy/sell/exit/hold).
+    Prior to the option-exit fix the scheduler had no EXIT branch, so the
+    tests here only ever drove buy/sell and the flatten path went unverified.
     """
     if decision_id is None:
         decision_id = hashlib.sha256(
@@ -373,7 +377,7 @@ def _make_decision(
             ).encode("utf-8")
         ).hexdigest()[:48]
     sig = StrategySignal(
-        action=SignalAction.BUY if action == "buy" else SignalAction.SELL,
+        action=SignalAction(action),
         strategy_id=strategy_id,
         timestamp=datetime.now(UTC),
         symbol=symbol,
@@ -403,6 +407,19 @@ def _attach_phase_b(controller, *, premium: float = 185.0, **quote_kwargs):
     controller.set_option_discoverer(discoverer, repository=repo)
     controller.set_quote_provider(quote_provider)
     return repo
+
+
+def _open_positions(runner) -> dict:
+    """Open (non-zero qty) positions only.
+
+    ``PaperBroker.positions()`` deliberately retains fully-closed records with
+    ``qty == 0`` so realized P&L stays inspectable, so asserting on the raw
+    dict would miss a stale open position.
+    """
+    return {
+        sym: pos for sym, pos in runner.broker.positions().items()
+        if pos.is_open and pos.qty != 0
+    }
 
 
 @pytest.fixture
@@ -1103,7 +1120,397 @@ class TestSchedulerOptionExecution:
 
 
 # --------------------------------------------------------------------------- #
-# Test 17 — No live broker invocation
+# Test 17 — Option EXIT / SELL flatten path (regression)
+# --------------------------------------------------------------------------- #
+# Regression cover for the defect where ``_execute_one_option_decision``
+# only allowed ``buy``/``sell`` and rejected the canonical
+# ``SignalAction.EXIT`` flatten with ``no_option_action`` before the
+# close branch could run — leaving every opened option position open
+# forever. No test drove the option path with ``action="exit"``, so the
+# suite stayed green.
+class TestSchedulerOptionExit:
+    @staticmethod
+    def _wire(bot_id: str, *, premium: float = 185.0):
+        from backend.autonomous_scheduler import _execute_one_option_decision
+
+        center, registry, intelligence, gate, spec, strategy_id = _build_control_center()
+        controller = _build_controller(center, bot_id=bot_id)
+        dep = _create_options_deployment(
+            controller, bot_id=bot_id, spec=spec, strategy_id=strategy_id,
+            options_enabled=True, allowed_option_types=["CE", "PE"], max_contracts=1,
+        )
+        _attach_phase_b(controller, premium=premium)
+        return controller, center, dep, _execute_one_option_decision
+
+    def test_exit_action_closes_open_option_position(self):
+        controller, center, dep, execute = self._wire("bot-sched-exit")
+
+        opened = execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert opened["result"] == "submitted", opened
+
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        assert _open_positions(runner), "expected an open position after BUY"
+
+        # The canonical flatten action. This is what every built-in strategy
+        # emits (SignalAction.EXIT -- "flatten any open position").
+        closed = execute(
+            controller,
+            _make_decision(action="exit", option_intent=None, decision_id="exit-ce-1"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert closed["result"] == "submitted", (
+            f"EXIT failed to close the option position: {closed}"
+        )
+        assert closed["option_intent"] == "CE", (
+            "EXIT should backfill option_intent from the matched position"
+        )
+        assert closed["options_contract_id"] == opened["options_contract_id"]
+        # The whole point: the position is actually flat afterwards.
+        assert _open_positions(runner) == {}, (
+            "option position still open after EXIT: "
+            f"{ {k: v.qty for k, v in _open_positions(runner).items()} }"
+        )
+        # Realized P&L must be booked on the retained (now-flat) record.
+        flat_rec = next(
+            p for p in runner.broker.positions().values()
+            if p.options_contract_id == opened["options_contract_id"]
+        )
+        assert flat_rec.qty == 0.0
+        assert flat_rec.avg_entry_price == 0.0
+
+    def test_sell_without_option_intent_closes_position(self):
+        """SELL must not require option_intent — the contract is known."""
+        controller, center, dep, execute = self._wire("bot-sched-sell-nointent")
+
+        opened = execute(
+            controller, _make_decision(option_intent="PE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert opened["result"] == "submitted", opened
+
+        closed = execute(
+            controller,
+            _make_decision(action="sell", option_intent=None, decision_id="sell-no-intent-1"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert closed["result"] == "submitted", (
+            f"SELL without option_intent should close from position metadata: {closed}"
+        )
+        assert closed["option_intent"] == "PE"
+        assert closed["options_contract_id"] == opened["options_contract_id"]
+
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        assert _open_positions(center.get_runner(sid)) == {}
+
+    def test_exit_closes_the_most_recent_position_lifo(self):
+        """Two positions open: EXIT must flatten the newest first."""
+        controller, center, dep, execute = self._wire("bot-sched-lifo")
+        _attach_phase_b(controller, premium=185.0)
+
+        first = execute(
+            controller, _make_decision(option_intent="CE", decision_id="lifo-1"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert first["result"] == "submitted", first
+
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        assert len(_open_positions(runner)) == 1
+
+        # Open a second, distinct contract (different strike) directly through
+        # the control center so we control the contract identity.
+        from trading_system.execution.orders import OrderIntent, OrderType, Side
+
+        second_contract = _build_option_instrument(
+            underlying="NIFTY", strike=24900.0, option_type="CE", expiry=FUTURE_EXPIRY,
+        )
+        controller.control_center.update_deployment_market_price(
+            deployment_id=dep.deployment_id, symbol=second_contract.key, price=180.0,
+        )
+        intent = OrderIntent(
+            symbol=second_contract.key,
+            side=Side.BUY,
+            quantity=1,
+            order_type=OrderType.MARKET,
+            current_price=180.0,
+            client_order_id="lifo-second-buy",
+            options_contract_id=second_contract.contract_id,
+            strike=second_contract.strike,
+            expiry=second_contract.expiry,
+            option_type=second_contract.option_type,
+            contract_size=second_contract.lot_size,
+        )
+        res = controller.control_center.submit_order_intent(session_id=sid, intent=intent)
+        assert res.status == "FILLED", res
+        assert len(_open_positions(runner)) == 2
+
+        closed = execute(
+            controller,
+            _make_decision(action="exit", option_intent="CE", decision_id="lifo-exit"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert closed["result"] == "submitted", closed
+        # Newest first => the 24900 strike we just opened, not the original.
+        assert closed["strike"] == 24900.0, (
+            f"expected LIFO close of the newest contract, got strike={closed['strike']}"
+        )
+        remaining = _open_positions(runner)
+        assert len(remaining) == 1
+        assert closed["options_contract_id"] not in remaining
+
+    def test_exit_with_no_open_position_is_rejected(self):
+        controller, center, dep, execute = self._wire("bot-sched-exit-flat")
+        result = execute(
+            controller,
+            _make_decision(action="exit", option_intent=None, decision_id="exit-flat-1"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert result["result"] == "no_long_option_position", result
+        assert "None" not in result["detail"], (
+            f"error detail leaked a null option_intent: {result['detail']}"
+        )
+
+    def test_hold_is_a_noop(self):
+        controller, center, dep, execute = self._wire("bot-sched-hold")
+        result = execute(
+            controller, _make_decision(action="hold", option_intent=None),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert result["result"] == "no_option_action", result
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        assert _open_positions(center.get_runner(sid)) == {}
+
+    def test_unknown_action_is_rejected_not_coerced(self):
+        """A non-contract action must not be silently turned into a SELL."""
+        controller, center, dep, execute = self._wire("bot-sched-garbage")
+        # StrategySignal is a frozen dataclass, so build the decision with a
+        # duck-typed signal carrying an out-of-contract action — this is what
+        # the scheduler's getattr-based dispatch would see from a bad producer.
+        decision = SimpleNamespace(
+            decision_id="garbage-action-1",
+            opportunity_symbol="NSE:NIFTY",
+            selected_configuration=None,
+            signal=SimpleNamespace(action="SHORT", option_intent=None),
+            action="SHORT",
+        )
+        result = execute(controller, decision, spot_price=25000.0, target_qty=1)
+        assert result["result"] == "no_option_action", result
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        assert _open_positions(center.get_runner(sid)) == {}, (
+            "an unrecognised action must not produce an order"
+        )
+
+    def test_buy_without_option_intent_is_rejected(self):
+        """A BUY needs an explicit direction (SELL-is-not-PUT invariant)."""
+        controller, center, dep, execute = self._wire("bot-sched-buy-nointent")
+        result = execute(
+            controller, _make_decision(action="buy", option_intent=None),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert result["result"] == "option_intent_required", result
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        assert _open_positions(center.get_runner(sid)) == {}
+
+
+# --------------------------------------------------------------------------- #
+# Test 18 — Controller action->side resolution (fail closed)
+# --------------------------------------------------------------------------- #
+class TestControllerSideResolution:
+    def test_resolver_maps_known_actions(self):
+        from trading_system.autonomous.controller import _resolve_option_order_side
+
+        assert _resolve_option_order_side(action="buy") == Side.BUY
+        assert _resolve_option_order_side(action="sell") == Side.SELL
+        # EXIT flattens => sell-to-close.
+        assert _resolve_option_order_side(action="exit") == Side.SELL
+        assert _resolve_option_order_side(action=SignalAction.EXIT) == Side.SELL
+        # explicit_side wins.
+        assert _resolve_option_order_side(explicit_side="sell", action="buy") == Side.SELL
+
+    def test_resolver_fails_closed_on_non_executable(self):
+        from trading_system.autonomous.controller import _resolve_option_order_side
+
+        for bad in ("hold", "HOLD", None, "", "short", "flip", 0):
+            assert _resolve_option_order_side(action=bad) is None, (
+                f"{bad!r} must not resolve to a Side"
+            )
+        assert _resolve_option_order_side(explicit_side="hold", action="buy") is None
+
+    def test_controller_rejects_hold_action(self, setup):
+        """A HOLD reaching execute_option_order must not fabricate a sell."""
+        controller = setup["controller"]
+        center = setup["center"]
+        dep = setup["deployment"]
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        decision = _make_decision(action="hold", option_intent=None)
+        result = controller.execute_option_order(
+            decision=decision,
+            spot_price=25000.0,
+            deployment_id=dep.deployment_id,
+            session_id=sid,
+            order_quantity=1,
+            options_deployment_config=dep.config,
+            client_order_id="phase-c-hold-001",
+        )
+        assert result is None, "HOLD must be rejected by the controller"
+        assert center.get_runner(sid).broker.positions() == {}
+
+    def test_controller_closes_via_exit_decision(self, setup):
+        """End-to-end at the controller layer: BUY then a sell-to-close."""
+        controller = setup["controller"]
+        center = setup["center"]
+        dep = setup["deployment"]
+        sid = center.find_session_for_deployment(dep.deployment_id)
+
+        opened = controller.execute_option_order(
+            decision=_make_decision(option_intent="CE"),
+            spot_price=25000.0,
+            deployment_id=dep.deployment_id,
+            session_id=sid,
+            order_quantity=1,
+            options_deployment_config=dep.config,
+            explicit_option_type="CE",
+            client_order_id="phase-c-exit-ce-001",
+        )
+        assert opened is not None and opened.status == "FILLED", opened
+        runner = center.get_runner(sid)
+        position = runner.broker.get_position(opened.symbol)
+        assert position is not None and position.qty == 1
+
+        exit_decision = SimpleNamespace(
+            decision_id="phase-c-exit-ce-001-exit",
+            opportunity_symbol="NSE:NIFTY",
+            selected_configuration=SimpleNamespace(
+                strategy_id="phasec-spec", timeframe="1d",
+            ),
+            action="sell",
+            signal=SimpleNamespace(
+                action="sell",
+                reference_price=25000.0,
+                option_intent="CE",
+                option_contract_id=opened.options_contract_id,
+            ),
+        )
+        closed = controller.execute_option_order(
+            decision=exit_decision,
+            spot_price=25000.0,
+            deployment_id=dep.deployment_id,
+            session_id=sid,
+            order_quantity=1,
+            options_deployment_config=dep.config,
+            explicit_option_type="CE",
+            existing_position=position,
+        )
+        assert closed is not None, "exit order was rejected"
+        assert closed.side == "SELL", f"exit must be a SELL, got {closed.side!r}"
+        assert closed.status == "FILLED", closed
+        flat = runner.broker.get_position(opened.symbol)
+        assert flat is not None and not flat.is_open and flat.qty == 0.0, (
+            f"position should be flat after the exit filled, got {flat}"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Test 19 — Options-mode strategies must still emit EXIT
+# --------------------------------------------------------------------------- #
+class TestOptionsModeExitSignal:
+    """Options mode rewrites bearish entries to BUY+PE. It must NOT rewrite
+    the EXIT flatten, or the position can never be closed.
+    """
+    @staticmethod
+    def _state(*, closes, position_side: int = 1):
+        import pandas as pd
+
+        from trading_system.strategy_factory.contract import MarketState, PositionState
+
+        n = len(closes)
+        # Timezone-aware daily index ending "now" — MarketState enforces that
+        # timestamp == the last bar index (no unclosed-bar data).
+        idx = pd.date_range(end=pd.Timestamp.now(tz=UTC), periods=n, freq="1D")
+        bars = pd.DataFrame(
+            {
+                "open": [float(c) for c in closes],
+                "high": [float(c) + 1.0 for c in closes],
+                "low": [float(c) - 1.0 for c in closes],
+                "close": [float(c) for c in closes],
+                "volume": [1000.0] * n,
+            },
+            index=idx,
+        )
+        return MarketState(
+            symbol="NSE:NIFTY",
+            timeframe="1d",
+            timestamp=idx[-1].to_pydatetime(),
+            bars=bars,
+            position=PositionState(symbol="NSE:NIFTY", side=position_side),
+        )
+
+    def test_ema_crossover_options_mode_passes_exit_through(self):
+        from trading_system.strategy_factory.builtin.ema_crossover import (
+            EMACrossoverStrategy,
+        )
+
+        strat = EMACrossoverStrategy(fast_period=3, slow_period=6, options_mode=True)
+
+        # Rising market, flat book => long entry, which options mode maps to
+        # BUY + a long CE (never a short underlying).
+        rising = [100.0 + 2.0 * i for i in range(30)]
+        entry = strat.evaluate(self._state(closes=rising, position_side=0))
+        assert entry.action == SignalAction.BUY, entry.action
+        assert entry.option_intent == "CE", entry.option_intent
+
+        # Now the trend rolls over. With allow_short=False (the deployment
+        # default) _desired() collapses to 0, and _transition(current=+1,
+        # desired=0) emits the canonical EXIT flatten. Options mode must let it
+        # through unchanged — rewriting it to BUY would strand the position.
+        falling = list(reversed(rising))
+        flat = strat.evaluate(self._state(closes=falling, position_side=1))
+        assert flat.action == SignalAction.EXIT, (
+            f"EXIT must survive options mode, got {flat.action}"
+        )
+        assert flat.option_intent is None, (
+            "EXIT must not be rewritten into a directional option entry"
+        )
+
+    def test_rsi_mean_reversion_options_mode_passes_exit_through(self):
+        from trading_system.strategy_factory.builtin.rsi_mean_reversion import (
+            RSIMeanReversionStrategy,
+        )
+
+        strat = RSIMeanReversionStrategy(
+            rsi_period=5, oversold=30.0, overbought=70.0, options_mode=True,
+        )
+        # Deeply oversold => long entry.
+        state = self._state(closes=[100, 98, 96, 94, 92, 90, 88], position_side=0)
+        entry = strat.evaluate(state)
+        assert entry.action == SignalAction.BUY, entry.action
+        assert entry.option_intent == "CE", entry.option_intent
+
+        # Overbought while long => flatten.
+        state_flat = self._state(
+            closes=[88, 90, 94, 98, 102, 104, 105], position_side=1,
+        )
+        flat = strat.evaluate(state_flat)
+        assert flat.action == SignalAction.EXIT, (
+            f"EXIT must survive options mode, got {flat.action}"
+        )
+
+    def test_rsi_options_mode_does_not_leak_into_parameters(self):
+        """options_mode is wiring, not a tunable strategy parameter."""
+        from trading_system.strategy_factory.builtin.rsi_mean_reversion import (
+            RSIMeanReversionStrategy,
+        )
+
+        params = RSIMeanReversionStrategy(options_mode=True).parameters
+        assert "options_mode" not in params, params
+
+
+# --------------------------------------------------------------------------- #
+# Test 20 — No live broker invocation
 # --------------------------------------------------------------------------- #
 class TestNoLiveBroker:
     def test_no_upstox_order_endpoint_called(self, setup):
