@@ -895,7 +895,7 @@ class AutonomousController(BaseModel):
     # Market scanning (Phase 2)
     # ------------------------------------------------------------------ #
 
-    def scan_market(self) -> MarketScanResult:
+    def scan_market(self, timeframe: Optional[str] = None) -> MarketScanResult:
         """Run a deterministic market scan over the bot's constrained universe.
 
         Builds a :class:`ScannerConfig` from the bot's ``user_constraints``
@@ -906,7 +906,14 @@ class AutonomousController(BaseModel):
 
         Fails closed: if no market-data provider is configured on the control
         center, every symbol is rejected as ``MISSING_MARKET_DATA``.
+
+        ``timeframe`` selects the bar interval to scan and defaults to ``1d``,
+        which is what every caller relied on before this parameter existed. The
+        scheduler passes the timeframe it has already proved has fresh data (see
+        ``_run_one_tick``), so a bot configured for intraday bars is not forced
+        through a daily scan.
         """
+        scan_timeframe = timeframe or "1d"
         if self._safety_layer.kill_switch.is_halted:
             self._record_event(
                 AutonomousEventType.ERROR,
@@ -917,7 +924,7 @@ class AutonomousController(BaseModel):
             return MarketScanResult(
                 scan_id=f"halted_{self.config.bot_id}",
                 scan_timestamp=_now,
-                timeframe="1d",
+                timeframe=scan_timeframe,
                 enabled=False,
                 universe_size=0,
                 scanned_count=0,
@@ -934,7 +941,7 @@ class AutonomousController(BaseModel):
         config = ScannerConfig(
             enabled=self.config.enabled,
             universe=universe,
-            timeframe="1d",
+            timeframe=scan_timeframe,
             data_provider=self.control_center.load_market_data,
             data_provider_source="control_center.load_market_data",
             # Daily bars from Upstox are stamped at 00:00 IST (18:30 UTC) —
@@ -984,6 +991,33 @@ class AutonomousController(BaseModel):
     # Phase 4 — Strategy & Timeframe Compatibility
     # ------------------------------------------------------------------ #
 
+    def _registered_factory_strategy_ids(self) -> list[str]:
+        """Factory ids for every strategy persisted in the research registry.
+
+        Compatibility must only consider strategies the tick can actually
+        execute. ``_execute_one_decision`` resolves a decision's
+        ``strategy_id`` via ``_lookup_strategy_spec``, which can only find
+        specs held in the research registry. Builtin factory strategies
+        (``rsi_mean_reversion``, ``ema_crossover``, ...) sit in the discovery
+        catalog but NOT in the registry, so selecting one resolves to nothing,
+        the tick answers ``unknown_strategy``, and the bot silently places no
+        orders while still reporting a healthy tick.
+
+        Constraining the evaluator to the registered set makes that outcome
+        unrepresentable: with an empty registry this returns ``[]``, which the
+        evaluator honours, so the tick produces no decisions rather than a
+        decision that can never execute.
+        """
+        from trading_system.autonomous.spec_register import factory_id_for_db_id
+
+        try:
+            strategies = self.control_center.registry.list_strategies()
+        except Exception:  # noqa: BLE001 — fail closed to "nothing tradeable"
+            return []
+        return [
+            factory_id_for_db_id(s.strategy_id) for s in strategies if s.strategy_id
+        ]
+
     def evaluate_strategy_compatibility(
         self,
         ranking_result: OpportunityRankingResult,
@@ -994,6 +1028,12 @@ class AutonomousController(BaseModel):
         Delegates to :class:`StrategyCompatibilityEvaluator` using the operator's
         ``allowed_strategy_ids`` constraint.  Does NOT execute strategies, generate
         signals, place orders, create deployments, or perform live trading.
+
+        The candidate set is restricted to strategies persisted in the research
+        registry (see ``_registered_factory_strategy_ids``). Leaving it open to
+        the whole discovery catalog lets the evaluator select a builtin that the
+        execution path cannot resolve, which presents as a permanently flat
+        paper account with no error anywhere.
 
         Snapshot consistency:
         The evaluator consumes the Phase 3 :class:`OpportunityRankingResult`
@@ -1007,7 +1047,11 @@ class AutonomousController(BaseModel):
         )
         evaluator = StrategyCompatibilityEvaluator(compat_config)
         allowed = self.config.user_constraints.allowed_strategy_ids
-        return evaluator.evaluate(ranking_result, allowed_strategies=allowed)
+        return evaluator.evaluate(
+            ranking_result,
+            allowed_strategies=allowed,
+            discovered_strategies=self._registered_factory_strategy_ids(),
+        )
 
     # ------------------------------------------------------------------ #
     # Phase 5 -- Strategy Selection & Signal Generation

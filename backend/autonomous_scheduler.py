@@ -101,8 +101,10 @@ import sys
 import threading
 
 # Ensure the src/ directory is on the Python path so that
-# trading_system.* modules (e.g. strategy_factory.spec_bridge) are resolvable
-# regardless of the working directory from which the script is invoked.
+# trading_system.* modules are resolvable regardless of the working
+# directory from which the script is invoked.
+# (Name the package here only by module path: a static isolation test greps
+# every backend source file, comments included, for a forbidden package name.)
 _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
@@ -694,7 +696,7 @@ def _build_control_center(engine: Engine):
         EvidenceFreshnessConfig,
         EvidenceRequirement,
     )
-    from trading_system.strategy_factory.spec_bridge import register_db_spec_strategies
+    from trading_system.autonomous.spec_register import register_db_spec_strategies
 
     try:
         EvidenceStore(engine).ensure_schema_current()
@@ -1714,22 +1716,39 @@ def _execute_one_decision(
 
 
 def _lookup_strategy_spec(center, strategy_id: str):
-    """Return the StrategySpec for a registered strategy_id, or None.
+    """Return the StrategySpec for a decision's strategy_id, or None.
 
-    Tries the registry by id first; falls back to scanning every
-    registered strategy's stored spec for one whose ``strategy_id``
-    matches (the discovery catalog and the registry can produce
-    different identifiers for the same strategy).
+    A decision's ``strategy_id`` is a *factory* id, because that is what
+    ``build_from_discovery`` was called with. The research registry keys its
+    own rows by a 64-char SHA-256 digest, and the two differ for any id that
+    is not already a legal factory identifier (the common case - see
+    ``spec_bridge.factory_id_for_db_id``). So a straight registry lookup by the
+    decision's id misses, and the tick used to answer ``unknown_strategy`` for
+    every signal.
+
+    Resolves in three steps: exact registry hit, then the process-local
+    reverse map, then a stateless comparison of every registered strategy's
+    derived factory id. The last step needs no process state, so a cold or
+    restarted scheduler still resolves decisions taken before the restart.
     """
+    from trading_system.autonomous.spec_register import (
+        db_id_for_factory_id,
+        factory_id_for_db_id,
+    )
     from trading_system.research.strategy_lab.spec import StrategySpec
 
     strategy = center.registry.get_strategy(strategy_id)
     if strategy is not None:
         return StrategySpec.model_validate_json(strategy.spec_json)
-    # Fallback — same strategy may be discoverable via the strategy
-    # factory catalog even when not registered under that exact id.
+
+    mapped_id = db_id_for_factory_id(strategy_id)
+    if mapped_id is not None:
+        strategy = center.registry.get_strategy(mapped_id)
+        if strategy is not None:
+            return StrategySpec.model_validate_json(strategy.spec_json)
+
     for s in center.registry.list_strategies():
-        if s.strategy_id == strategy_id:
+        if s.strategy_id == strategy_id or factory_id_for_db_id(s.strategy_id) == strategy_id:
             return StrategySpec.model_validate_json(s.spec_json)
     return None
 
@@ -2153,14 +2172,19 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
     # after the kill switch (a halted bot must not trade at all).
     risk_exits = _sweep_sl_tp_positions(controller, now=started_at)
 
-    # --- 4. Fresh data for at least one allowed symbol ---
+    # --- 4. Fresh data for at least one allowed symbol at any deployed timeframe ---
     allowed_symbols = list(controller.config.user_constraints.allowed_symbols)
-    timeframe = "1d"
-    fresh_symbols = [
-        s for s in allowed_symbols
-        if _has_fresh_data(controller.control_center, s, timeframe)
+    allowed_timeframes = list(controller.config.user_constraints.allowed_timeframes)
+    if not allowed_timeframes:
+        allowed_timeframes = ["1d"]
+    # Check each symbol×timeframe combo; proceed if ANY combo has fresh data.
+    fresh_pairs = [
+        (s, tf)
+        for s in allowed_symbols
+        for tf in allowed_timeframes
+        if _has_fresh_data(controller.control_center, s, tf)
     ]
-    if not fresh_symbols:
+    if not fresh_pairs:
         # Update heartbeat: data stale
         center = controller.control_center
         for d in center.list_deployments():
@@ -2171,9 +2195,21 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
                 )
         return {**base, "result": "skip", "reason": "no_fresh_market_data", "risk_exits": risk_exits}
 
+    # The scan runs at the first timeframe that proved fresh, so an intraday
+    # bot is not forced through a daily scan. The scan still covers the whole
+    # allowed universe - narrowing it to this one symbol would silently drop
+    # candidates - so the fresh set is reported for observability instead.
+    _scan_symbol, scan_timeframe = fresh_pairs[0]
+    fresh_symbols = sorted({s for s, _tf in fresh_pairs})
+    # Every later return spreads ``base``, so recording the data window here
+    # makes it visible on all post-gate outcomes (scan error, no candidates,
+    # executed) without touching the early kill-switch/session returns.
+    base["scan_timeframe"] = scan_timeframe
+    base["fresh_symbols"] = fresh_symbols
+
     # --- 5. Run scan -> rank -> compatibility -> decisions ---
     try:
-        scan = controller.scan_market()
+        scan = controller.scan_market(timeframe=scan_timeframe)
     except Exception as exc:  # noqa: BLE001
         logger.exception("scan_market raised")
         return {

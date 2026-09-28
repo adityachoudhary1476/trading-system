@@ -80,7 +80,10 @@ from trading_system.paper.control import (
     PaperTradingControlCenter,
     UnknownDeploymentError,
 )
-from trading_system.paper.deployment import PaperDeploymentConfig
+from trading_system.paper.deployment import (
+    PaperDeploymentConfig,
+    PaperDeploymentStatus,
+)
 from trading_system.paper.gate import DeploymentGate
 from trading_system.paper.risk import PaperRiskConfig, PaperRiskGuard
 from trading_system.paper.runner import PaperStrategyRunner
@@ -273,6 +276,16 @@ def _build_control_center(
             created_at=fresh,
         )
     )
+    # Mirror the production startup step: DB specs are registered into the
+    # factory discovery catalog so the decision engine can resolve a
+    # strategy_id. Without this the catalog holds only the builtins and the
+    # pipeline produces no executable decision.
+    from trading_system.autonomous.spec_register import (
+        register_db_spec_strategies,
+    )
+
+    registered = register_db_spec_strategies(center)
+    assert registered, "no DB strategy registered into the factory catalog"
     return center, registry, intelligence, spec
 
 
@@ -288,9 +301,13 @@ def _build_controller(
 
     user_constraints = UserConstraints(
         allowed_symbols=allowed_symbols,
-        # Constrain to the deterministic reference trend strategy so the
-        # decision engine selects a BUY signal on our uptrending bars.
-        allowed_strategy_ids=frozenset({"ema_crossover"}),
+        # Empty allow-list, matching the production scheduler: the decision
+        # engine is then restricted to the strategies persisted in the
+        # research registry (the executable universe). Pinning a builtin id
+        # such as "ema_crossover" here would allow a strategy the execution
+        # path cannot resolve back to a spec, which is the silent
+        # no-trade this file now guards against.
+        allowed_strategy_ids=frozenset(),
         allowed_timeframes=frozenset({"1d"}),
         max_drawdown_pct=0.15,
         trading_session=TradingSessionConstraints(),
@@ -746,3 +763,394 @@ class TestAutonomousExecutionBlocked:
         )
         # And the long position remains at 3, not reduced.
         assert center.get_runner(sid).broker.get_position("NSE:SBIN").qty == 3
+
+
+# --------------------------------------------------------------------------- #
+# The real tick
+#
+# Every test above drives the pipeline stage by stage, with the test itself
+# calling scan -> rank -> decide -> submit. That proves the pieces work. It
+# does NOT prove the scheduler wires them together -- and the wiring is where
+# both real defects of this project lived:
+#
+#   * the SL/TP sweep sat AFTER an early return in the tick, so a breached
+#     threshold was skipped on exactly the ticks it mattered;
+#   * the fyers->upstox migration left the v2 reader and the test fixtures
+#     disagreeing on one field name, so every live frame parsed to a default.
+#
+# Both shipped with a fully green suite.
+#
+# The specific gap these tests close: every test that drove a real
+# ``_run_one_tick`` asserted that the tick does NOTHING (kill switch, market
+# closed, stale data). None asserted that a tick actually EXECUTES. So it was
+# possible for the tick never to place an order and the whole suite to stay
+# green -- which would have made paper trading a silent no-op.
+#
+# These tests run the production tick function. The only thing patched is the
+# wall-clock market-hours gate, which legitimately depends on what time it is
+# when CI runs. The scanner, ranker, decision engine, safety stack, deployment
+# coordinator and PaperBroker are all the real implementations.
+# --------------------------------------------------------------------------- #
+class _ZeroPosition:
+    """Null object so a position total can be summed over missing positions."""
+
+    qty = 0
+
+
+_ZERO = _ZeroPosition()
+
+
+def _all_runners(center: PaperTradingControlCenter) -> list:
+    """Every attached runner across all deployments (the tick may create its own)."""
+    runners = []
+    for d in center.list_deployments():
+        sid = center.find_session_for_deployment(d.deployment_id)
+        if sid is None:
+            continue
+        runner = center.get_runner(sid)
+        if runner is not None:
+            runners.append(runner)
+    return runners
+
+
+class TestRealSchedulerTickExecutes:
+    """A real ``_run_one_tick`` must reach a filled position, unprompted."""
+
+    @staticmethod
+    def _build_ready(monkeypatch, bot_id: str):
+        """A started controller on fresh synthetic bars, one gate patched.
+
+        Patches ONLY ``_is_regular_session`` (a wall-clock seam: the market-hours
+        gate must not depend on what time it is when CI runs). No calendar and
+        no ``max_freshness`` patch, because neither is needed once the fixture
+        is honest about time:
+
+        - bars end at *now*, so the scanner's ``max_freshness`` window (7d,
+          measured against ``scan_timestamp`` which ``scan_market`` leaves at
+          wall-clock now) passes exactly as it does in production. The
+          hand-built-scanner tests above dodge this by pinning
+          ``scan_timestamp=SCAN_TS`` to 2024; on a real tick that pin does not
+          exist, so the fixture has to be genuinely fresh instead.
+        - ``AutonomousController.scan_market`` sets
+          ``require_regular_session=False`` precisely because daily bars
+          stamped at 00:00 IST are never inside 09:15-15:30 IST, so the
+          calendar needs no patch either.
+
+        ``_build_control_center`` performs the same catalog registration the
+        production scheduler does at startup.
+        """
+        from backend import autonomous_scheduler
+
+        df = _build_ohlcv_df(end_ts=datetime.now(UTC))
+
+        def provider(symbol: str, timeframe: str):
+            return df if symbol == "NSE:SBIN" else None
+
+        center, _registry, _intelligence, spec = _build_control_center(provider)
+
+        # Build the controller with the PRODUCTION builder, not the local
+        # ``_build_controller`` above. Production deliberately leaves the
+        # strategy allow-list empty so decisions resolve to registered DB
+        # specs; the local builder now mirrors that.
+        monkeypatch.setenv("AUTONOMOUS_ALLOWED_SYMBOLS", "NSE:SBIN")
+        controller = autonomous_scheduler._build_controller(
+            center,
+            None,
+            center.load_market_data,
+            bot_id,
+        )
+        controller.start_bot()
+
+        monkeypatch.setattr(
+            autonomous_scheduler, "_is_regular_session", lambda ts: True
+        )
+        return controller, center, spec
+
+    def test_real_tick_places_and_fills_a_buy(self, monkeypatch):
+        from backend import autonomous_scheduler
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-buy")
+
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        # --- the tick cleared its own gates ---
+        assert result["result"] == "executed", result
+        assert result["decision_count"] >= 1, f"tick produced no decisions: {result}"
+        assert result["eligible_count"] >= 1, (
+            "tick produced no eligible decision, so the bot would never trade "
+            f"even with a valid signal: {result}"
+        )
+
+        # --- and it actually submitted an order ---
+        submitted = [
+            s for s in result["submissions"] if s.get("result") == "submitted"
+        ]
+        assert submitted, f"tick executed no order: {result['submissions']}"
+        assert submitted[0]["symbol"] == "NSE:SBIN", submitted[0]
+
+        # --- the order became a real filled position in the real broker ---
+        positions = [r.broker.get_position("NSE:SBIN") for r in _all_runners(center)]
+        held = [p for p in positions if p is not None and p.qty > 0]
+        assert held, (
+            "tick reported a submission but no runner holds a position; the "
+            "paper account would stay flat forever"
+        )
+        assert held[0].qty > 0
+        assert held[0].avg_entry_price > 0
+
+    def test_real_tick_created_its_own_deployment(self, monkeypatch):
+        """The tick, not the test, must create the deployment it trades on.
+
+        ``_execute_one_decision`` imports the coordinator and creates the
+        deployment inline. If that wiring regressed, the tick would have
+        nowhere to route the order and would silently submit nothing.
+        """
+        from backend import autonomous_scheduler
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-dep")
+        assert center.list_deployments() == [], (
+            "precondition: no deployment should exist before the first tick"
+        )
+
+        autonomous_scheduler._run_one_tick(controller)
+
+        deps = center.list_deployments()
+        assert deps, "the tick created no deployment"
+        assert all(d.notes.startswith("bot:bot-tick-dep") for d in deps), deps
+        assert all(d.status == PaperDeploymentStatus.ACTIVE for d in deps), deps
+
+    def test_real_tick_order_is_persisted_under_the_signal_identity(
+        self, monkeypatch
+    ):
+        """The fill must be durable, keyed on the scheduler's own signal id.
+
+        This is the check that the order was built *and* recorded by
+        production code. ``_execute_one_decision`` sets
+        ``OrderIntent.client_order_id = _signal_identity(...)`` -- a pure
+        function of the signal payload, deliberately not a UUID -- and that
+        string is the ``PaperSessionStore`` primary key that makes execution
+        restart-safe.
+
+        A test that hand-builds an ``OrderIntent`` (as several above do) proves
+        only that a hand-built intent fills. Here the key the store returns
+        must be the same id the scheduler reported, so a tick that faked its
+        way to a fill, or that persisted under a key it cannot reproduce, both
+        fail. The second half matters on its own: if that derivation ever
+        picked up a wall-clock or random component, every restart would
+        silently re-execute the same signal.
+        """
+        from backend import autonomous_scheduler
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-cid")
+
+        result = autonomous_scheduler._run_one_tick(controller)
+        submitted = [
+            s for s in result["submissions"] if s.get("result") == "submitted"
+        ]
+        assert submitted, result["submissions"]
+        order = submitted[0]
+
+        assert order["status"] == "FILLED", order
+        assert order["filled_quantity"] > 0, order
+        assert order["is_idempotent_replay"] is False, order
+
+        # The client_order_id IS the signal identity; look the record up by it.
+        record = center.session_store.get_order(
+            session_id=order["session_id"],
+            client_order_id=order["signal_id"],
+        )
+        assert record is not None, (
+            f"no persisted order under the tick's own signal id "
+            f"{order['signal_id']!r}; the fill would not survive a restart"
+        )
+        assert record.order_id == order["order_id"], (record.order_id, order["order_id"])
+
+    def test_second_tick_does_not_double_the_position(self, monkeypatch):
+        """Idempotency across ticks: a repeated signal must not stack orders.
+
+        The per-tick ``seen`` set only dedupes within one tick. Across ticks
+        the durable ``client_order_id`` is the real guard, and this is the
+        only place that behaviour is observed on a genuine tick.
+
+        Asserted on the submission, not on the raw position size. The tick
+        also runs ``_run_portfolio_tick``, a second decision engine sharing the
+        same paper account - see
+        ``test_portfolio_tick_liquidates_main_pipeline_positions`` for what
+        that does to the size. Idempotency means "no second fill", which is
+        what the submission result and the persisted order count show.
+        """
+        from backend import autonomous_scheduler
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-twice")
+
+        first = autonomous_scheduler._run_one_tick(controller)
+        submitted = [
+            s for s in first["submissions"] if s.get("result") == "submitted"
+        ]
+        assert submitted, first["submissions"]
+        first_order = submitted[0]
+        assert first_order["status"] == "FILLED", first_order
+        assert first_order["is_idempotent_replay"] is False, first_order
+        assert first_order["filled_quantity"] > 0, first_order
+
+        def qty() -> float:
+            return sum(
+                (r.broker.get_position("NSE:SBIN") or _ZERO).qty
+                for r in _all_runners(center)
+            )
+
+        after_first = qty()
+        assert after_first > 0, "first tick did not open anything"
+
+        second = autonomous_scheduler._run_one_tick(controller)
+        assert second["result"] == "executed", second
+
+        # Same signal -> same identity -> no new order. The replay path
+        # short-circuits on the durable store before it resolves an order, so
+        # it reports the signal_id but no order_id; the signal_id is the key.
+        replays = [
+            s
+            for s in second["submissions"]
+            if s.get("result") in ("submitted", "already_executed")
+        ]
+        assert replays, second["submissions"]
+        assert all(
+            s["signal_id"] == first_order["signal_id"] for s in replays
+        ), f"a repeated signal produced a different identity: {replays}"
+        assert all(
+            s.get("result") == "already_executed" for s in replays
+        ), f"a repeated signal placed a second order: {replays}"
+
+        # The durable record still points at the single original order, and the
+        # position never grew.
+        record = center.session_store.get_order(
+            session_id=first_order["session_id"],
+            client_order_id=first_order["signal_id"],
+        )
+        assert record is not None and record.order_id == first_order["order_id"]
+        assert qty() <= after_first, (
+            f"a second tick on an unchanged signal INCREASED the position "
+            f"({after_first} -> {qty()}); idempotency did not hold"
+        )
+
+    def test_portfolio_tick_liquidates_main_pipeline_positions(self, monkeypatch):
+        """Pins a real conflict between the two decision engines on one account.
+
+        A tick runs the main pipeline (scan -> decision -> order) and then
+        ``_run_portfolio_tick``. The portfolio treats every position in the
+        shared paper account as its own, and closes any position whose owning
+        strategy produced no opportunity in *its* evaluation
+        (``portfolio.py``: ``if opportunity is None: return
+        "strategy_exit_signal"``). The portfolio only evaluates Phase 22
+        strategies, so a position opened by a Phase 2-5 DB spec is always
+        liquidated on the next tick.
+
+        Net effect on paper results: the account opens a position and flattens
+        it again every tick, which reads as a strategy that never holds. The
+        close is reported only inside the nested ``portfolio`` result, not in
+        the tick's ``submissions`` or ``risk_exits``.
+
+        This is a design question - which engine owns the account - not a
+        mechanical bug, so it is pinned rather than fixed here. If the intent
+        is for the portfolio to own the account, the main pipeline should not
+        also open positions on it.
+        """
+        from backend import autonomous_scheduler
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-portfolio")
+
+        first = autonomous_scheduler._run_one_tick(controller)
+        assert any(
+            s.get("result") == "submitted" for s in first["submissions"]
+        ), first["submissions"]
+
+        def qty() -> float:
+            return sum(
+                (r.broker.get_position("NSE:SBIN") or _ZERO).qty
+                for r in _all_runners(center)
+            )
+
+        assert qty() > 0, "first tick did not open anything"
+
+        second = autonomous_scheduler._run_one_tick(controller)
+        portfolio = second.get("portfolio") or {}
+        assert portfolio, "the tick reported no portfolio phase result"
+
+        # Documented behaviour: the position does not survive the second tick.
+        assert qty() == 0, (
+            "expected the portfolio tick to liquidate the main pipeline's "
+            f"position; it held {qty()}. If this now passes differently the "
+            "two engines have stopped conflicting and this pin should be "
+            "updated deliberately, not deleted."
+        )
+        # And the close is invisible in the tick's own execution reporting.
+        assert not any(
+            s.get("result") == "submitted" for s in second["submissions"]
+        ), second["submissions"]
+
+    def test_heartbeat_records_a_successful_execution(self, monkeypatch):
+        """A completed tick must stamp last_successful_tick_at.
+
+        The health monitor reads these heartbeats to decide whether the bot
+        is alive. A tick that trades but does not stamp the heartbeat looks
+        identical to a dead bot to the operator.
+        """
+        from backend import autonomous_scheduler
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-hb")
+
+        autonomous_scheduler._run_one_tick(controller)
+
+        beats = [d.notes for d in center.list_deployments()]
+        assert beats, "no deployments to heartbeat"
+        stamped = [d for d in center.list_deployments() if d.last_successful_tick_at]
+        assert stamped, (
+            "the tick completed but stamped no successful-tick heartbeat; "
+            "the health monitor would report this bot as dead"
+        )
+
+    def test_tick_scans_the_timeframe_that_has_fresh_data(self, monkeypatch):
+        """The scan must run at a timeframe with fresh data, not a hardcoded 1d.
+
+        The freshness gate used to test ``"1d"`` unconditionally, so a bot
+        configured for intraday bars was skipped as stale even when its 5m data
+        was current, and the scan itself was pinned to ``1d``. The gate now
+        considers every allowed timeframe and hands the winning one to
+        ``scan_market``.
+
+        Asserted on the boundary, not on the tick's outcome: a bot with no 1d
+        data but fresh 5m data must reach the scan, and the scan must be asked
+        for 5m.
+        """
+        from backend import autonomous_scheduler
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-tf")
+
+        # Intraday bot: allowed_timeframes is 5m only, so a 1d scan would find
+        # no candidates and the tick would skip.
+        controller.config.user_constraints.allowed_timeframes = frozenset({"5m"})
+
+        asked: list = []
+        controller_cls = type(controller)
+        real_scan = controller_cls.scan_market
+
+        def spy(self, timeframe=None):
+            asked.append(timeframe)
+            return real_scan(self, timeframe=timeframe)
+
+        monkeypatch.setattr(controller_cls, "scan_market", spy)
+        monkeypatch.setattr(
+            autonomous_scheduler,
+            "_has_fresh_data",
+            lambda _center, symbol, tf: tf == "5m" and symbol == "NSE:SBIN",
+        )
+
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        assert asked, "the tick never reached the scan"
+        assert asked[0] == "5m", (
+            f"the scan was asked for {asked[0]!r} instead of the fresh "
+            "timeframe 5m"
+        )
+        assert result["scan_timeframe"] == "5m", result
+        assert result["fresh_symbols"] == ["NSE:SBIN"], result

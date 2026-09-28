@@ -60,7 +60,6 @@ from trading_system.strategy_factory.contract import (
 )
 from trading_system.strategy_factory.discovery import (
     build_from_discovery,
-    clear_discovery,
     discover,
     registered_strategy_ids,
 )
@@ -451,13 +450,27 @@ class StrategyDecisionEngine:
     # ------------------------------------------------------------------ #
 
     def _ensure_discovered(self) -> None:
-        """Populate the strategy discovery catalog (idempotent)."""
+        """Populate the strategy discovery catalog (idempotent, additive).
+
+        Importing the discovery module runs its ``@register_strategy``
+        decorators, which appends the builtin strategies to the catalog.
+
+        This deliberately does NOT call ``clear_discovery()``. That function
+        exists for test isolation, but running it here wiped the *global*
+        catalog - including every DB-bridged spec that
+        ``register_db_spec_strategies`` had registered at scheduler startup -
+        and left only the builtins. Every DB-backed decision then failed with
+        ``strategy_not_found`` and the bot silently placed no orders.
+
+        ``discover(reload=True)`` is not a safe substitute: re-executing the
+        module builds fresh class objects, so the decorators hit
+        ``DuplicateStrategyError`` on the ids they are re-registering.
+        """
         if self._discovered:
             return
         if not self.config.enabled:
             return
         try:
-            clear_discovery()
             discover([self.config.discovery_module])
             self._discovered_ids = registered_strategy_ids()
         except Exception:
