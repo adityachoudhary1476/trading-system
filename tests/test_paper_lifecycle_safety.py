@@ -528,9 +528,20 @@ class TestPhase18Safety:
             "print(','.join(sorted(live)))"
             % src_dir
         )
+        proc_env = {**os.environ, "PYTHONPATH": str(src_dir)}
         result = subprocess.run(
-            [sys.executable, "-c", code], capture_output=True, text=True, timeout=180
+            [sys.executable, "-c", code], capture_output=True, text=True, timeout=180,
+            env=proc_env,
         )
+        # If the current interpreter can't find trading_system, fall back to the
+        # project venv python (symlinked from .venv/Scripts/python.exe).
+        if result.returncode != 0 and "No module named 'trading_system'" in result.stderr:
+            venv_python = Path(__file__).resolve().parents[1] / ".venv" / "Scripts" / "python.exe"
+            if venv_python.exists():
+                result = subprocess.run(
+                    [str(venv_python), "-c", code], capture_output=True, text=True, timeout=180,
+                    env=proc_env,
+                )
         # Subprocess output must NOT mention fyers/token modules being
         # loaded as a side effect of importing Phase 18. (Other modules in
         # the project do load fyers via the india package, but Phase 18
