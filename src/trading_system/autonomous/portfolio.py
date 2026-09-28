@@ -566,7 +566,11 @@ class AutonomousPortfolio:
 
     def _create_portfolio_deployment(self):
         """Create the single portfolio deployment through the existing gate."""
-        from trading_system.paper.deployment import PaperDeploymentConfig
+        from trading_system.paper.deployment import (
+            DEFAULT_STOP_LOSS_PCT,
+            DEFAULT_TAKE_PROFIT_PCT,
+            PaperDeploymentConfig,
+        )
 
         resolved = self.mandate_strategy()
         if resolved is None:
@@ -581,6 +585,10 @@ class AutonomousPortfolio:
             execution_mode="paper",
             initial_cash=self.capital,
             allow_short=False,
+            # Arm per-position risk limits, otherwise this deployment has no
+            # SL/TP exit path (see PaperDeploymentConfig docstring).
+            stop_loss_pct=DEFAULT_STOP_LOSS_PCT,
+            take_profit_pct=DEFAULT_TAKE_PROFIT_PCT,
             options_enabled=True,
             allowed_option_types=["CE", "PE"],
             max_options_contracts_per_trade=self.max_contracts_per_trade,

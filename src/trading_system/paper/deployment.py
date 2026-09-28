@@ -47,6 +47,21 @@ class PaperDeploymentStatus(str, Enum):
 STATUS_ACCEPTS_ORDERS = frozenset({PaperDeploymentStatus.ACTIVE})
 
 
+# Default per-position risk limits for autonomously-created deployments.
+# A deployment with ``stop_loss_pct`` and ``take_profit_pct`` both left as
+# ``None`` has NO per-position exit: ``PaperStrategyRunner._check_sl_tp``
+# short-circuits, and the scheduler's SL/TP sweep has nothing to compare
+# against, so a position can only ever be closed by a strategy signal.
+#
+# These are fractions of cost basis (0.03 == 3%), validated as ``gt=0, lt=1``
+# on the model. They match the Phase 23 deployment policy defaults
+# (``research/phase23/deployment.py``) so both creation paths agree, and give a
+# 1:2 reward-to-risk ratio. The live worker can override them via
+# ``AUTONOMOUS_STOP_LOSS_PCT`` / ``AUTONOMOUS_TAKE_PROFIT_PCT``.
+DEFAULT_STOP_LOSS_PCT = 0.03
+DEFAULT_TAKE_PROFIT_PCT = 0.06
+
+
 class PaperDeploymentConfig(BaseModel):
     """Typed, paper-only deployment configuration.
 

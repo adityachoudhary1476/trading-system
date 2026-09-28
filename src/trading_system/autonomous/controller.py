@@ -27,6 +27,8 @@ from trading_system.paper.control import (
     UnknownDeploymentError,
 )
 from trading_system.paper.deployment import (
+    DEFAULT_STOP_LOSS_PCT,
+    DEFAULT_TAKE_PROFIT_PCT,
     PaperDeploymentStatus,
     PaperDeploymentConfig,
 )
@@ -352,7 +354,13 @@ class AutonomousController(BaseModel):
                     from trading_system.research.strategy_lab.spec import StrategySpec
                     spec = StrategySpec.model_validate(spec_dict)
                     from trading_system.paper.deployment import PaperDeploymentConfig
-                    dep_config = PaperDeploymentConfig()
+                    dep_config = PaperDeploymentConfig(
+                        # Without these the deployment has no per-position
+                        # exit at all — a position could only ever be closed
+                        # by a strategy signal.
+                        stop_loss_pct=DEFAULT_STOP_LOSS_PCT,
+                        take_profit_pct=DEFAULT_TAKE_PROFIT_PCT,
+                    )
                     result, deployment = self.create_autonomous_deployment(
                         symbol=item.symbol,
                         strategy_id=item.strategy_id,

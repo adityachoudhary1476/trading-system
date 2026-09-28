@@ -319,6 +319,8 @@ def _create_options_deployment(
     options_enabled: bool,
     allowed_option_types: list[str],
     max_contracts: int | None,
+    stop_loss_pct: float | None = None,
+    take_profit_pct: float | None = None,
 ) -> object:
     cfg = PaperDeploymentConfig(
         execution_mode="paper",
@@ -327,6 +329,8 @@ def _create_options_deployment(
         options_enabled=options_enabled,
         allowed_option_types=list(allowed_option_types),
         max_options_contracts_per_trade=max_contracts,
+        stop_loss_pct=stop_loss_pct,
+        take_profit_pct=take_profit_pct,
     )
     coord = AutonomousDeploymentCoordinator(
         config=controller.config, control_center=controller.control_center
@@ -1535,5 +1539,421 @@ class TestNoLiveBroker:
         from trading_system.execution.paper_broker import PaperBroker
         runner = center.get_runner(sid)
         assert isinstance(runner.broker, PaperBroker)
+
+
+class TestStopLossTakeProfitConfig:
+    """Every autonomous deployment must be armed with a per-position exit.
+
+    A deployment with no SL/TP can only ever be closed by a strategy signal,
+    so an unarmed deployment silently holds risk indefinitely.
+    """
+
+    def test_paper_deployment_config_defaults_are_sane(self):
+        from trading_system.paper.deployment import (
+            DEFAULT_STOP_LOSS_PCT,
+            DEFAULT_TAKE_PROFIT_PCT,
+        )
+
+        assert 0.0 < DEFAULT_STOP_LOSS_PCT < 1.0
+        assert 0.0 < DEFAULT_TAKE_PROFIT_PCT < 1.0
+        # Take-profit should be further out than stop-loss: a wider loss
+        # budget than profit target would be a losing expectancy.
+        assert DEFAULT_TAKE_PROFIT_PCT > DEFAULT_STOP_LOSS_PCT
+
+    def test_scheduler_deployment_config_is_armed(self, monkeypatch):
+        """The scheduler's own deployment config must carry both legs."""
+        from backend.autonomous_scheduler import _autonomous_deployment_config
+
+        monkeypatch.delenv("AUTONOMOUS_STOP_LOSS_PCT", raising=False)
+        monkeypatch.delenv("AUTONOMOUS_TAKE_PROFIT_PCT", raising=False)
+        cfg = _autonomous_deployment_config()
+        assert cfg.stop_loss_pct == 0.03
+        assert cfg.take_profit_pct == 0.06
+        assert cfg.execution_mode == "paper"
+
+    def test_scheduler_deployment_config_honours_env(self, monkeypatch):
+        from backend.autonomous_scheduler import _autonomous_deployment_config
+
+        monkeypatch.setenv("AUTONOMOUS_STOP_LOSS_PCT", "0.02")
+        monkeypatch.setenv("AUTONOMOUS_TAKE_PROFIT_PCT", "0.10")
+        cfg = _autonomous_deployment_config()
+        assert cfg.stop_loss_pct == 0.02
+        assert cfg.take_profit_pct == 0.10
+
+    def test_scheduler_deployment_config_allows_explicit_optout(self, monkeypatch):
+        """An operator who turns both legs off must actually get no exit."""
+        from backend.autonomous_scheduler import _autonomous_deployment_config
+
+        monkeypatch.setenv("AUTONOMOUS_STOP_LOSS_PCT", "off")
+        monkeypatch.setenv("AUTONOMOUS_TAKE_PROFIT_PCT", "off")
+        cfg = _autonomous_deployment_config()
+        assert cfg.stop_loss_pct is None
+        assert cfg.take_profit_pct is None
+
+    def test_scheduler_env_parsing_defaults(self, monkeypatch):
+        from backend.autonomous_scheduler import (
+            _env_stop_loss_pct,
+            _env_take_profit_pct,
+        )
+
+        monkeypatch.delenv("AUTONOMOUS_STOP_LOSS_PCT", raising=False)
+        monkeypatch.delenv("AUTONOMOUS_TAKE_PROFIT_PCT", raising=False)
+        assert _env_stop_loss_pct() == 0.03
+        assert _env_take_profit_pct() == 0.06
+
+    def test_scheduler_env_parsing_overrides(self, monkeypatch):
+        from backend.autonomous_scheduler import _env_stop_loss_pct, _env_take_profit_pct
+
+        monkeypatch.setenv("AUTONOMOUS_STOP_LOSS_PCT", "0.015")
+        monkeypatch.setenv("AUTONOMOUS_TAKE_PROFIT_PCT", "0.12")
+        assert _env_stop_loss_pct() == 0.015
+        assert _env_take_profit_pct() == 0.12
+
+    @pytest.mark.parametrize("raw", ["", "none", "off", "false", "0"])
+    def test_scheduler_env_parsing_disables_leg(self, monkeypatch, raw):
+        from backend.autonomous_scheduler import _env_take_profit_pct
+
+        monkeypatch.setenv("AUTONOMOUS_TAKE_PROFIT_PCT", raw)
+        assert _env_take_profit_pct() is None
+
+    @pytest.mark.parametrize("raw", ["garbage", "5", "-0.1", "1.0", "-1", "100"])
+    def test_scheduler_env_parsing_rejects_bad_values(self, monkeypatch, raw):
+        """Out-of-contract values fall back to the default, never to no-exit."""
+        from backend.autonomous_scheduler import _env_stop_loss_pct
+
+        monkeypatch.setenv("AUTONOMOUS_STOP_LOSS_PCT", raw)
+        assert _env_stop_loss_pct() == 0.03
+
+
+class TestSlTpSweep:
+    """The SL/TP sweep must fire with no strategy signal at all.
+
+    The built-in strategies emit HOLD while a position is open, and
+    ``_run_one_tick`` only routes buy/sell decisions, so a risk check nested
+    in the decision path would never run. The sweep is deliberately
+    independent of signals.
+    """
+
+    @staticmethod
+    def _wire(bot_id: str, *, premium: float = 185.0, sl: float | None = 0.03,
+              tp: float | None = 0.06):
+        from backend.autonomous_scheduler import (
+            _execute_one_option_decision,
+            _sweep_sl_tp_positions,
+        )
+
+        center, registry, intelligence, gate, spec, strategy_id = _build_control_center()
+        controller = _build_controller(center, bot_id=bot_id)
+        dep = _create_options_deployment(
+            controller, bot_id=bot_id, spec=spec, strategy_id=strategy_id,
+            options_enabled=True, allowed_option_types=["CE", "PE"],
+            max_contracts=1, stop_loss_pct=sl, take_profit_pct=tp,
+        )
+        _attach_phase_b(controller, premium=premium)
+        return controller, center, dep, _execute_one_option_decision, _sweep_sl_tp_positions
+
+    @staticmethod
+    def _reprice(runner, multiplier: float) -> None:
+        """Mark the open position to ``multiplier`` x its entry price."""
+        for pos in _open_positions(runner).values():
+            pos.current_price = pos.avg_entry_price * multiplier
+
+    def test_take_profit_closes_position_without_any_signal(self):
+        controller, center, dep, execute, sweep = self._wire("bot-sweep-tp")
+        opened = execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert opened["result"] == "submitted", opened
+
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        self._reprice(runner, 1.10)  # +10%, well past the 6% take-profit
+
+        fired = sweep(controller)
+        assert len(fired) == 1, f"expected exactly one SL/TP exit, got {fired}"
+        assert fired[0]["result"] == "sl_tp_exit", fired[0]
+        assert fired[0]["options_contract_id"] == opened["options_contract_id"]
+        assert _open_positions(runner) == {}, (
+            "position still open after take-profit: "
+            f"{ {k: v.qty for k, v in _open_positions(runner).items()} }"
+        )
+
+    def test_stop_loss_closes_position_without_any_signal(self):
+        controller, center, dep, execute, sweep = self._wire("bot-sweep-sl")
+        execute(
+            controller, _make_decision(option_intent="PE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        self._reprice(runner, 0.90)  # -10%, well past the 3% stop-loss
+
+        fired = sweep(controller)
+        assert len(fired) == 1, f"expected exactly one SL/TP exit, got {fired}"
+        assert fired[0]["result"] == "sl_tp_exit", fired[0]
+        assert _open_positions(runner) == {}, "position still open after stop-loss"
+
+    def test_sweep_is_a_noop_inside_the_band(self):
+        """+1% is inside both thresholds: must not touch the position."""
+        controller, center, dep, execute, sweep = self._wire("bot-sweep-band")
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        self._reprice(runner, 1.01)
+
+        assert sweep(controller) == []
+        assert len(_open_positions(runner)) == 1, "sweep closed a position early"
+
+    def test_sweep_is_idempotent(self):
+        """A second sweep must not double-close or error on a flat book."""
+        controller, center, dep, execute, sweep = self._wire("bot-sweep-idem")
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        self._reprice(runner, 1.10)
+
+        assert len(sweep(controller)) == 1
+        assert sweep(controller) == [], "sweep fired again on an already-flat book"
+
+    def test_sweep_respects_disabled_thresholds(self):
+        """With both legs off, the sweep must not close anything."""
+        controller, center, dep, execute, sweep = self._wire(
+            "bot-sweep-disabled", sl=None, tp=None,
+        )
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        self._reprice(runner, 1.50)  # +50%: would fire if a threshold were armed
+
+        assert sweep(controller) == []
+        assert len(_open_positions(runner)) == 1, (
+            "sweep closed a position with SL/TP disabled"
+        )
+
+    def test_sweep_skips_stale_or_unpriced_position(self):
+        """current_price <= 0 means no authoritative mark: never fire."""
+        controller, center, dep, execute, sweep = self._wire("bot-sweep-noprice")
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        for pos in _open_positions(runner).values():
+            pos.current_price = 0.0
+
+        assert sweep(controller) == []
+        assert len(_open_positions(runner)) == 1
+
+    def test_sweep_books_realized_pnl(self):
+        """The exit must realize the loss, not just flatten the quantity."""
+        controller, center, dep, execute, sweep = self._wire("bot-sweep-pnl")
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        entry = next(iter(_open_positions(runner).values())).avg_entry_price
+        self._reprice(runner, 0.90)
+
+        fired = sweep(controller)
+        assert len(fired) == 1, fired
+        record = next(
+            p for p in runner.broker.positions().values()
+            if p.options_contract_id == fired[0]["options_contract_id"]
+        )
+        assert record.qty == 0.0
+        # A stop-loss exit at -10% must realize a loss.
+        assert record.realized_pnl < 0, (
+            f"expected a realized loss, got {record.realized_pnl}"
+        )
+        assert record.avg_entry_price == 0.0
+        assert entry > 0
+
+    def test_sweep_ignores_non_active_deployment(self):
+        """A stopped deployment has a detached session; must not be closed."""
+        controller, center, dep, execute, sweep = self._wire("bot-sweep-stopped")
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        self._reprice(runner, 1.10)
+
+        center.stop_deployment(dep.deployment_id)
+        assert sweep(controller) == []
+        assert len(_open_positions(runner)) == 1, (
+            "sweep closed a position on a non-ACTIVE deployment"
+        )
+
+    def test_sweep_never_raises_on_no_deployments(self):
+        center, registry, intelligence, gate, spec, strategy_id = _build_control_center()
+        controller = _build_controller(center, bot_id="bot-sweep-empty")
+        from backend.autonomous_scheduler import _sweep_sl_tp_positions
+
+        assert _sweep_sl_tp_positions(controller) == []
+
+
+class TestSlTpSweepRunsOnEveryTick:
+    """Regression: the sweep must not sit behind an early return.
+
+    ``_run_one_tick`` can return early on market_closed / no_fresh_market_data
+    / no_candidates. If the SL/TP sweep ran after those, a breached threshold
+    would be missed on exactly the ticks where the strategy has nothing to say.
+    """
+
+    def test_sweep_precedes_early_returns_in_source(self):
+        """Structural guard: the sweep call must come before the early returns."""
+        import inspect
+
+        from backend import autonomous_scheduler
+
+        src = inspect.getsource(autonomous_scheduler._run_one_tick)
+        sweep_at = src.index("_sweep_sl_tp_positions(")
+        for reason in (
+            '"no_fresh_market_data"',
+            '"no_candidates"',
+        ):
+            assert sweep_at < src.index(reason), (
+                f"SL/TP sweep is evaluated after the {reason} early return; "
+                "breached thresholds would be skipped on those ticks"
+            )
+
+
+class TestSlTpExitDuringALiveTick:
+    """End-to-end: a breached threshold must be actioned by a real tick.
+
+    This is the exact scenario that was broken. The built-in strategies emit
+    HOLD while a position is open, so on a normal tick the decision pipeline
+    contributes no eligible decision at all — the SL/TP check nested in the
+    decision path therefore never ran, and a position could only be closed by
+    a rare explicit exit signal.
+    """
+
+    @staticmethod
+    def _open_and_breach(bot_id: str, multiplier: float):
+        from backend.autonomous_scheduler import _execute_one_option_decision
+
+        center, registry, intelligence, gate, spec, strategy_id = _build_control_center()
+        controller = _build_controller(center, bot_id=bot_id)
+        dep = _create_options_deployment(
+            controller, bot_id=bot_id, spec=spec, strategy_id=strategy_id,
+            options_enabled=True, allowed_option_types=["CE", "PE"],
+            max_contracts=1, stop_loss_pct=0.03, take_profit_pct=0.06,
+        )
+        _attach_phase_b(controller, premium=185.0)
+        opened = _execute_one_option_decision(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert opened["result"] == "submitted", opened
+
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        for pos in _open_positions(runner).values():
+            pos.current_price = pos.avg_entry_price * multiplier
+        return controller, center, dep, sid, runner, opened
+
+    def test_tick_flattens_take_profit_with_no_eligible_decision(self, monkeypatch):
+        from backend import autonomous_scheduler
+
+        controller, center, dep, sid, runner, opened = self._open_and_breach(
+            "bot-tick-tp", 1.10,
+        )
+        # Force the session/data gates open so the tick reaches the decision
+        # stage regardless of wall-clock time when the suite runs.
+        monkeypatch.setattr(
+            autonomous_scheduler, "_is_regular_session", lambda ts: True
+        )
+        monkeypatch.setattr(
+            autonomous_scheduler, "_has_fresh_data", lambda *a, **k: False
+        )
+
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        assert result.get("risk_exits"), (
+            f"a real tick did not action the breached take-profit: {result}"
+        )
+        assert result["risk_exits"][0]["result"] == "sl_tp_exit", result["risk_exits"][0]
+        assert result["risk_exits"][0]["options_contract_id"] == opened["options_contract_id"]
+        # The tick is allowed to have no eligible decisions at all — that is
+        # the realistic case while a position is open.
+        assert result.get("eligible_count", 0) == 0, result
+        assert _open_positions(runner) == {}, (
+            "position still open after a tick that breached take-profit: "
+            f"{ {k: v.qty for k, v in _open_positions(runner).items()} }"
+        )
+
+    def test_tick_flattens_stop_loss_with_no_eligible_decision(self, monkeypatch):
+        from backend import autonomous_scheduler
+
+        controller, center, dep, sid, runner, opened = self._open_and_breach(
+            "bot-tick-sl", 0.90,
+        )
+        monkeypatch.setattr(
+            autonomous_scheduler, "_is_regular_session", lambda ts: True
+        )
+        monkeypatch.setattr(
+            autonomous_scheduler, "_has_fresh_data", lambda *a, **k: False
+        )
+
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        assert result.get("risk_exits"), (
+            f"a real tick did not action the breached stop-loss: {result}"
+        )
+        assert _open_positions(runner) == {}, "position still open after stop-loss tick"
+
+    def test_tick_leaves_position_alone_inside_the_band(self, monkeypatch):
+        from backend import autonomous_scheduler
+
+        controller, center, dep, sid, runner, opened = self._open_and_breach(
+            "bot-tick-band", 1.01,
+        )
+        monkeypatch.setattr(
+            autonomous_scheduler, "_is_regular_session", lambda ts: True
+        )
+        monkeypatch.setattr(
+            autonomous_scheduler, "_has_fresh_data", lambda *a, **k: False
+        )
+
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        assert result.get("risk_exits") == [], (
+            f"tick exited a position that was inside the band: {result}"
+        )
+        assert len(_open_positions(runner)) == 1, "position closed without a breach"
+
+    def test_halted_bot_does_not_sweep(self, monkeypatch):
+        """A halted bot must not trade at all, including risk exits."""
+        from backend import autonomous_scheduler
+        from trading_system.autonomous.safety import KillSwitchReason
+
+        controller, center, dep, sid, runner, opened = self._open_and_breach(
+            "bot-tick-halted", 1.10,
+        )
+        controller.halt_bot(reason=KillSwitchReason.MANUAL, detail="test")
+        monkeypatch.setattr(
+            autonomous_scheduler, "_is_regular_session", lambda ts: True
+        )
+
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        assert result["reason"] == "kill_switch_halted", result
+        assert len(_open_positions(runner)) == 1, (
+            "a halted bot closed a position: the kill switch must win"
+        )
         # And no live order endpoint was hit (Upstox/FYERS) — there is no
         # network code path inside execute_option_order.

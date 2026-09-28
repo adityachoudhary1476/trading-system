@@ -119,6 +119,11 @@ from sqlalchemy.engine import Engine
 
 from dotenv import load_dotenv
 
+from trading_system.paper.deployment import (
+    DEFAULT_STOP_LOSS_PCT,
+    DEFAULT_TAKE_PROFIT_PCT,
+)
+
 _env_dir = Path(__file__).resolve().parent
 load_dotenv(_env_dir / ".env")  # backend/.env
 load_dotenv(".env")  # project root .env as fallback
@@ -134,6 +139,8 @@ ENV_DB_URL = "MARKET_DATA_DB_URL"
 ENV_PHASE22 = "AUTONOMOUS_PHASE22_ENABLED"
 ENV_PHASE22_OPTIONS = "AUTONOMOUS_PHASE22_OPTIONS_ENABLED"
 ENV_PORTFOLIO = "AUTONOMOUS_PORTFOLIO_ENABLED"
+ENV_STOP_LOSS_PCT = "AUTONOMOUS_STOP_LOSS_PCT"
+ENV_TAKE_PROFIT_PCT = "AUTONOMOUS_TAKE_PROFIT_PCT"
 
 DEFAULT_INTERVAL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 10
@@ -845,6 +852,60 @@ def _env_max_option_quote_age() -> float:
         return 300.0
 
 
+def _env_risk_pct(var: str, default: float) -> Optional[float]:
+    """Parse a per-position risk limit from the environment.
+
+    Returns a fraction of cost basis (``0.03`` == 3%), validated against the
+    ``gt=0, lt=1`` constraint on :class:`PaperDeploymentConfig`. Set the var to
+    an empty string, ``none``, ``off`` or ``0`` to explicitly disable that leg
+    (e.g. "no take-profit, stop-loss only"). An unparseable value falls back to
+    the default rather than silently disarming risk.
+    """
+    raw = os.environ.get(var)
+    if raw is None:
+        return default
+    raw = raw.strip().lower()
+    if raw in ("", "none", "off", "false", "0"):
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not 0.0 < value < 1.0:
+        return default
+    return value
+
+
+def _env_stop_loss_pct() -> Optional[float]:
+    """Per-position stop-loss fraction. Default 3% (``DEFAULT_STOP_LOSS_PCT``)."""
+    return _env_risk_pct(ENV_STOP_LOSS_PCT, DEFAULT_STOP_LOSS_PCT)
+
+
+def _env_take_profit_pct() -> Optional[float]:
+    """Per-position take-profit fraction. Default 6% (``DEFAULT_TAKE_PROFIT_PCT``)."""
+    return _env_risk_pct(ENV_TAKE_PROFIT_PCT, DEFAULT_TAKE_PROFIT_PCT)
+
+
+def _autonomous_deployment_config():
+    """Build the ``PaperDeploymentConfig`` the scheduler deploys with.
+
+    Arming the per-position risk limits here is not optional: an autonomous
+    deployment with no stop-loss and no take-profit has no per-position exit,
+    so a position can only ever be closed by a strategy signal — and the
+    built-in strategies emit HOLD while a position is open. Thresholds come
+    from the environment so an operator can retune them without a code change.
+    """
+    from trading_system.paper.deployment import PaperDeploymentConfig
+
+    return PaperDeploymentConfig(
+        execution_mode="paper",
+        initial_cash=100_000.0,
+        allow_short=False,
+        stop_loss_pct=_env_stop_loss_pct(),
+        take_profit_pct=_env_take_profit_pct(),
+    )
+
+
 def _build_options_wiring(
     *,
     repository: Optional[InstrumentRepository] = None,
@@ -962,6 +1023,133 @@ def _run_phase_b_validation(
         for o in obs:
             observations.append({**o.to_dict(), "underlying": underlying})
     return observations
+
+
+def _close_option_position(
+    controller,
+    *,
+    position,
+    deployment,
+    session_id: str,
+    spot_price: float,
+    quantity: float,
+    config,
+    decision_id: str,
+) -> dict:
+    """Close one open option position with a sell-to-close order.
+
+    Shared by the SL/TP sweep and the in-decision SL/TP check so both paths
+    build an identical, idempotent exit. Never raises.
+    """
+    contract_id = getattr(position, "options_contract_id", None)
+    option_type = getattr(position, "option_type", None)
+    if contract_id is None or option_type is None:
+        return {
+            "result": "invalid_position",
+            "detail": "existing position missing contract metadata",
+            "deployment_id": deployment.deployment_id,
+        }
+
+    exit_decision = SimpleNamespace(
+        decision_id=decision_id,
+        opportunity_symbol=deployment.symbol,
+        selected_configuration=None,
+        action="sell",
+        signal=SimpleNamespace(
+            action="sell",
+            reference_price=spot_price,
+            option_intent=option_type,
+        ),
+    )
+    result = controller.execute_option_order(
+        decision=exit_decision,
+        spot_price=spot_price,
+        deployment_id=deployment.deployment_id,
+        session_id=session_id,
+        order_quantity=quantity,
+        options_deployment_config=config,
+        explicit_option_type=option_type,
+        existing_position=position,
+    )
+    if result is None:
+        return {
+            "result": "rejected",
+            "options_contract_id": contract_id,
+            "deployment_id": deployment.deployment_id,
+        }
+    return {
+        "result": "sl_tp_exit",
+        "status": result.status,
+        "order_id": result.order_id,
+        "option_intent": option_type,
+        "options_contract_id": contract_id,
+        "strike": getattr(position, "strike", None),
+        "expiry": getattr(position, "expiry", None),
+        "filled_quantity": getattr(result, "filled_quantity", None),
+        "avg_fill_price": getattr(result, "avg_fill_price", None),
+        "deployment_id": deployment.deployment_id,
+        "session_id": session_id,
+    }
+
+
+def _sweep_sl_tp_positions(
+    controller, *, now: Optional[datetime] = None
+) -> list[dict]:
+    """Close every open option position whose SL/TP threshold is breached.
+
+    This runs on every tick and is deliberately independent of strategy
+    signals. ``_run_one_tick`` only routes decisions whose action is
+    buy/sell, and while a position is open the built-in strategies emit
+    HOLD -- so an SL/TP check nested inside the decision path would almost
+    never be evaluated. Risk exits must not depend on the strategy being in
+    a particular state.
+
+    Returns a list of per-position result dicts (empty when nothing fired).
+    Never raises.
+    """
+    from trading_system.paper.deployment import PaperDeploymentStatus
+
+    ts = now or datetime.now(UTC)
+    try:
+        center = controller.control_center
+        deployments = center.list_deployments()
+    except Exception:  # noqa: BLE001
+        return []
+
+    fired: list[dict] = []
+    for dep in deployments:
+        # Only ACTIVE deployments accept orders; stopped/failed ones have
+        # detached sessions and would be rejected downstream anyway.
+        if dep.status != PaperDeploymentStatus.ACTIVE:
+            continue
+        try:
+            sid = center.find_session_for_deployment(dep.deployment_id)
+            if sid is None:
+                continue
+            runner = center.get_runner(sid)
+            if runner is None:
+                continue
+            positions = _get_open_option_positions(center, dep.deployment_id)
+            for pos in positions:
+                if _check_sl_tp_for_position(runner, pos, ts) is None:
+                    continue
+                fired.append(
+                    _close_option_position(
+                        controller,
+                        position=pos,
+                        deployment=dep,
+                        session_id=sid,
+                        spot_price=float(getattr(pos, "current_price", 0.0) or 0.0),
+                        quantity=abs(float(getattr(pos, "qty", 0.0) or 0.0)),
+                        config=getattr(dep, "config", None),
+                        decision_id=f"sl-tp-{dep.deployment_id}-{pos.symbol}",
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001
+            # A failure on one position must not abort the rest of the sweep,
+            # and must never take down the tick loop.
+            logger.warning("SL/TP sweep failed for %s: %s", dep.deployment_id, exc)
+    return fired
 
 
 def _execute_one_option_decision(
@@ -1103,59 +1291,24 @@ def _execute_one_option_decision(
             }
 
         # --- SL/TP: if existing position violates thresholds, exit instead ---
+        # Also enforced every tick by _sweep_sl_tp_positions, which is the
+        # path that actually fires while the strategy is HOLDing.
         open_positions = _get_open_option_positions(controller.control_center, deployment_id)
         for pos in open_positions:
             if _option_position_matches_contract(pos, decision, option_intent):
-                sl_tp_action = _check_sl_tp_for_position(runner, pos, datetime.now(timezone.utc))
-                if sl_tp_action is not None:
-                    contract_id = getattr(pos, "options_contract_id", None)
-                    strike = getattr(pos, "strike", None)
-                    expiry = getattr(pos, "expiry", None)
-                    pos_option_type = getattr(pos, "option_type", None)
-                    contract_size = getattr(pos, "contract_size", 1)
-
-                    exit_decision = SimpleNamespace(
-                        decision_id=getattr(decision, "decision_id", "exit") + "-sl-tp",
-                        opportunity_symbol=getattr(decision, "opportunity_symbol", dep.symbol),
-                        selected_configuration=getattr(decision, "selected_configuration", None),
-                        action="sell",
-                        signal=SimpleNamespace(
-                            action="sell",
-                            reference_price=spot_price,
-                            option_intent=option_intent,
+                if _check_sl_tp_for_position(runner, pos, datetime.now(timezone.utc)) is not None:
+                    return _close_option_position(
+                        controller,
+                        position=pos,
+                        deployment=dep,
+                        session_id=sid,
+                        spot_price=spot_price,
+                        quantity=target_qty,
+                        config=cfg,
+                        decision_id=(
+                            f"{getattr(decision, 'decision_id', 'exit')}-sl-tp"
                         ),
                     )
-
-                    result = controller.execute_option_order(
-                        decision=exit_decision,
-                        spot_price=spot_price,
-                        deployment_id=deployment_id,
-                        session_id=sid,
-                        order_quantity=target_qty,
-                        options_deployment_config=cfg,
-                        explicit_option_type=option_intent,
-                        existing_position=pos,
-                    )
-
-                    if result is None:
-                        return {
-                            "result": "rejected",
-                            "deployment_id": deployment_id,
-                        }
-
-                    return {
-                        "result": "sl_tp_exit",
-                        "status": result.status,
-                        "order_id": result.order_id,
-                        "option_intent": option_intent,
-                        "options_contract_id": contract_id,
-                        "strike": strike,
-                        "expiry": expiry,
-                        "filled_quantity": getattr(result, "filled_quantity", None),
-                        "avg_fill_price": getattr(result, "avg_fill_price", None),
-                        "deployment_id": deployment_id,
-                        "session_id": sid,
-                    }
                 break
 
         result = controller.execute_option_order(
@@ -1300,6 +1453,8 @@ def _execute_one_decision(
         DeploymentCreationResult,
     )
     from trading_system.paper.deployment import (
+        DEFAULT_STOP_LOSS_PCT,
+        DEFAULT_TAKE_PROFIT_PCT,
         PaperDeploymentConfig,
         PaperDeploymentStatus,
     )
@@ -1352,11 +1507,7 @@ def _execute_one_decision(
             strategy_id=strategy_id,
             timeframe=timeframe,
             strategy_spec=spec,
-            deployment_config=PaperDeploymentConfig(
-                execution_mode="paper",
-                initial_cash=100_000.0,
-                allow_short=False,
-            ),
+            deployment_config=_autonomous_deployment_config(),
         )
         if result == DeploymentCreationResult.DUPLICATE_DEPLOYMENT:
             # Another worker created it concurrently; re-resolve.
@@ -1977,7 +2128,17 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
                 )
         return {**base, "result": "skip", "reason": "market_closed"}
 
-    # --- 3. Fresh data for at least one allowed symbol ---
+    # --- 3. Risk exits, before the decision pipeline ---
+    # A breached stop-loss / take-profit must flatten existing risk no matter
+    # what the scanner or strategy does this tick. Steps 3-6 below can each
+    # return early (no fresh data, no candidates, decision error), and the
+    # built-in strategies emit HOLD while a position is open -- so an exit
+    # check nested in the decision path would almost never be reached.
+    # Runs after the session check (no exits when the market is closed) and
+    # after the kill switch (a halted bot must not trade at all).
+    risk_exits = _sweep_sl_tp_positions(controller, now=started_at)
+
+    # --- 4. Fresh data for at least one allowed symbol ---
     allowed_symbols = list(controller.config.user_constraints.allowed_symbols)
     timeframe = "1d"
     fresh_symbols = [
@@ -1993,9 +2154,9 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
                     d.deployment_id,
                     last_tick_at=started_at.isoformat(),
                 )
-        return {**base, "result": "skip", "reason": "no_fresh_market_data"}
+        return {**base, "result": "skip", "reason": "no_fresh_market_data", "risk_exits": risk_exits}
 
-    # --- 4. Run scan -> rank -> compatibility -> decisions ---
+    # --- 5. Run scan -> rank -> compatibility -> decisions ---
     try:
         scan = controller.scan_market()
     except Exception as exc:  # noqa: BLE001
@@ -2004,6 +2165,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
             **base, "result": "error",
             "reason": f"scan_error:{type(exc).__name__}",
             "error_category": "transient_infrastructure",
+            "risk_exits": risk_exits,
         }
     if not scan.candidates:
         # Update heartbeat: no candidates
@@ -2015,7 +2177,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
                     last_tick_at=started_at.isoformat(),
                     last_market_data_at=started_at.isoformat(),
                 )
-        return {**base, "result": "skip", "reason": "no_candidates"}
+        return {**base, "result": "skip", "reason": "no_candidates", "risk_exits": risk_exits}
     try:
         ranking = controller.rank_candidates(scan)
         compat = controller.evaluate_strategy_compatibility(ranking)
@@ -2035,6 +2197,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
             **base, "result": "error",
             "reason": f"decision_error:{type(exc).__name__}",
             "error_category": "unexpected_programming",
+            "risk_exits": risk_exits,
         }
 
     eligible = [
@@ -2059,8 +2222,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
             **base, "result": "skip", "reason": "no_eligible_decisions",
             "decision_count": len(decisions.decisions),
         }
-
-    # --- 5. Per-decision execution with isolation ---
+    # --- 6. Per-decision execution with isolation ---
     submissions = []
     seen: set[tuple[str, str, str, str]] = set()
     execution_happened = False
@@ -2132,6 +2294,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         "result": "executed",
         "decision_count": len(decisions.decisions),
         "eligible_count": len(eligible),
+        "risk_exits": risk_exits,
         "submissions": submissions,
         "phase22": phase22_result,
         "portfolio": portfolio_result,
