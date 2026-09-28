@@ -473,7 +473,7 @@ def test_explicit_range_argument(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 # Symbol normalization
 # --------------------------------------------------------------------------- #
-def test_symbol_normalization_maps_to_fyers(tmp_path, monkeypatch):
+def test_symbol_normalization_maps_to_upstox(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 2)
@@ -481,12 +481,14 @@ def test_symbol_normalization_maps_to_fyers(tmp_path, monkeypatch):
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     res = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=1))
-    # The fyers symbol is derived via the existing mapping layer.
-    assert res.provider_symbol == "NSE:SBIN-EQ"
+    # The Upstox instrument key is derived via the existing mapping layer.
+    # Upstox addresses instruments as "<segment>|<id>" (pipe-separated), not the
+    # fyers-era "NSE:SBIN-EQ" form.
+    assert res.provider_symbol == "NSE_EQ|SBIN"
     assert res.exchange == "NSE"
     # INDEX symbols also map.
     res2 = eng.backfill_symbol("NSE:NIFTY50", "1d", start=base, end=base + timedelta(days=1))
-    assert res2.provider_symbol == "NSE:NIFTY50-INDEX"
+    assert res2.provider_symbol == "NSE_INDEX|NIFTY50"
 
 
 # --------------------------------------------------------------------------- #

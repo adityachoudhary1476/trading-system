@@ -5,6 +5,7 @@ No network / FYERS credentials / live market required.
 from __future__ import annotations
 
 import time
+import json
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -336,7 +337,9 @@ def test_ws_normalizes_symbol_update():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    sock._normalize(upstox_ws_symbol_update())
+    # Drive the real websocket message path (JSON frame -> _normalize -> on_event)
+    # rather than calling _normalize directly, so the routing is covered too.
+    sock._handle_message_from_ws(None, json.dumps(upstox_ws_symbol_update()))
     assert len(received) == 1
     assert received[0].symbol == "NSE:SBIN"
     assert received[0].ltp == 123.45
@@ -346,19 +349,23 @@ def test_ws_drops_malformed_json():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    # non-dict / control frames are skipped, never crash
-    assert sock._normalize("not-a-dict") is None
-    sock._normalize(upstox_ws_malformed())  # dict without 'symbol'
-    sock._normalize(upstox_ws_heartbeat())  # control frame
-    sock._normalize(upstox_ws_auth_ack())   # control frame
+    invalid = []
+    sock.on_invalid_cb(lambda: invalid.append(True))
+    # Control frames / non-price frames are skipped, never crash, never emitted.
+    sock._handle_message_from_ws(None, json.dumps(upstox_ws_heartbeat()))
+    sock._handle_message_from_ws(None, json.dumps(upstox_ws_auth_ack()))
+    sock._handle_message_from_ws(None, json.dumps(upstox_ws_malformed()))
+    # Undecodable payload is reported via the invalid callback, not raised.
+    sock._handle_message_from_ws(None, "not-json")
     assert received == []
+    assert invalid == [True]
 
 
 def test_ws_unknown_type_skipped():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    sock._normalize(upstox_ws_unknown_type())
+    sock._handle_message_from_ws(None, json.dumps(upstox_ws_unknown_type()))
     assert received == []
 
 
@@ -369,13 +376,15 @@ def test_ws_lifecycle_hooks_drive_health():
     sock.on_connect_cb(hm.on_connect)
     sock.on_disconnect_cb(hm.on_disconnect)
     sock.on_auth_error_cb(hm.on_auth_error)
-    sock._on_sdk_connect()
+    sock._handle_open(None)
     assert hm.status == FeedStatus.HEALTHY
-    sock._on_sdk_close({"code": 1, "message": "closed"})
+    sock._handle_close(None, 1000, "closed")
     assert hm.status == FeedStatus.DISCONNECTED
-    # SDK surfaces auth failure via OnError with type AUTH_TYPE.
-    sock._on_sdk_error({"type": "AUTH_TYPE", "code": 803})
-    assert hm.status == FeedStatus.AUTH_ERROR
+    # An SDK-level error surfaces via the invalid/error callback.
+    invalid = []
+    sock.on_invalid_cb(lambda: invalid.append(True))
+    sock._handle_error(None, RuntimeError("boom"))
+    assert invalid == [True]
 
 
 def test_ws_reconnect_owned_by_sdk_no_spin():
@@ -383,5 +392,18 @@ def test_ws_reconnect_owned_by_sdk_no_spin():
     sock = _make_socket()
     assert not hasattr(sock, "_schedule_reconnect")
     # Double close should not raise or loop.
-    sock._on_sdk_close({"code": 1})
-    sock._on_sdk_close({"code": 1})
+    sock._handle_close(None, 1000, "closed")
+    sock._handle_close(None, 1000, "closed")
+
+
+def test_ws_intentional_close_not_reported_as_disconnect():
+    """close() marks the socket closed first, so a deliberate shutdown is not
+    surfaced to the health monitor as a feed drop."""
+    from trading_system.india.data_health import DataHealthMonitor, FeedStatus
+    sock = _make_socket()
+    hm = DataHealthMonitor()
+    sock.on_disconnect_cb(hm.on_disconnect)
+    hm.on_connect()
+    sock._closed = True
+    sock._handle_close(None, 1000, "bye")
+    assert hm.status == FeedStatus.HEALTHY

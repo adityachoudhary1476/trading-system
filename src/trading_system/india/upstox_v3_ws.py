@@ -166,31 +166,12 @@ class UpstoxV3WebSocket:
             log.info("V3 authorization successful")
 
             # Step 2: Connect to authorized URL
-            def on_open(ws):
-                log.info("V3 WebSocket connected")
-                self._subscribe()
-                if self._on_connect_cb:
-                    self._on_connect_cb()
-
-            def on_error(ws, error):
-                log.error("V3 WebSocket error: %s", error)
-                if self._on_error_cb:
-                    self._on_error_cb(error)
-
-            def on_close(ws, status, message):
-                log.info("V3 WebSocket closed: %s %s", status, message)
-                if not self._closed and self._on_disconnect_cb:
-                    self._on_disconnect_cb()
-
-            def on_message(ws, message):
-                self._handle_message(message)
-
             self._ws = websocket.WebSocketApp(
                 self._authorized_url,
-                on_open=on_open,
-                on_error=on_error,
-                on_close=on_close,
-                on_message=on_message,
+                on_open=self._handle_open,
+                on_error=self._handle_error,
+                on_close=self._handle_close,
+                on_message=self._handle_message_from_ws,
             )
 
             # Run WebSocket in a background thread (run_forever is blocking)
@@ -202,8 +183,7 @@ class UpstoxV3WebSocket:
 
         except UpstoxV3AuthorizationError as e:
             log.error("V3 authorization failed: %s", e)
-            if self._on_auth_error_cb:
-                self._on_auth_error_cb()
+            self._notify_auth_error()
             raise
         except Exception as e:
             log.error("V3 WebSocket connection failed: %s", e)
@@ -269,6 +249,37 @@ class UpstoxV3WebSocket:
         # remain readable; encode as UTF-8.
         return json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
+    # -------------------------------------------------- lifecycle handlers
+    # These are bound onto the WebSocketApp as ``on_open``/``on_error``/
+    # ``on_close``/``on_message`` and kept as named methods (rather than
+    # closures inside connect()) so the feed lifecycle is directly testable
+    # without a real socket.
+
+    def _handle_open(self, ws=None) -> None:
+        log.info("V3 WebSocket connected")
+        self._subscribe()
+        if self._on_connect_cb:
+            self._on_connect_cb()
+
+    def _handle_error(self, ws=None, error=None) -> None:
+        log.error("V3 WebSocket error: %s", error)
+        if self._on_error_cb:
+            self._on_error_cb(error)
+
+    def _handle_close(self, ws=None, status=None, message=None) -> None:
+        log.info("V3 WebSocket closed: %s %s", status, message)
+        # An intentional close() sets _closed first; only an unexpected drop
+        # should be reported as a disconnect.
+        if not self._closed and self._on_disconnect_cb:
+            self._on_disconnect_cb()
+
+    def _handle_message_from_ws(self, ws=None, message=None) -> None:
+        self._handle_message(message)
+
+    def _notify_auth_error(self) -> None:
+        if self._on_auth_error_cb:
+            self._on_auth_error_cb()
+
     def _handle_message(self, message) -> None:
         """
         Handle incoming WebSocket message.
@@ -299,6 +310,24 @@ class UpstoxV3WebSocket:
             if self._on_invalid_cb:
                 self._on_invalid_cb(e)
 
+    @staticmethod
+    def _exchange_of(instrument_key: str, internal_symbol: str) -> str:
+        """Exchange for an event, consistent with the V2 socket.
+
+        V2 derives the exchange from the internal symbol ("NSE:SBIN" -> "NSE").
+        Taking the raw segment off a V3 instrument key instead would yield
+        "NSE_EQ" / "NSE_INDEX", so the same instrument reported a different
+        exchange depending on which transport produced it. Prefer the internal
+        symbol, and only fall back to stripping the segment suffix.
+        """
+        if ":" in internal_symbol:
+            return internal_symbol.split(":", 1)[0]
+        segment = instrument_key.split("|", 1)[0] if "|" in instrument_key else ""
+        for suffix in ("_EQ", "_INDEX", "_OPT", "_FUT", "_CDS"):
+            if segment.endswith(suffix):
+                return segment[: -len(suffix)]
+        return segment
+
     def _normalize(
         self,
         instrument_key: str,
@@ -323,6 +352,8 @@ class UpstoxV3WebSocket:
 
         if not ltpc or not ltpc.ltp:
             return None
+
+        internal_symbol = self.symbol_map.get(instrument_key, instrument_key)
 
         # V3 timestamps are milliseconds. Missing market time is not replaced
         # with server time because that would create a false market event.
@@ -353,8 +384,8 @@ class UpstoxV3WebSocket:
 
         return InternalMarketEvent(
             event_type=EventType.QUOTE,
-            symbol=self.symbol_map.get(instrument_key, instrument_key),
-            exchange=instrument_key.split("|")[0] if "|" in instrument_key else "",
+            symbol=internal_symbol,
+            exchange=self._exchange_of(instrument_key, internal_symbol),
             provider_symbol=instrument_key,
             timestamp=ts,
             ltp=ltpc.ltp,

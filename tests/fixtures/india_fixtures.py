@@ -77,6 +77,71 @@ def upstox_ws_unknown_type() -> dict:
     return {"foo": "bar"}
 
 
+# --- Upstox V3 protobuf feed fixtures ---------------------------------------
+# V3 delivers binary protobuf FeedResponse frames, not the v2 JSON dicts above.
+# These build real serializable protobuf messages so the decode path is
+# exercised end to end rather than stubbed out.
+
+V3_SBIN_KEY = "NSE_EQ|INE020B01018"
+V3_NIFTY_KEY = "NSE_INDEX|NIFTY 50"
+
+
+def v3_feed_response(
+    instrument_key: str = V3_SBIN_KEY,
+    ltp: float = 123.45,
+    ltt_ms: int = 1_700_000_000_000,
+    current_ts: int = 1_700_000_000_000,
+) -> "object":
+    """A single-instrument LTPC FeedResponse message."""
+    from trading_system.india.upstox_v3_pb import Feed, FeedResponse, LTPC
+
+    return FeedResponse(
+        feeds={
+            instrument_key: Feed(
+                ltpc=LTPC(ltp=ltp, ltt=ltt_ms, cp=ltp),
+            )
+        },
+        current_ts=current_ts,
+    )
+
+
+def v3_feed_response_full(
+    instrument_key: str = V3_SBIN_KEY,
+    ltp: float = 123.45,
+    ltt_ms: int = 1_700_000_000_000,
+) -> "object":
+    """A FeedResponse carrying a full feed (LTPC + OHLC)."""
+    from trading_system.india.upstox_v3_pb import Feed, FeedResponse, LTPC, MarketFullFeed, OHLC
+
+    return FeedResponse(
+        feeds={
+            instrument_key: Feed(
+                ltpc=LTPC(ltp=ltp, ltt=ltt_ms, cp=ltp),
+                full_feed=MarketFullFeed(
+                    ltpc=LTPC(ltp=ltp, ltt=ltt_ms, cp=ltp),
+                    market_ohlc=[OHLC(open=120.0, high=125.0, low=119.0, close=123.45, vol=98765)],
+                ),
+            )
+        },
+        current_ts=ltt_ms,
+    )
+
+
+def v3_feed_response_no_price(instrument_key: str = V3_SBIN_KEY) -> "object":
+    """A FeedResponse whose feed carries no LTPC - must be skipped, not crash."""
+    from trading_system.india.upstox_v3_pb import Feed, FeedResponse, LTPC
+
+    return FeedResponse(
+        feeds={instrument_key: Feed(ltpc=LTPC(ltp=0.0, ltt=0, cp=0.0))},
+        current_ts=1_700_000_000_000,
+    )
+
+
+def v3_feed_bytes(*args, **kwargs) -> bytes:
+    """Serialized V3 FeedResponse frame, as delivered by websocket."""
+    return v3_feed_response(*args, **kwargs).serialize()
+
+
 # --- Instrument master fixtures (provider-independent) ----------------------
 # Instrument master is a CSV/JSON with columns like:
 #   Symbol, Exch, Token, Instrument, Expiry, StrikePrice, OptionType, LotSize

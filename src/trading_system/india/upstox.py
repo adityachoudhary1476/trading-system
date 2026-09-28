@@ -318,47 +318,82 @@ class UpstoxDataSocket:
             return
         import websocket
 
-        auth = {"type": "auth", "access_token": f"{self.client_id}:{self.access_token}"}
-        subscribe = {"type": "subscribe", "symbols": self.upstox_symbols}
-
-        def on_open(ws):
-            log.info("Upstox WS connected")
-            ws.send(json.dumps(auth))
-            ws.send(json.dumps(subscribe))
-            if self._on_connect_cb:
-                self._on_connect_cb()
-
-        def on_error(ws, error):
-            log.error("Upstox WS error: %s", error)
-            if self._on_invalid_cb:
-                self._on_invalid_cb()
-
-        def on_close(ws, status, message):
-            log.info("Upstox WS closed: %s %s", status, message)
-            if self._closed:
-                return
-            if self._on_disconnect_cb:
-                self._on_disconnect_cb()
-
-        def on_message(ws, message):
-            try:
-                data = json.loads(message)
-            except (json.JSONDecodeError, TypeError):
-                if self._on_invalid_cb:
-                    self._on_invalid_cb()
-                return
-            event = self._normalize(data)
-            if event is not None and self.on_event is not None:
-                self.on_event(event)
-
         self._ws = websocket.WebSocketApp(
             _WS_URL,
-            on_open=on_open,
-            on_error=on_error,
-            on_close=on_close,
-            on_message=on_message,
+            on_open=self._handle_open,
+            on_error=self._handle_error,
+            on_close=self._handle_close,
+            on_message=self._handle_message_from_ws,
         )
         self._ws.run_async()
+
+    # -------------------------------------------------- lifecycle handlers
+    # Bound onto the WebSocketApp as on_open/on_error/on_close/on_message and
+    # kept as named methods (rather than closures inside connect()) so the feed
+    # lifecycle is testable without a real socket.
+
+    def _handle_open(self, ws=None) -> None:
+        log.info("Upstox WS connected")
+        if ws is not None:
+            ws.send(json.dumps(self._auth_frame()))
+            ws.send(json.dumps({"type": "subscribe", "symbols": self.upstox_symbols}))
+        if self._on_connect_cb:
+            self._on_connect_cb()
+
+    def _auth_frame(self) -> dict:
+        return {
+            "type": "auth",
+            "access_token": f"{self.client_id}:{self.access_token}",
+        }
+
+    def _handle_error(self, ws=None, error=None) -> None:
+        log.error("Upstox WS error: %s", error)
+        if self._on_invalid_cb:
+            self._on_invalid_cb()
+
+    def _handle_close(self, ws=None, status=None, message=None) -> None:
+        log.info("Upstox WS closed: %s %s", status, message)
+        # An intentional close() sets _closed first; only an unexpected drop
+        # should be reported as a disconnect.
+        if self._closed:
+            return
+        if self._on_disconnect_cb:
+            self._on_disconnect_cb()
+
+    def _is_auth_failure(self, data) -> bool:
+        """Whether a v2 frame reports an authentication failure.
+
+        Upstox v2 answers the ``auth`` frame with a ``cn`` (connect) frame
+        carrying a ``s`` status field. A failed or expired token therefore
+        arrives as an ordinary message, so without this check the auth error is
+        swallowed as an undecodable frame and the feed health monitor never
+        learns the session is dead.
+        """
+        if not isinstance(data, dict):
+            return False
+        frame_type = data.get("type")
+        if frame_type == "cn":
+            # The connect/auth acknowledgement frame.
+            return str(data.get("s", "")).lower() not in ("ok", "success", "")
+        if frame_type == "auth":
+            return str(data.get("status", "")).lower() not in ("success", "ok", "")
+        return False
+
+    def _handle_message_from_ws(self, ws=None, message=None) -> None:
+        try:
+            data = json.loads(message)
+        except (json.JSONDecodeError, TypeError):
+            if self._on_invalid_cb:
+                self._on_invalid_cb()
+            return
+        if self._is_auth_failure(data):
+            log.error("Upstox WS auth rejected: %s", data.get("message"))
+            if self._on_auth_error_cb:
+                self._on_auth_error_cb()
+            return
+        event = self._normalize(data)
+        if event is not None and self.on_event is not None:
+            self.on_event(event)
 
     def _normalize(self, data: dict) -> Optional[InternalMarketEvent]:
         if not isinstance(data, dict):

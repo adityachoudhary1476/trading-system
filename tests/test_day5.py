@@ -1,12 +1,14 @@
-"""Day 5 tests: real FYERS pipeline integration (all OFFLINE + deterministic).
+"""Day 5 tests: real Upstox pipeline integration (all OFFLINE + deterministic).
 
-No network / FYERS credentials / live market / current prices / current time.
-The live socket is faked at the boundary: we drive UpstoxDataSocket._normalize and
-LiveMarketPipeline.ingest directly with synthetic SDK-shaped dicts, and a fake
-provider + fake socket for bootstrap/historical + health wiring.
+No network / Upstox credentials / live market / current prices / current time.
+The live socket is faked at the boundary: we drive UpstoxDataSocket message
+handling and LiveMarketPipeline.ingest directly with synthetic Upstox-shaped
+frames, and a fake provider + fake socket for bootstrap/historical + health
+wiring.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -33,13 +35,18 @@ def _event(symbol="NSE:SBIN", ltp=100.0, ts=None, exch="NSE", fy="NSE:SBIN-EQ") 
 
 
 def _sdk_dict(symbol="NSE:SBIN-EQ", ltp=123.4, **extra):
-    d = {"symbol": symbol, "ltp": ltp, "type": "sf"}
+    """An Upstox v2 quote frame.
+
+    The price field is ``last_price``; the fyers-era ``ltp`` key is not emitted
+    by this transport, so a frame carrying only ``ltp`` is (correctly) dropped.
+    """
+    d = {"symbol": symbol, "last_price": ltp, "type": "sf"}
     d.update(extra)
     return d
 
 
-# --- 1. FYERS event -> EventBus ---------------------------------------------
-def test_fyers_event_to_eventbus():
+# --- 1. Upstox event -> EventBus ---------------------------------------------
+def test_upstox_event_to_eventbus():
     bus = EventBus()
     received = []
     bus.subscribe_all(received.append)
@@ -250,7 +257,7 @@ def test_malformed_ws_message_handling():
     assert fs._normalize("garbage") is None
     # Valid
     ev = fs._normalize(_sdk_dict("NSE:SBIN-EQ", 555.0, open_price=550, high_price=560,
-                                 low_price=540, vol_traded_today=1000))
+                                 low_price=540, volume=1000))
     assert ev is not None
     assert ev.open == 550 and ev.high == 560 and ev.low == 540 and ev.volume == 1000
 
@@ -280,11 +287,36 @@ def test_socket_disconnect_does_not_spin():
     health.on_connect()
     assert health.status == FeedStatus.HEALTHY
     # Simulate a disconnect (the SDK would handle the actual reconnect).
-    fs._on_sdk_close({"code": 1, "message": "closed"})
+    fs._handle_close(None, 1, "closed")
     assert health.status == FeedStatus.DISCONNECTED
-    # Simulate auth error
-    fs._on_sdk_error({"type": "AUTH_TYPE", "code": 803})
+    # Simulate auth error - Upstox v2 reports this on the auth response frame.
+    fs._handle_message_from_ws(None, json.dumps(
+        {"type": "auth", "status": "error", "message": "invalid token"}))
     assert health.status == FeedStatus.AUTH_ERROR
+
+
+def test_socket_auth_success_frame_is_not_an_auth_error():
+    """A successful auth response must not be mistaken for a failure."""
+    from trading_system.india.upstox import UpstoxDataSocket
+    from trading_system.india.data_health import DataHealthMonitor, FeedStatus
+
+    health = DataHealthMonitor()
+
+    class _FakeSocket(UpstoxDataSocket):
+        def __init__(self):
+            self._closed = False
+            self._on_connect_cb = None
+            self._on_disconnect_cb = None
+            self._on_auth_error_cb = None
+            self._on_invalid_cb = None
+            self.on_event = None
+
+    fs = _FakeSocket()
+    fs.on_auth_error_cb(health.on_auth_error)
+    health.on_connect()
+    fs._handle_message_from_ws(None, json.dumps(
+        {"type": "auth", "status": "success", "message": "welcome"}))
+    assert health.status == FeedStatus.HEALTHY
 
 
 # --- 11. no AI call per tick -------------------------------------------------
@@ -337,10 +369,10 @@ def test_normalize_index_symbol():
     assert ev.exchange == "NSE"
 
 
-# --- regression: observed FYERS control frames (real connect 2026-08-27) -----
-def test_observed_fyers_control_frames_skipped():
-    """Real FYERS v3 WS sends these exact control frames on connect; they must
-    not produce market events."""
+# --- regression: observed control frames on a real connect (2026-08-27) -----
+def test_observed_control_frames_skipped():
+    """The feed sends these control frames on connect; they must not produce
+    market events."""
     from trading_system.india.upstox import UpstoxDataSocket
     from trading_system.india.upstox import UpstoxMarketDataProvider
 
@@ -353,10 +385,44 @@ def test_observed_fyers_control_frames_skipped():
     fs = _FakeSocket()
     received = []
     fs.on_event = lambda e: received.append(e)
-    # Exactly the frames observed from a live FYERS session:
+    # Exactly the frames observed from a live session:
     fs._normalize({"type": "cn", "code": 200, "message": "Authentication done", "s": "ok"})
     fs._normalize({"type": "lit", "code": 200, "message": "Lite Mode On", "s": "ok"})
     assert received == []
+
+
+def test_observed_auth_control_frame_drives_auth_error():
+    """The connect-time "cn" frame reports auth status; a rejection must reach
+    the health monitor rather than being dropped as an ordinary control frame."""
+    from trading_system.india.upstox import UpstoxDataSocket
+    from trading_system.india.upstox import UpstoxMarketDataProvider
+    from trading_system.india.data_health import DataHealthMonitor, FeedStatus
+
+    class _FakeSocket(UpstoxDataSocket):
+        def __init__(self):
+            self._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+            self.provider = UpstoxMarketDataProvider()
+            self.on_event = None
+            self._closed = False
+            self._on_connect_cb = None
+            self._on_disconnect_cb = None
+            self._on_auth_error_cb = None
+            self._on_invalid_cb = None
+
+    fs = _FakeSocket()
+    health = DataHealthMonitor()
+    fs.on_auth_error_cb(health.on_auth_error)
+    health.on_connect()
+
+    # A successful auth frame must leave health untouched.
+    fs._handle_message_from_ws(None, json.dumps(
+        {"type": "cn", "code": 200, "message": "Authentication done", "s": "ok"}))
+    assert health.status == FeedStatus.HEALTHY
+
+    # A rejected one must surface as an auth error.
+    fs._handle_message_from_ws(None, json.dumps(
+        {"type": "cn", "code": 803, "message": "Invalid Api Key", "s": "error"}))
+    assert health.status == FeedStatus.AUTH_ERROR
 
 
 # --- historical seed into closed-candle pipeline ----------------------------

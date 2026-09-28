@@ -24,6 +24,7 @@ from trading_system.india import (
 from trading_system.india.upstox import UpstoxMarketDataProvider, UpstoxDataSocket
 from trading_system.data.provider_exports import get_provider
 from trading_system.data.validation import validate_ohlcv
+from tests.fixtures.india_fixtures import upstox_history_response
 from zoneinfo import ZoneInfo
 
 KOL = ZoneInfo("Asia/Kolkata")
@@ -150,20 +151,24 @@ def test_candle_aggregator_tz_naive_rejected():
 
 # --- FYERS response normalization (mocked, no network) ---
 def _fy_hist_response():
+    """Two Upstox historical candles in the documented payload shape."""
     epoch = int(datetime(2024, 1, 1, tzinfo=UTC).timestamp())
-    return {
-        "s": "ok",
-        "candles": [
-            [epoch, 100.0, 102.0, 99.0, 101.0, 1000.0],
-            [epoch + 86400, 101.0, 103.0, 100.0, 102.0, 1100.0],
+    return upstox_history_response(
+        symbol="NSE:SBIN",
+        bars=[
+            [epoch, 100.0, 102.0, 99.0, 101.0, 1000.0, 5000.0],
+            [epoch + 86400, 101.0, 103.0, 100.0, 102.0, 1100.0, 5100.0],
         ],
-    }
+    )
 
 
-def test_fyers_historical_normalization_shape(monkeypatch):
+def test_upstox_historical_normalization_shape(monkeypatch):
     prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
+    # The V3 resolver performs a network lookup to turn an internal symbol into
+    # an instrument key; stub it so this test stays offline and hermetic.
+    monkeypatch.setattr(prov, "_upstox_symbol", lambda s: "NSE_EQ|INE062A01020")
     # Patch the REST helper to return a fixture.
-    monkeypatch.setattr(prov, "_get", lambda path, params: _fy_hist_response())
+    monkeypatch.setattr(prov, "_get", lambda path, params=None: _fy_hist_response())
     df = prov.get_historical("NSE:SBIN", "1d", 2)
     assert len(df) == 2
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
@@ -173,11 +178,20 @@ def test_fyers_historical_normalization_shape(monkeypatch):
     assert report.ok
 
 
-def test_fyers_requires_auth_for_live(monkeypatch):
-    monkeypatch.delenv("UPSTOX_CLIENT_ID", raising=False)
-    monkeypatch.delenv("UPSTOX_ACCESS_TOKEN", raising=False)
+def test_upstox_requires_auth_for_live(monkeypatch):
+    # All three token sources must be cleared. UPSTOX_SERVICE_ACCOUNT_TOKEN is
+    # read as a fallback by the provider and is re-populated by the dotenv load
+    # that runs at import time, so deleting only the first two left a live
+    # token behind and is_authenticated stayed True.
+    for var in (
+        "UPSTOX_CLIENT_ID",
+        "UPSTOX_ACCESS_TOKEN",
+        "UPSTOX_SERVICE_ACCOUNT_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
 
     prov = UpstoxMarketDataProvider()
+    assert prov.access_token == ""
     assert not prov.is_authenticated
 
     with pytest.raises(RuntimeError):
@@ -192,16 +206,18 @@ def test_upstox_symbol_resolution_without_creds():
     assert to_upstox_symbol(Instrument(InternalSymbol("NSE", "NIFTY50"), InstrumentType.INDEX)) == "NSE_INDEX|NIFTY50"
 
 
-def test_fyers_ws_message_normalization(monkeypatch):
+def test_upstox_ws_message_normalization(monkeypatch):
     prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
     # Build a socket-like object (bypass the real-SDK __init__).
     sock = object.__new__(UpstoxDataSocket)
     sock._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
     sock.provider = prov
     sock.on_event = None
-    # Real SDK-decoded market dict (binary protobuf -> plain dict).
-    msg = {"symbol": "NSE:SBIN-EQ", "ltp": 555.5, "open_price": 550.0,
-           "high_price": 560.0, "low_price": 548.0, "vol_traded_today": 123.0, "type": "sf"}
+    # Upstox v2 quote frames use "last_price"; the fyers-era "ltp" key is not
+    # what this transport actually emits, so a message without last_price is
+    # correctly dropped rather than normalized.
+    msg = {"symbol": "NSE:SBIN-EQ", "last_price": 555.5, "open_price": 550.0,
+           "high_price": 560.0, "low_price": 548.0, "volume": 123.0, "type": "sf"}
     ev = sock._normalize(msg)
     assert isinstance(ev, InternalMarketEvent)
     assert ev.symbol == "NSE:SBIN"
@@ -209,7 +225,17 @@ def test_fyers_ws_message_normalization(monkeypatch):
     assert ev.event_type == EventType.QUOTE
 
 
-def test_fyers_ws_control_frame_skipped():
+def test_upstox_ws_message_missing_price_dropped(monkeypatch):
+    """A frame with no price field must not fabricate a quote event."""
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
+    sock = object.__new__(UpstoxDataSocket)
+    sock._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+    sock.provider = prov
+    sock.on_event = None
+    assert sock._normalize({"symbol": "NSE:SBIN-EQ", "type": "sf"}) is None
+
+
+def test_upstox_ws_control_frame_skipped():
     prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
     sock = object.__new__(UpstoxDataSocket)
     sock._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
