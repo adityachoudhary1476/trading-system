@@ -24,20 +24,20 @@ from trading_system.india import (
     plan_chunks,
     combine_frames,
     ChunkedHistoricalFetcher,
-    FYERSMarketDataProvider,
+    UpstoxMarketDataProvider,
 )
-from trading_system.india.fyers import FyersDataSocket
+from trading_system.india.upstox import UpstoxDataSocket
 from trading_system.india.events import InternalMarketEvent
 from trading_system.paper_trading.interface import NoOpPaperTrader, PaperTrader
 from trading_system.data.validation import validate_ohlcv
 from tests.fixtures.india_fixtures import (
-    fyers_history_response,
-    fyers_ws_symbol_update,
-    fyers_ws_malformed,
-    fyers_ws_heartbeat,
-    fyers_ws_auth_ack,
-    fyers_ws_unknown_type,
-    fyers_ws_lite,
+    upstox_history_response,
+    upstox_ws_symbol_update,
+    upstox_ws_malformed,
+    upstox_ws_heartbeat,
+    upstox_ws_auth_ack,
+    upstox_ws_unknown_type,
+    upstox_ws_lite,
     instrument_master_csv,
 )
 from zoneinfo import ZoneInfo
@@ -312,16 +312,16 @@ def test_health_monitor_lifecycle():
 # WebSocket reconnection (deterministic, no real socket)
 # --------------------------------------------------------------------------- #
 def _make_socket():
-    """Build a FyersDataSocket whose real-SDK constructor is bypassed.
+    """Build a UpstoxDataSocket whose real-SDK constructor is bypassed.
 
     The production socket wraps the official fyers_apiv3 SDK (binary protobuf).
     For deterministic tests we stub only the normalization + lifecycle hooks —
     we do NOT open a network connection and we do NOT re-implement reconnect (the
     SDK owns reconnect with bounded backoff).
     """
-    prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
-    sock = object.__new__(FyersDataSocket)
-    sock._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
+    sock = object.__new__(UpstoxDataSocket)
+    sock._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
     sock.provider = prov
     sock.on_event = lambda e: None
     sock._closed = False
@@ -336,7 +336,7 @@ def test_ws_normalizes_symbol_update():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    sock._on_sdk_message(fyers_ws_symbol_update())
+    sock._normalize(upstox_ws_symbol_update())
     assert len(received) == 1
     assert received[0].symbol == "NSE:SBIN"
     assert received[0].ltp == 123.45
@@ -348,9 +348,9 @@ def test_ws_drops_malformed_json():
     sock.on_event = lambda e: received.append(e)
     # non-dict / control frames are skipped, never crash
     assert sock._normalize("not-a-dict") is None
-    sock._on_sdk_message(fyers_ws_malformed())  # dict without 'symbol'
-    sock._on_sdk_message(fyers_ws_heartbeat())  # control frame
-    sock._on_sdk_message(fyers_ws_auth_ack())   # control frame
+    sock._normalize(upstox_ws_malformed())  # dict without 'symbol'
+    sock._normalize(upstox_ws_heartbeat())  # control frame
+    sock._normalize(upstox_ws_auth_ack())   # control frame
     assert received == []
 
 
@@ -358,7 +358,7 @@ def test_ws_unknown_type_skipped():
     sock = _make_socket()
     received = []
     sock.on_event = lambda e: received.append(e)
-    sock._on_sdk_message(fyers_ws_unknown_type())
+    sock._normalize(upstox_ws_unknown_type())
     assert received == []
 
 

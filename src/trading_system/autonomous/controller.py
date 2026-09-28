@@ -1000,7 +1000,11 @@ class AutonomousController(BaseModel):
         directly — no new market-data fetches are performed.  All market-condition
         features come from the Phase 2 snapshot embedded in the ranking.
         """
-        compat_config = config or CompatibilityConfig(enabled=self.config.enabled)
+        allowed_timeframes = self.config.user_constraints.allowed_timeframes
+        compat_config = config or CompatibilityConfig(
+            enabled=self.config.enabled,
+            timeframes=tuple(allowed_timeframes) if allowed_timeframes else ("5m", "15m", "1h", "1d"),
+        )
         evaluator = StrategyCompatibilityEvaluator(compat_config)
         allowed = self.config.user_constraints.allowed_strategy_ids
         return evaluator.evaluate(ranking_result, allowed_strategies=allowed)

@@ -21,7 +21,7 @@ from trading_system.india import (
     InternalMarketEvent,
     EventType,
 )
-from trading_system.india.fyers import FYERSMarketDataProvider, FyersDataSocket
+from trading_system.india.upstox import UpstoxMarketDataProvider, UpstoxDataSocket
 from trading_system.data.provider_exports import get_provider
 from trading_system.data.validation import validate_ohlcv
 from zoneinfo import ZoneInfo
@@ -161,7 +161,7 @@ def _fy_hist_response():
 
 
 def test_fyers_historical_normalization_shape(monkeypatch):
-    prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
     # Patch the REST helper to return a fixture.
     monkeypatch.setattr(prov, "_get", lambda path, params: _fy_hist_response())
     df = prov.get_historical("NSE:SBIN", "1d", 2)
@@ -174,28 +174,29 @@ def test_fyers_historical_normalization_shape(monkeypatch):
 
 
 def test_fyers_requires_auth_for_live(monkeypatch):
-    monkeypatch.delenv("FYERS_CLIENT_ID", raising=False)
-    monkeypatch.delenv("FYERS_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("UPSTOX_CLIENT_ID", raising=False)
+    monkeypatch.delenv("UPSTOX_ACCESS_TOKEN", raising=False)
 
-    prov = FYERSMarketDataProvider()
+    prov = UpstoxMarketDataProvider()
     assert not prov.is_authenticated
 
     with pytest.raises(RuntimeError):
         prov.connect_live(["NSE:SBIN"], on_event=lambda e: None)
 
 
-def test_fyers_symbol_resolution_without_creds():
+def test_upstox_symbol_resolution_without_creds():
     # Symbol mapping works even without credentials (no network).
-    prov = FYERSMarketDataProvider()
-    assert prov._fyers_symbol("NSE:SBIN") == "NSE:SBIN-EQ"
-    assert prov._fyers_symbol("NSE:NIFTY50") == "NSE:NIFTY50-INDEX"
+    from trading_system.india.symbol_map import to_upstox_symbol
+    from trading_system.india.instruments import Instrument, InstrumentType, InternalSymbol
+    assert to_upstox_symbol(Instrument(InternalSymbol("NSE", "SBIN"), InstrumentType.EQUITY)) == "NSE_EQ|SBIN"
+    assert to_upstox_symbol(Instrument(InternalSymbol("NSE", "NIFTY50"), InstrumentType.INDEX)) == "NSE_INDEX|NIFTY50"
 
 
 def test_fyers_ws_message_normalization(monkeypatch):
-    prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
     # Build a socket-like object (bypass the real-SDK __init__).
-    sock = object.__new__(FyersDataSocket)
-    sock._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+    sock = object.__new__(UpstoxDataSocket)
+    sock._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
     sock.provider = prov
     sock.on_event = None
     # Real SDK-decoded market dict (binary protobuf -> plain dict).
@@ -209,9 +210,9 @@ def test_fyers_ws_message_normalization(monkeypatch):
 
 
 def test_fyers_ws_control_frame_skipped():
-    prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
-    sock = object.__new__(FyersDataSocket)
-    sock._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
+    sock = object.__new__(UpstoxDataSocket)
+    sock._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
     sock.provider = prov
     sock.on_event = None
     # Control/response frames (no symbol / no price) must return None.
@@ -226,7 +227,7 @@ def test_fyers_is_a_marketdataprovider():
 
     prov = get_provider("fyers")
     assert isinstance(prov, MarketDataProvider)
-    assert prov.name == "fyers"
+    assert prov.name == "upstox"
 
 
 def test_binance_still_default_and_works():

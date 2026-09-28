@@ -63,7 +63,7 @@ def test_upstox_historical_normalization_shape(monkeypatch):
 def test_upstox_requires_auth_for_live(monkeypatch):
     monkeypatch.delenv("UPSTOX_CLIENT_ID", raising=False)
     monkeypatch.delenv("UPSTOX_ACCESS_TOKEN", raising=False)
-
+    monkeypatch.delenv("UPSTOX_SERVICE_ACCOUNT_TOKEN", raising=False)
     prov = UpstoxMarketDataProvider()
     assert not prov.is_authenticated
 

@@ -22,16 +22,16 @@ from trading_system.india.backfill import (
     _resolve_range,
     _chunk_plan,
 )
-from trading_system.india.fyers import (
-    FYERSMarketDataProvider,
-    FYERSAuthError,
-    FYERSAPIError,
-    FYERSNetworkError,
-    FYERSRateLimitError,
+from trading_system.india.upstox import (
+    UpstoxMarketDataProvider,
+    UpstoxAuthError,
+    UpstoxAPIError,
+    UpstoxNetworkError,
+    UpstoxRateLimitError,
 )
 from trading_system.storage.database import MarketStore
 from trading_system.india import InstrumentRegistry
-from tests.fixtures.india_fixtures import fyers_history_response
+from tests.fixtures.india_fixtures import upstox_history_response
 
 UTC = timezone.utc
 
@@ -44,13 +44,13 @@ def _ts(d):
 
 
 def _fake_provider(responses):
-    """Build a FYERSMarketDataProvider whose get_historical returns queued frames.
+    """Build a UpstoxMarketDataProvider whose get_historical returns queued frames.
 
     `responses` is a list of (frame_or_exception). For deterministic chunk tests we
     instead patch get_historical directly; this helper is used for auth/error tests
     where we drive _get at the requests level.
     """
-    prov = FYERSMarketDataProvider(client_id="X-100", access_token="tok")
+    prov = UpstoxMarketDataProvider(client_id="X-100", access_token="tok")
     return prov
 
 
@@ -125,7 +125,7 @@ def test_single_chunk_success(tmp_path, monkeypatch):
     start = _ts("2024-01-01")
     frame = _good_frame(start, 5)
 
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
 
     eng = BackfillEngine(prov, store)
@@ -153,7 +153,7 @@ def test_multi_chunk_success(tmp_path, monkeypatch):
     f2 = _good_frame(base + timedelta(days=2), 2)
     f3 = _good_frame(base + timedelta(days=4), 2)
 
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
 
     # get_historical receives (symbol, timeframe, start=, end=). We return the
     # slice of the full series overlapping the requested window.
@@ -187,7 +187,7 @@ def test_chunk_boundary_dedup(tmp_path, monkeypatch):
     f1 = _good_frame(base, 367)                       # days 0..366
     f2 = _good_frame(base + timedelta(days=366), 35)  # days 366..400 (overlap day 366)
 
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     calls = {"n": 0}
 
     def fake(symbol, tf, start=None, end=None, **k):
@@ -216,7 +216,7 @@ def test_backfill_output_sorted(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 5).iloc[::-1]  # deliver out of order
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     res = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=4))
@@ -230,7 +230,7 @@ def test_backfill_output_sorted(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_empty_response_is_empty_status(tmp_path, monkeypatch):
     store = _store(tmp_path)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(
         prov, "get_historical", lambda s, tf, **k: pd.DataFrame(
             columns=["open", "high", "low", "close", "volume"]
@@ -249,10 +249,10 @@ def test_empty_response_is_empty_status(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_auth_failure_classified(tmp_path, monkeypatch):
     store = _store(tmp_path)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
 
     def fake(symbol, tf, **k):
-        raise FYERSAuthError("FYERS authentication failed (code=-16): Could not authenticate the user")
+        raise UpstoxAuthError("FYERS authentication failed (code=-16): Could not authenticate the user")
 
     monkeypatch.setattr(prov, "get_historical", fake)
     eng = BackfillEngine(prov, store)
@@ -273,14 +273,14 @@ def test_one_chunk_fails_others_succeed(tmp_path, monkeypatch):
     base = _ts("2024-01-01")
     good = _good_frame(base, 2)
 
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     calls = {"n": 0}
 
     def fake(symbol, tf, start=None, end=None, **k):
         calls["n"] += 1
         # Fail the SECOND distinct chunk only, then succeed thereafter.
         if calls["n"] == 2:
-            raise FYERSNetworkError("chunk fetch failed after retries: timeout")
+            raise UpstoxNetworkError("chunk fetch failed after retries: timeout")
         return good
 
     monkeypatch.setattr(prov, "get_historical", fake)
@@ -306,7 +306,7 @@ def test_validation_rejects_bad_rows(tmp_path, monkeypatch):
     frame.iloc[2, frame.columns.get_loc("high")] = 1.0
     frame.iloc[2, frame.columns.get_loc("low")] = 999.0
 
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     res = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=4))
@@ -324,7 +324,7 @@ def test_all_rows_invalid_is_validation_error(tmp_path, monkeypatch):
     for i in range(3):
         frame.iloc[i, frame.columns.get_loc("high")] = 1.0
         frame.iloc[i, frame.columns.get_loc("low")] = 999.0
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     res = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=2))
@@ -339,7 +339,7 @@ def test_idempotent_second_backfill(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 5)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     r1 = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=4))
@@ -355,7 +355,7 @@ def test_idempotent_recovers_missing_rows(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 5)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     # First run stores only first 3 by pre-seeding... simulate by deleting 2 rows.
@@ -384,7 +384,7 @@ def test_multiple_symbols_independent(tmp_path, monkeypatch):
     base = _ts("2024-01-01")
     frame = _good_frame(base, 3)
 
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     r_sbin = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=2))
@@ -394,7 +394,7 @@ def test_multiple_symbols_independent(tmp_path, monkeypatch):
     assert store.count("NSE:RELIANCE", "1d") == 3
     # Provider/exchange metadata preserved.
     df = store.load("NSE:SBIN", "1d")
-    assert df.iloc[0]["provider"] == "fyers"
+    assert df.iloc[0]["provider"] == "upstox"
 
 
 # --------------------------------------------------------------------------- #
@@ -402,7 +402,7 @@ def test_multiple_symbols_independent(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_dry_run_plans_no_api_no_db(tmp_path, monkeypatch):
     store = _store(tmp_path)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     called = {"n": 0}
     monkeypatch.setattr(prov, "get_historical",
                         lambda s, tf, **k: called.__setitem__("n", called["n"] + 1))
@@ -429,7 +429,7 @@ def test_days_argument(tmp_path, monkeypatch):
 
     base = fixed_now - timedelta(days=10)
     frame = _good_frame(base, 11)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     captured = {}
 
     def fake(symbol, tf, start=None, end=None, **k):
@@ -450,7 +450,7 @@ def test_explicit_range_argument(tmp_path, monkeypatch):
     s = _ts("2021-01-01")
     e = _ts("2021-02-01")
     frame = _good_frame(s, 5)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     captured = {"calls": []}
 
     def fake(symbol, tf, start=None, end=None, **k):
@@ -477,7 +477,7 @@ def test_symbol_normalization_maps_to_fyers(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 2)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     res = eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=1))
@@ -494,10 +494,10 @@ def test_symbol_normalization_maps_to_fyers(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------- #
 def test_credentials_not_in_error_output(tmp_path, monkeypatch, capsys):
     store = _store(tmp_path)
-    prov = FYERSMarketDataProvider(client_id="SECRET_CLIENT_ID", access_token="SECRET_TOKEN")
+    prov = UpstoxMarketDataProvider(client_id="SECRET_CLIENT_ID", access_token="SECRET_TOKEN")
 
     def fake(symbol, tf, **k):
-        raise FYERSAuthError("auth failed code=-16")
+        raise UpstoxAuthError("auth failed code=-16")
 
     monkeypatch.setattr(prov, "get_historical", fake)
     eng = BackfillEngine(prov, store)
@@ -511,10 +511,10 @@ def test_credentials_not_in_error_output(tmp_path, monkeypatch, capsys):
 
 def test_credentials_not_in_network_error(tmp_path, monkeypatch, capsys):
     store = _store(tmp_path)
-    prov = FYERSMarketDataProvider(client_id="SECRET_CLIENT_ID", access_token="SECRET_TOKEN")
+    prov = UpstoxMarketDataProvider(client_id="SECRET_CLIENT_ID", access_token="SECRET_TOKEN")
 
     def fake(symbol, tf, **k):
-        raise FYERSNetworkError("connection reset by peer: <Auth header redacted>")
+        raise UpstoxNetworkError("connection reset by peer: <Auth header redacted>")
 
     monkeypatch.setattr(prov, "get_historical", fake)
     eng = BackfillEngine(prov, store)
@@ -530,7 +530,7 @@ def test_metadata_persisted(tmp_path, monkeypatch):
     store = _store(tmp_path)
     base = _ts("2024-01-01")
     frame = _good_frame(base, 3)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     eng = BackfillEngine(prov, store)
     eng.backfill_symbol("NSE:SBIN", "1d", start=base, end=base + timedelta(days=2))
@@ -538,7 +538,7 @@ def test_metadata_persisted(tmp_path, monkeypatch):
         from trading_system.storage.database import OHLCVRecord
         from sqlalchemy import select
         row = s.execute(select(OHLCVRecord)).scalars().first()
-        assert row.provider == "fyers"
+        assert row.provider == "upstox"
         assert row.exchange == "NSE"
         assert row.symbol == "NSE:SBIN"
         assert row.timeframe == "1d"
@@ -558,7 +558,7 @@ def test_cli_backfill_end_to_end(tmp_path, monkeypatch, capsys):
 
     base = _ts("2024-01-01")
     frame = _good_frame(base, 5)
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(prov, "get_historical", lambda s, tf, **k: frame)
     monkeypatch.setattr(
         "trading_system.data.provider_exports.get_provider", lambda name, **kw: prov
@@ -587,7 +587,7 @@ def test_cli_dry_run(tmp_path, monkeypatch, capsys):
     import trading_system.__main__ as m
     from trading_system.storage.database import MarketStore
 
-    prov = FYERSMarketDataProvider(client_id="X", access_token="Y")
+    prov = UpstoxMarketDataProvider(client_id="X", access_token="Y")
     monkeypatch.setattr(
         "trading_system.data.provider_exports.get_provider", lambda name, **kw: prov
     )

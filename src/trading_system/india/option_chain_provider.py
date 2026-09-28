@@ -234,9 +234,14 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
         if not expiry_iso:
             expiry_iso = self._nearest_expiry(raw_symbol)
         if not expiry_iso or not _ISO_DATE_RE.match(expiry_iso):
-            # No usable expiry — fail closed (never invent dates).
-            raise _ExpiryError(f"no listed expiry available for {symbol!r}")
-        params = {"instrument_key": inst_key, "expiry_date": expiry_iso}
+            if expiry:
+                # An invalid expiry was explicitly provided — fail closed.
+                raise _ExpiryError(f"no listed expiry available for {symbol!r}")
+            # No expiry requested — fall back to expiry-less request
+            # Upstox v2 returns the nearest expiry chain when expiry_date is omitted.
+            params = {"instrument_key": inst_key}
+        else:
+            params = {"instrument_key": inst_key, "expiry_date": expiry_iso}
         resp = self._discovery._provider._get(
             "/option/chain",
             params=params,

@@ -1558,7 +1558,7 @@ class AutonomousPortfolio:
         # When the live broker has no positions (API process reads its own empty
         # in-memory broker — fills happen in the scheduler process), fall back
         # to the last snapshot published by the scheduler worker.
-        if account is None or not account.positions:
+        if account is None or not self.open_positions():
             if persisted:
                 payload = dict(persisted)
                 payload["data_source"] = "persisted"

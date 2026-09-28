@@ -763,7 +763,7 @@ def _build_controller(
         trading_mode=TradingMode.PAPER,  # ENFORCED by the Pydantic validator
         enabled=True,
         user_constraints=UserConstraints(
-            allowed_symbols=frozenset({"NSE:NIFTY"}),
+            allowed_symbols=_env_allowed_symbols(),
             allowed_strategy_ids=frozenset(),
             allowed_timeframes=frozenset({"1d"}),
             allowed_option_underlyings=option_underlyings,
@@ -784,38 +784,32 @@ def _build_controller(
             pass
     controller.set_chain_provider(None)
 
-    # --------------------------------------------------------------- #
-    # Phase 8 — Paper-trading options pipeline (synthetic chains only)
-    # --------------------------------------------------------------- #
-    # InMemoryOptionsChainProvider generates deterministic synthetic chains
-    # from a spot price — paper-trading only, no live market data required.
-    from trading_system.autonomous.options_contract import InMemoryOptionsChainProvider
+    # Only wire options providers when option underlyings are configured.
+    # Equity-only bots must have _option_discoverer, _quote_provider, and
+    # _chain_provider all None so Phase B wiring can attach real providers.
+    # NOTE: chain_provider is intentionally left None here — Phase B wiring
+    # (attach_to_controller) attaches the real provider, and InMemoryOptionsChainProvider
+    # is rejected by resolve_options_plan as synthetic.
+    if option_underlyings:
+        # Option discoverer with instrument repository
+        from trading_system.india.instrument_repository import InstrumentRepository
+        from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
 
-    chain_provider = InMemoryOptionsChainProvider(
-        default_volatility=float(os.environ.get("AUTONOMOUS_OPTION_VOLATILITY", "0.20")),
-        min_premium=float(os.environ.get("AUTONOMOUS_OPTION_MIN_PREMIUM", "0.01")),
-    )
-    controller.set_chain_provider(chain_provider)
+        repo = InstrumentRepository()
+        discoverer = CurrentOptionDiscoverer(repository=repo)
+        controller.set_option_discoverer(discoverer, repository=repo)
 
-    # Option discoverer with live instrument repository
-    from trading_system.india.instrument_repository import InstrumentRepository
-    from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
+        # Option quote provider backed by Upstox (read-only, paper mode)
+        from trading_system.india.upstox import UpstoxMarketDataProvider
+        from trading_system.india.option_quotes import CurrentOptionQuoteProvider
 
-    repo = InstrumentRepository()
-    discoverer = CurrentOptionDiscoverer(repository=repo)
-    controller.set_option_discoverer(discoverer, repository=repo)
-
-    # Option quote provider backed by Upstox (read-only, paper mode)
-    from trading_system.india.upstox import UpstoxMarketDataProvider
-    from trading_system.india.option_quotes import CurrentOptionQuoteProvider
-
-    access_token = os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN", "").strip() or None
-    upstox = UpstoxMarketDataProvider(access_token=access_token)
-    quote_provider = CurrentOptionQuoteProvider(
-        provider=upstox,
-        max_quote_age_seconds=float(os.environ.get("AUTONOMOUS_MAX_OPTION_QUOTE_AGE_SECONDS", "300")),
-    )
-    controller.set_quote_provider(quote_provider)
+        access_token = os.environ.get("UPSTOX_SERVICE_ACCOUNT_TOKEN", "").strip() or None
+        upstox = UpstoxMarketDataProvider(access_token=access_token)
+        quote_provider = CurrentOptionQuoteProvider(
+            provider=upstox,
+            max_quote_age_seconds=float(os.environ.get("AUTONOMOUS_MAX_OPTION_QUOTE_AGE_SECONDS", "300")),
+        )
+        controller.set_quote_provider(quote_provider)
 
     # Phase 22 adaptive multi-strategy configuration.
     controller._phase22_enabled = phase22_enabled  # type: ignore[attr-defined]
@@ -836,10 +830,13 @@ def _env_option_underlyings() -> frozenset:
 
 
 def _env_allowed_symbols() -> frozenset:
-    """Parse ``AUTONOMOUS_ALLOWED_SYMBOLS`` into a frozenset of allowed NSE symbols."""
-    raw = os.environ.get("AUTONOMOUS_ALLOWED_SYMBOLS", "NSE:NIFTY,NSE:NIFTY50").strip()
+    """Parse ``AUTONOMOUS_ALLOWED_SYMBOLS`` into a frozenset of allowed NSE symbols.
+    NIFTY is an option underlying, not an equity symbol — kept in
+    ``allowed_option_underlyings`` instead.
+    """
+    raw = os.environ.get("AUTONOMOUS_ALLOWED_SYMBOLS", "NSE:NIFTY50").strip()
     if not raw:
-        return frozenset({"NSE:NIFTY", "NSE:NIFTY50"})
+        return frozenset({"NSE:NIFTY50"})
     return frozenset(part.strip().upper() for part in raw.split(",") if part.strip())
 
 
@@ -916,7 +913,7 @@ def _build_options_wiring(
     """Build a Phase B wiring with real providers backed by a repository."""
     from backend.options_phase_b import OptionsPhaseBWiring
     from trading_system.autonomous.options.discovery import CurrentOptionDiscoverer
-    from trading_system.autonomous.options_selector import CurrentOptionQuoteProvider
+    from trading_system.india.option_quotes import CurrentOptionQuoteProvider
     from trading_system.india.upstox import UpstoxMarketDataProvider
 
     repo = repository or InstrumentRepository()
@@ -936,7 +933,7 @@ def _build_options_wiring(
         repository=repo,
         discoverer=discoverer,
         quote_provider=quote_provider,
-        discovery=None,
+        chain_provider=None,
     )
 
 
@@ -2226,7 +2223,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         and d.selected_configuration is not None
     ]
     if not eligible:
-        # Update heartbeat: no eligible decisions
+        # Update heartbeat: no eligible decisions from main pipeline
         center = controller.control_center
         for d in center.list_deployments():
             if d.notes and d.notes.startswith(f"bot:{bot_id}") and d.status == PaperDeploymentStatus.ACTIVE:
@@ -2236,10 +2233,6 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
                     last_market_data_at=started_at.isoformat(),
                     last_decision_at=started_at.isoformat(),
                 )
-        return {
-            **base, "result": "skip", "reason": "no_eligible_decisions",
-            "decision_count": len(decisions.decisions),
-        }
     # --- 6. Per-decision execution with isolation ---
     submissions = []
     seen: set[tuple[str, str, str, str]] = set()
@@ -2423,6 +2416,7 @@ def run() -> int:
         logger.exception("portfolio state schema creation failed")
     controller = _build_controller(
         center, md_provider, market_data_callable, bot_id,
+        option_underlyings=_env_option_underlyings(),
         persistence=persistence,
         phase22_enabled=phase22_enabled,
         phase22_options_enabled=phase22_options,

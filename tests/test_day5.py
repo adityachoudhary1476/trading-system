@@ -1,7 +1,7 @@
 """Day 5 tests: real FYERS pipeline integration (all OFFLINE + deterministic).
 
 No network / FYERS credentials / live market / current prices / current time.
-The live socket is faked at the boundary: we drive FyersDataSocket._normalize and
+The live socket is faked at the boundary: we drive UpstoxDataSocket._normalize and
 LiveMarketPipeline.ingest directly with synthetic SDK-shaped dicts, and a fake
 provider + fake socket for bootstrap/historical + health wiring.
 """
@@ -18,7 +18,7 @@ from trading_system.india.event_bus import EventBus
 from trading_system.india.closed_candle_pipeline import ClosedCandlePipeline
 from trading_system.india.data_health import DataHealthMonitor, FeedStatus
 from trading_system.india.live_pipeline import LiveMarketPipeline, bootstrap_historical
-from trading_system.india.fyers import FYERSMarketDataProvider
+from trading_system.india.upstox import UpstoxMarketDataProvider
 
 
 # --- helpers ----------------------------------------------------------------
@@ -43,15 +43,15 @@ def test_fyers_event_to_eventbus():
     bus = EventBus()
     received = []
     bus.subscribe_all(received.append)
-    prov = FYERSMarketDataProvider()
+    prov = UpstoxMarketDataProvider()
     sock = object()  # we only need the normalizer
     # Use the provider's normalization helper through a minimal socket-like object.
-    from trading_system.india.fyers import FyersDataSocket
+    from trading_system.india.upstox import UpstoxDataSocket
 
-    class _FakeSocket(FyersDataSocket):
+    class _FakeSocket(UpstoxDataSocket):
         def __init__(self):
-            # bypass FyersDataSocket.__init__ (which builds the real SDK object)
-            self._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+            # bypass UpstoxDataSocket.__init__ (which builds the real SDK object)
+            self._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
             self.provider = prov
             self.on_event = None
 
@@ -189,7 +189,7 @@ def test_historical_bootstrap_persistence(tmp_path):
     class FakeProv:
         name = "fake"
 
-        def _fyers_symbol(self, s):
+        def _upstox_symbol(self, s):
             return s
 
         def get_historical(self, sym, tf, limit=None, end=None):
@@ -214,7 +214,7 @@ def test_historical_bootstrap_idempotent(tmp_path):
     class FakeProv:
         name = "fake"
 
-        def _fyers_symbol(self, s):
+        def _upstox_symbol(self, s):
             return s
 
         def get_historical(self, sym, tf, limit=None, end=None):
@@ -232,13 +232,13 @@ def test_historical_bootstrap_idempotent(tmp_path):
 
 # --- 9. malformed WS message handling ---------------------------------------
 def test_malformed_ws_message_handling():
-    from trading_system.india.fyers import FyersDataSocket
-    from trading_system.india.fyers import FYERSMarketDataProvider
+    from trading_system.india.upstox import UpstoxDataSocket
+    from trading_system.india.upstox import UpstoxMarketDataProvider
 
-    class _FakeSocket(FyersDataSocket):
+    class _FakeSocket(UpstoxDataSocket):
         def __init__(self):
-            self._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
-            self.provider = FYERSMarketDataProvider()
+            self._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+            self.provider = UpstoxMarketDataProvider()
             self.on_event = None
 
     fs = _FakeSocket()
@@ -259,13 +259,13 @@ def test_malformed_ws_message_handling():
 def test_socket_disconnect_does_not_spin():
     # Drive the socket's lifecycle callbacks; reconnect is owned by the SDK, so
     # our code must simply update health and not raise / not loop.
-    from trading_system.india.fyers import FyersDataSocket
-    from trading_system.india.fyers import FYERSMarketDataProvider
+    from trading_system.india.upstox import UpstoxDataSocket
+    from trading_system.india.upstox import UpstoxMarketDataProvider
     import time
 
     health = DataHealthMonitor()
 
-    class _FakeSocket(FyersDataSocket):
+    class _FakeSocket(UpstoxDataSocket):
         def __init__(self):
             self._closed = False
             self._on_connect_cb = None
@@ -321,13 +321,13 @@ def test_ai_invocation_follows_interval():
 
 # --- provider-independent: normalization works for index too ----------------
 def test_normalize_index_symbol():
-    from trading_system.india.fyers import FyersDataSocket
-    from trading_system.india.fyers import FYERSMarketDataProvider
+    from trading_system.india.upstox import UpstoxDataSocket
+    from trading_system.india.upstox import UpstoxMarketDataProvider
 
-    class _FakeSocket(FyersDataSocket):
+    class _FakeSocket(UpstoxDataSocket):
         def __init__(self):
-            self._fy_to_internal = {"NSE:NIFTY50-INDEX": "NSE:NIFTY50"}
-            self.provider = FYERSMarketDataProvider()
+            self._up_to_internal = {"NSE:NIFTY50-INDEX": "NSE:NIFTY50"}
+            self.provider = UpstoxMarketDataProvider()
             self.on_event = None
 
     fs = _FakeSocket()
@@ -341,21 +341,21 @@ def test_normalize_index_symbol():
 def test_observed_fyers_control_frames_skipped():
     """Real FYERS v3 WS sends these exact control frames on connect; they must
     not produce market events."""
-    from trading_system.india.fyers import FyersDataSocket
-    from trading_system.india.fyers import FYERSMarketDataProvider
+    from trading_system.india.upstox import UpstoxDataSocket
+    from trading_system.india.upstox import UpstoxMarketDataProvider
 
-    class _FakeSocket(FyersDataSocket):
+    class _FakeSocket(UpstoxDataSocket):
         def __init__(self):
-            self._fy_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
-            self.provider = FYERSMarketDataProvider()
+            self._up_to_internal = {"NSE:SBIN-EQ": "NSE:SBIN"}
+            self.provider = UpstoxMarketDataProvider()
             self.on_event = None
 
     fs = _FakeSocket()
     received = []
     fs.on_event = lambda e: received.append(e)
     # Exactly the frames observed from a live FYERS session:
-    fs._on_sdk_message({"type": "cn", "code": 200, "message": "Authentication done", "s": "ok"})
-    fs._on_sdk_message({"type": "lit", "code": 200, "message": "Lite Mode On", "s": "ok"})
+    fs._normalize({"type": "cn", "code": 200, "message": "Authentication done", "s": "ok"})
+    fs._normalize({"type": "lit", "code": 200, "message": "Lite Mode On", "s": "ok"})
     assert received == []
 
 
