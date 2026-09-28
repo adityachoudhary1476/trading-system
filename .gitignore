@@ -49,6 +49,7 @@ trading-system-audit/
 vibetrading-inspection/
 check_now.py
 check_snapshot*.py
+check_api*.py
 _test_broker.py
 
 # Embedded git submodules removed from index (not needed for deployment)
