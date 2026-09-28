@@ -92,6 +92,8 @@ class AutonomousDeploymentCoordinator:
         # Step 1: Check for duplicate deployments.
         # A duplicate is: same bot (via notes), same symbol, same strategy_id,
         # same timeframe, and the existing deployment is still ACTIVE.
+        from trading_system.autonomous.spec_register import same_strategy
+
         existing_deps = self.control_center.list_deployments(
             symbol=symbol,
             timeframe=timeframe,
@@ -103,7 +105,16 @@ class AutonomousDeploymentCoordinator:
                 existing_bot_id = dep.notes.split(":", 1)[1]
                 if existing_bot_id == self.config.bot_id:
                     # Same bot, same symbol, same timeframe — check strategy.
-                    if dep.strategy_id == strategy_id and dep.status == PaperDeploymentStatus.ACTIVE:
+                    # ``same_strategy`` compares across the factory-id and
+                    # research-registry namespaces: a decision passes the
+                    # factory id while the deployment row stores the registry
+                    # id, so ``==`` here would never match and every tick would
+                    # re-enter the creation path for a deployment that already
+                    # exists.
+                    if (
+                        same_strategy(dep.strategy_id, strategy_id)
+                        and dep.status == PaperDeploymentStatus.ACTIVE
+                    ):
                         return DeploymentCreationResult.DUPLICATE_DEPLOYMENT, None
                     # Same bot but different strategy/timeframe — that's a new deployment,
                     # which is fine. Continue below.
@@ -149,6 +160,27 @@ class AutonomousDeploymentCoordinator:
                 self.control_center.activate_deployment(deployment.deployment_id)
 
             # Step 5: Attach a runner + broker so the dashboard has immediate data.
+            #
+            # Reuse the live session's runner if one is already attached. The
+            # paper broker holds the only copy of the book (open positions and
+            # realised P&L), so building a fresh one over a live session
+            # silently resets the account to flat. This is reached whenever a
+            # deployment already exists, so the guard belongs here, where the
+            # state is actually at risk - not only in the duplicate check.
+            live_sid = self.control_center.find_session_for_deployment(
+                deployment.deployment_id
+            )
+            live_runner = (
+                self.control_center.get_runner(live_sid) if live_sid else None
+            )
+            if live_runner is not None:
+                # Already live: keep its broker and its book.
+                try:
+                    self.control_center.save_session(live_sid)
+                except Exception:
+                    pass
+                return DeploymentCreationResult.SUCCESS, deployment
+
             from trading_system.execution.paper_broker import PaperBroker, SlippageConfig
             from trading_system.paper.runner import PaperStrategyRunner
             from trading_system.paper import PaperCircuitBreaker

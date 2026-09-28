@@ -1496,12 +1496,18 @@ def _execute_one_decision(
     center = controller.control_center
 
     # --- Locate (or create) an ACTIVE autonomous deployment. ---
+    # The decision carries the factory strategy_id; the deployment row stores
+    # the research-registry id. Compare across both namespaces or this never
+    # finds the deployment the previous tick created, and the tick walks into
+    # the creation path again.
+    from trading_system.autonomous.spec_register import same_strategy
+
     existing = None
     for d in center.list_deployments(symbol=symbol, timeframe=timeframe):
         if (
             d.notes
             and d.notes.startswith(f"bot:{controller.config.bot_id}")
-            and d.strategy_id == strategy_id
+            and same_strategy(d.strategy_id, strategy_id)
             and d.status == PaperDeploymentStatus.ACTIVE
         ):
             existing = d
@@ -1532,7 +1538,7 @@ def _execute_one_decision(
                 if (
                     d.notes
                     and d.notes.startswith(f"bot:{controller.config.bot_id}")
-                    and d.strategy_id == strategy_id
+                    and same_strategy(d.strategy_id, strategy_id)
                     and d.status == PaperDeploymentStatus.ACTIVE
                 ):
                     existing = d

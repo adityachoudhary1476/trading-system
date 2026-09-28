@@ -1033,36 +1033,39 @@ class TestRealSchedulerTickExecutes:
             f"({after_first} -> {qty()}); idempotency did not hold"
         )
 
-    def test_portfolio_tick_liquidates_main_pipeline_positions(self, monkeypatch):
-        """Pins a real conflict between the two decision engines on one account.
+    def test_open_position_survives_the_next_tick(self, monkeypatch):
+        """A paper position must still be open on the following tick.
 
-        A tick runs the main pipeline (scan -> decision -> order) and then
-        ``_run_portfolio_tick``. The portfolio treats every position in the
-        shared paper account as its own, and closes any position whose owning
-        strategy produced no opportunity in *its* evaluation
-        (``portfolio.py``: ``if opportunity is None: return
-        "strategy_exit_signal"``). The portfolio only evaluates Phase 22
-        strategies, so a position opened by a Phase 2-5 DB spec is always
-        liquidated on the next tick.
+        This was the worst defect in the tick path, and it was invisible: the
+        account opened a position and was flat again one tick later, with no
+        order, no fill and no realised P&L to show for it.
 
-        Net effect on paper results: the account opens a position and flattens
-        it again every tick, which reads as a strategy that never holds. The
-        close is reported only inside the nested ``portfolio`` result, not in
-        the tick's ``submissions`` or ``risk_exits``.
+        Cause: a decision carries the *factory* strategy_id while the deployment
+        row stores the *research-registry* id, so both duplicate checks compared
+        two different namespaces and never matched. The scheduler therefore
+        believed it had no deployment, re-entered the creation path, got the
+        same deployment back (``create_deployment`` is idempotent on
+        dataset+config), and Step 5 attached a brand-new ``PaperBroker`` over
+        the live one. The broker owns the only copy of the book, so every open
+        position and all realised P&L were discarded each tick.
 
-        This is a design question - which engine owns the account - not a
-        mechanical bug, so it is pinned rather than fixed here. If the intent
-        is for the portfolio to own the account, the main pipeline should not
-        also open positions on it.
+        Asserted on the book, not on an order: a correct tick places no second
+        order (the signal is idempotent) and must still be holding.
         """
         from backend import autonomous_scheduler
 
-        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-portfolio")
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-hold")
 
         first = autonomous_scheduler._run_one_tick(controller)
-        assert any(
-            s.get("result") == "submitted" for s in first["submissions"]
-        ), first["submissions"]
+        submitted = [
+            s for s in first["submissions"] if s.get("result") == "submitted"
+        ]
+        assert submitted, first["submissions"]
+        entry_price = next(
+            r.broker.get_position("NSE:SBIN").avg_entry_price
+            for r in _all_runners(center)
+            if r.broker.get_position("NSE:SBIN") is not None
+        )
 
         def qty() -> float:
             return sum(
@@ -1070,23 +1073,71 @@ class TestRealSchedulerTickExecutes:
                 for r in _all_runners(center)
             )
 
-        assert qty() > 0, "first tick did not open anything"
+        after_first = qty()
+        assert after_first > 0, "first tick did not open anything"
 
         second = autonomous_scheduler._run_one_tick(controller)
-        portfolio = second.get("portfolio") or {}
-        assert portfolio, "the tick reported no portfolio phase result"
-
-        # Documented behaviour: the position does not survive the second tick.
-        assert qty() == 0, (
-            "expected the portfolio tick to liquidate the main pipeline's "
-            f"position; it held {qty()}. If this now passes differently the "
-            "two engines have stopped conflicting and this pin should be "
-            "updated deliberately, not deleted."
-        )
-        # And the close is invisible in the tick's own execution reporting.
+        assert second["result"] == "executed", second
         assert not any(
             s.get("result") == "submitted" for s in second["submissions"]
-        ), second["submissions"]
+        ), f"an unchanged signal placed a second order: {second['submissions']}"
+
+        assert qty() == after_first, (
+            "the open position did not survive the next tick "
+            f"({after_first} -> {qty()}); the paper book was reset without an "
+            "order or a fill, which is silent state loss"
+        )
+
+        # The same runner must still own the book: a fresh broker means the
+        # session was re-initialised rather than reused.
+        held = [
+            r
+            for r in _all_runners(center)
+            if r.broker.get_position("NSE:SBIN") is not None
+        ]
+        assert held, "no runner holds the position after the second tick"
+        assert held[0].broker.get_position("NSE:SBIN").avg_entry_price == entry_price, (
+            "the surviving position has a different entry price, so it came "
+            "from a rebuilt book rather than the original fill"
+        )
+
+    def test_tick_reuses_its_deployment_instead_of_recreating_it(self, monkeypatch):
+        """A second tick must reuse the deployment, not re-create its session.
+
+        Guards the identity mismatch that made the state loss above reachable.
+        Even if a fresh broker were somehow attached, the deployment itself
+        should be recognised as the bot's own, so the duplicate check fires.
+        """
+        from backend import autonomous_scheduler
+        from trading_system.autonomous.coordinator import (
+            AutonomousDeploymentCoordinator,
+        )
+
+        controller, center, _spec = self._build_ready(monkeypatch, "bot-tick-reuse")
+
+        calls = []
+        real = AutonomousDeploymentCoordinator.create_autonomous_deployment
+        monkeypatch.setattr(
+            AutonomousDeploymentCoordinator,
+            "create_autonomous_deployment",
+            lambda self, **kw: (
+                calls.append(kw.get("strategy_id")),
+                real(self, **kw),
+            )[1],
+        )
+
+        autonomous_scheduler._run_one_tick(controller)
+        first_calls = len(calls)
+        autonomous_scheduler._run_one_tick(controller)
+
+        assert first_calls == 1, (
+            f"the first tick should create the deployment once, made {first_calls}"
+        )
+        assert len(calls) == 1, (
+            "the second tick re-entered deployment creation for a deployment "
+            f"that already exists (strategy_id={calls!r}); it should have been "
+            "recognised as the bot's own"
+        )
 
     def test_heartbeat_records_a_successful_execution(self, monkeypatch):
         """A completed tick must stamp last_successful_tick_at.
