@@ -27,6 +27,7 @@ from .live_market_state import normalize_timestamp_ms, TimestampValidationError
 from .upstox_v3_pb import (
     FeedResponse,
     FeedType,
+    ProtobufDecodeError,
     RequestMode,
     SubscriptionRequest,
 )
@@ -286,29 +287,47 @@ class UpstoxV3WebSocket:
 
         V3 messages are protobuf-encoded binary data.
         """
+        if isinstance(message, str):
+            # Some messages are JSON (e.g., errors); they carry no feed.
+            try:
+                log.warning("Received JSON message: %s", json.loads(message))
+            except (json.JSONDecodeError, TypeError):
+                log.warning("Received undecodable text message")
+            return
+        if not isinstance(message, (bytes, bytearray)):
+            log.warning("Unknown message type: %s", type(message))
+            return
+
+        # A corrupt frame is a real fault, not a quiet gap: the decoder raises
+        # rather than yielding a default message, so it is reported instead of
+        # the feed quietly going stale with nothing to alert on.
         try:
-            # Decode protobuf
-            if isinstance(message, bytes):
-                feed_response = FeedResponse.deserialize(message)
-            elif isinstance(message, str):
-                # Some messages might be JSON (e.g., errors)
-                data = json.loads(message)
-                log.warning("Received JSON message: %s", data)
-                return
-            else:
-                log.warning("Unknown message type: %s", type(message))
-                return
-
-            # Process feeds
-            for instrument_key, feed in feed_response.feeds.items():
-                event = self._normalize(instrument_key, feed, feed_response.current_ts)
-                if event and self.on_event:
-                    self.on_event(event)
-
-        except Exception as e:
-            log.error("Failed to decode V3 message: %s", e)
+            feed_response = FeedResponse.deserialize(bytes(message))
+        except ProtobufDecodeError as e:
+            log.warning("Dropping corrupt V3 feed frame: %s", e)
             if self._on_invalid_cb:
                 self._on_invalid_cb(e)
+            return
+
+        for instrument_key, feed in feed_response.feeds.items():
+            try:
+                event = self._normalize(instrument_key, feed, feed_response.current_ts)
+            except Exception as e:
+                # One bad instrument must not cost us the rest of the frame.
+                log.error("Failed to normalize V3 feed for %s: %s", instrument_key, e)
+                if self._on_invalid_cb:
+                    self._on_invalid_cb(e)
+                continue
+            if event and self.on_event:
+                self.on_event(event)
+
+        # Entries the decoder could not parse are reported after the good ones
+        # have been delivered, so a single corrupt instrument costs visibility
+        # rather than the whole frame.
+        for err in feed_response.decode_errors:
+            log.warning("Skipped unparseable V3 instrument entry: %s", err)
+            if self._on_invalid_cb:
+                self._on_invalid_cb(err)
 
     @staticmethod
     def _exchange_of(instrument_key: str, internal_symbol: str) -> str:

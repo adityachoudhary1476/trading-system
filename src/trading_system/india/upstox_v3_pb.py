@@ -31,7 +31,24 @@ class RequestMode(IntEnum):
 
 # Protobuf wire types
 VARINT = 0
+FIXED64 = 1
 LEN_DELIMITED = 2
+FIXED32 = 5
+
+# A 64-bit varint is at most 10 bytes. Anything longer is corrupt, and without
+# this bound a run of continuation bytes shifts an int past any limit.
+_MAX_VARINT_BYTES = 10
+
+
+class ProtobufDecodeError(ValueError):
+    """Raised when a byte sequence is not a valid protobuf message.
+
+    The decoders used to be lenient: a truncated or corrupt frame decoded to a
+    default-constructed message, so a garbled feed frame was indistinguishable
+    from a legitimately empty one. That made corruption invisible - the feed
+    simply went quiet with nothing to alert on. Malformed input now raises, and
+    the socket reports it via its invalid-frame callback.
+    """
 
 
 def _encode_varint(value: int) -> bytes:
@@ -48,13 +65,22 @@ def _decode_varint(data: bytes, offset: int) -> tuple[int, int]:
     """Decode a protobuf varint. Returns (value, new_offset)."""
     result = 0
     shift = 0
+    start = offset
     while True:
+        if offset >= len(data):
+            raise ProtobufDecodeError(
+                f"truncated varint at offset {start}"
+            )
         byte = data[offset]
         offset += 1
         result |= (byte & 0x7F) << shift
         if not (byte & 0x80):
             break
         shift += 7
+        if offset - start >= _MAX_VARINT_BYTES:
+            raise ProtobufDecodeError(
+                f"varint at offset {start} exceeds {_MAX_VARINT_BYTES} bytes"
+            )
     return result, offset
 
 
@@ -76,7 +102,7 @@ def _encode_varint_field(field_number: int, value: int) -> bytes:
 
 def _encode_double(field_number: int, value: float) -> bytes:
     """Encode a double field (64-bit)."""
-    return _encode_tag(field_number, 1) + struct.pack("<d", value)
+    return _encode_tag(field_number, FIXED64) + struct.pack("<d", value)
 
 
 def _encode_int64(field_number: int, value: int) -> bytes:
@@ -84,22 +110,87 @@ def _encode_int64(field_number: int, value: int) -> bytes:
     return _encode_tag(field_number, VARINT) + _encode_varint(value)
 
 
+def _read_length_delimited(data: bytes, offset: int) -> tuple[bytes, int]:
+    """Read a length-delimited payload, rejecting a length that overruns."""
+    length, offset = _decode_varint(data, offset)
+    if offset + length > len(data):
+        raise ProtobufDecodeError(
+            f"length-delimited field at offset {offset} claims {length} bytes, "
+            f"{len(data) - offset} available"
+        )
+    return data[offset:offset + length], offset + length
+
+
 def _decode_string(data: bytes, offset: int) -> tuple[str, int]:
     """Decode a string field. Returns (value, new_offset)."""
-    length, offset = _decode_varint(data, offset)
-    value = data[offset:offset + length].decode("utf-8")
-    return value, offset + length
+    raw, offset = _read_length_delimited(data, offset)
+    try:
+        return raw.decode("utf-8"), offset
+    except UnicodeDecodeError as exc:
+        raise ProtobufDecodeError("invalid utf-8 in string field") from exc
+
+
+def _decode_bytes(data: bytes, offset: int) -> tuple[bytes, int]:
+    """Decode a length-delimited bytes field. Returns (value, new_offset)."""
+    return _read_length_delimited(data, offset)
 
 
 def _decode_double(data: bytes, offset: int) -> tuple[float, int]:
-    """Decode a double field. Returns (value, new_offset)."""
-    value = struct.unpack("<d", data[offset:offset + 8])[0]
-    return value, offset + 8
+    """Decode a double field (64-bit). Returns (value, new_offset)."""
+    if offset + 8 > len(data):
+        raise ProtobufDecodeError(f"truncated 64-bit field at offset {offset}")
+    return struct.unpack("<d", data[offset:offset + 8])[0], offset + 8
 
 
 def _decode_int64(data: bytes, offset: int) -> tuple[int, int]:
-    """Decode an int64 field. Returns (value, new_offset)."""
+    """Decode an int64 field as varint. Returns (value, new_offset)."""
     return _decode_varint(data, offset)
+
+
+def _skip_field(data: bytes, offset: int, wire_type: int, field_number: int) -> int:
+    """Advance past an unknown field.
+
+    Unknown fields are skipped rather than rejected: the wire format does not
+    forbid a server from sending fields this client predates, and failing here
+    would break the feed on any Upstox schema addition. Only genuinely
+    unparseable bytes raise.
+    """
+    if wire_type == VARINT:
+        _, offset = _decode_varint(data, offset)
+    elif wire_type == LEN_DELIMITED:
+        _, offset = _read_length_delimited(data, offset)
+    elif wire_type == FIXED64:
+        if offset + 8 > len(data):
+            raise ProtobufDecodeError(f"truncated unknown 64-bit field {field_number}")
+        offset += 8
+    elif wire_type == FIXED32:
+        if offset + 4 > len(data):
+            raise ProtobufDecodeError(f"truncated unknown 32-bit field {field_number}")
+        offset += 4
+    else:
+        # Wire types 3/4 (groups) and 6/7 are not valid in proto3.
+        raise ProtobufDecodeError(
+            f"field {field_number} has unsupported wire type {wire_type}"
+        )
+    return offset
+
+
+def _read_tag(data: bytes, offset: int) -> tuple[int, int, int]:
+    """Read a field tag. Returns (field_number, wire_type, new_offset)."""
+    tag, offset = _decode_varint(data, offset)
+    field_number = tag >> 3
+    if field_number == 0:
+        raise ProtobufDecodeError("field number 0 is not valid")
+    return field_number, tag & 0x07, offset
+
+
+def _decode_utf8(raw: bytes, what: str) -> str:
+    """Decode a length-delimited string payload."""
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtobufDecodeError(f"invalid utf-8 in {what}") from exc
+
 
 
 @dataclass
@@ -129,27 +220,34 @@ class LTPC:
         ltpc = cls()
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
-            field_number = tag >> 3
-            wire_type = tag & 0x07
+            field_number, wire_type, offset = _read_tag(data, offset)
 
             if field_number == 1:  # ltp
+                if wire_type != FIXED64:
+                    raise ProtobufDecodeError(
+                        f"LTPC.ltp has wire type {wire_type}, expected {FIXED64}"
+                    )
                 ltpc.ltp, offset = _decode_double(data, offset)
             elif field_number == 2:  # ltt
+                if wire_type != VARINT:
+                    raise ProtobufDecodeError(
+                        f"LTPC.ltt has wire type {wire_type}, expected {VARINT}"
+                    )
                 ltpc.ltt, offset = _decode_varint(data, offset)
             elif field_number == 3:  # ltq
+                if wire_type != VARINT:
+                    raise ProtobufDecodeError(
+                        f"LTPC.ltq has wire type {wire_type}, expected {VARINT}"
+                    )
                 ltpc.ltq, offset = _decode_varint(data, offset)
             elif field_number == 4:  # cp
+                if wire_type != FIXED64:
+                    raise ProtobufDecodeError(
+                        f"LTPC.cp has wire type {wire_type}, expected {FIXED64}"
+                    )
                 ltpc.cp, offset = _decode_double(data, offset)
             else:
-                # Skip unknown field
-                if wire_type == VARINT:
-                    _, offset = _decode_varint(data, offset)
-                elif wire_type == LEN_DELIMITED:
-                    length, offset = _decode_varint(data, offset)
-                    offset += length
-                else:
-                    break
+                offset = _skip_field(data, offset, wire_type, field_number)
         return ltpc
 
 
@@ -189,33 +287,43 @@ class OHLC:
         ohlc = cls()
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
-            field_number = tag >> 3
-            wire_type = tag & 0x07
+            field_number, wire_type, offset = _read_tag(data, offset)
 
             if field_number == 1:  # interval
+                if wire_type != LEN_DELIMITED:
+                    raise ProtobufDecodeError(
+                        f"OHLC.interval has wire type {wire_type}, expected "
+                        f"{LEN_DELIMITED}"
+                    )
                 ohlc.interval, offset = _decode_string(data, offset)
-            elif field_number == 2:  # open
-                ohlc.open, offset = _decode_double(data, offset)
-            elif field_number == 3:  # high
-                ohlc.high, offset = _decode_double(data, offset)
-            elif field_number == 4:  # low
-                ohlc.low, offset = _decode_double(data, offset)
-            elif field_number == 5:  # close
-                ohlc.close, offset = _decode_double(data, offset)
-            elif field_number == 6:  # vol
-                ohlc.vol, offset = _decode_varint(data, offset)
-            elif field_number == 7:  # ts
-                ohlc.ts, offset = _decode_varint(data, offset)
-            else:
-                # Skip unknown field
-                if wire_type == VARINT:
-                    _, offset = _decode_varint(data, offset)
-                elif wire_type == LEN_DELIMITED:
-                    length, offset = _decode_varint(data, offset)
-                    offset += length
+            elif field_number in (2, 3, 4, 5):  # open/high/low/close
+                if wire_type != FIXED64:
+                    raise ProtobufDecodeError(
+                        f"OHLC field {field_number} has wire type {wire_type}, "
+                        f"expected {FIXED64}"
+                    )
+                value, offset = _decode_double(data, offset)
+                if field_number == 2:
+                    ohlc.open = value
+                elif field_number == 3:
+                    ohlc.high = value
+                elif field_number == 4:
+                    ohlc.low = value
                 else:
-                    break
+                    ohlc.close = value
+            elif field_number in (6, 7):  # vol, ts
+                if wire_type != VARINT:
+                    raise ProtobufDecodeError(
+                        f"OHLC field {field_number} has wire type {wire_type}, "
+                        f"expected {VARINT}"
+                    )
+                value, offset = _decode_varint(data, offset)
+                if field_number == 6:
+                    ohlc.vol = value
+                else:
+                    ohlc.ts = value
+            else:
+                offset = _skip_field(data, offset, wire_type, field_number)
         return ohlc
 
 
@@ -262,26 +370,22 @@ class MarketFullFeed:
         feed = cls()
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
-            field_number = tag >> 3
-            wire_type = tag & 0x07
+            field_number, wire_type, offset = _read_tag(data, offset)
 
             if wire_type == LEN_DELIMITED:
-                length, offset = _decode_varint(data, offset)
-                field_data = data[offset:offset + length]
-                offset += length
+                field_data, offset = _read_length_delimited(data, offset)
 
                 if field_number == 1:  # ltpc
                     feed.ltpc = LTPC.deserialize(field_data)
                 elif field_number == 4:  # market_ohlc
                     feed.market_ohlc.append(OHLC.deserialize(field_data))
-                # Skip other fields for now
+                # Other length-delimited fields are skipped by the read above.
             elif wire_type == VARINT:
                 if field_number == 6:  # vtt
                     feed.vtt, offset = _decode_varint(data, offset)
                 else:
                     _, offset = _decode_varint(data, offset)
-            elif wire_type == 1:  # 64-bit
+            elif wire_type == FIXED64:
                 if field_number == 5:  # atp
                     feed.atp, offset = _decode_double(data, offset)
                 elif field_number == 7:  # oi
@@ -293,9 +397,15 @@ class MarketFullFeed:
                 elif field_number == 10:  # tsq
                     feed.tsq, offset = _decode_double(data, offset)
                 else:
+                    if offset + 8 > len(data):
+                        raise ProtobufDecodeError(
+                            f"truncated unknown 64-bit field {field_number}"
+                        )
                     offset += 8
             else:
-                break
+                raise ProtobufDecodeError(
+                    f"field {field_number} has unsupported wire type {wire_type}"
+                )
         return feed
 
 
@@ -325,14 +435,10 @@ class Feed:
         feed = cls()
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
-            field_number = tag >> 3
-            wire_type = tag & 0x07
+            field_number, wire_type, offset = _read_tag(data, offset)
 
             if wire_type == LEN_DELIMITED:
-                length, offset = _decode_varint(data, offset)
-                field_data = data[offset:offset + length]
-                offset += length
+                field_data, offset = _read_length_delimited(data, offset)
 
                 if field_number == 1:  # ltpc
                     feed.ltpc = LTPC.deserialize(field_data)
@@ -345,7 +451,7 @@ class Feed:
                 else:
                     _, offset = _decode_varint(data, offset)
             else:
-                break
+                offset = _skip_field(data, offset, wire_type, field_number)
         return feed
 
 
@@ -355,6 +461,11 @@ class FeedResponse:
     type: FeedType = FeedType.LIVE_FEED
     feeds: dict[str, Feed] = field(default_factory=dict)
     current_ts: int = 0
+    # Populated when an individual instrument entry in the feeds map could not
+    # be parsed. A single corrupt instrument must not cost every other
+    # instrument in the frame, so those entries are collected and reported
+    # rather than aborting the whole decode. Not part of the wire format.
+    decode_errors: list = field(default_factory=list)
 
     def serialize(self) -> bytes:
         """Serialize to protobuf bytes."""
@@ -376,9 +487,7 @@ class FeedResponse:
         response = cls()
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
-            field_number = tag >> 3
-            wire_type = tag & 0x07
+            field_number, wire_type, offset = _read_tag(data, offset)
 
             if wire_type == VARINT:
                 if field_number == 1:  # type
@@ -389,17 +498,18 @@ class FeedResponse:
                 else:
                     _, offset = _decode_varint(data, offset)
             elif wire_type == LEN_DELIMITED:
-                length, offset = _decode_varint(data, offset)
+                entry_data, offset = _read_length_delimited(data, offset)
                 if field_number == 2:  # feeds map
-                    # Parse map entry
-                    entry_data = data[offset:offset + length]
-                    offset += length
-                    key, feed = _decode_map_entry(entry_data)
+                    try:
+                        key, feed = _decode_map_entry(entry_data)
+                    except ProtobufDecodeError as e:
+                        # Isolate the bad instrument; the rest of the frame
+                        # stays usable.
+                        response.decode_errors.append(e)
+                        continue
                     response.feeds[key] = feed
-                else:
-                    offset += length
             else:
-                break
+                offset = _skip_field(data, offset, wire_type, field_number)
         return response
 
 
@@ -409,21 +519,20 @@ def _decode_map_entry(data: bytes) -> tuple[str, Feed]:
     feed = Feed()
     offset = 0
     while offset < len(data):
-        tag, offset = _decode_varint(data, offset)
-        field_number = tag >> 3
-        wire_type = tag & 0x07
+        field_number, wire_type, offset = _read_tag(data, offset)
 
         if wire_type == LEN_DELIMITED:
-            length, offset = _decode_varint(data, offset)
-            field_data = data[offset:offset + length]
-            offset += length
+            field_data, offset = _read_length_delimited(data, offset)
 
             if field_number == 1:  # key
-                key = field_data.decode("utf-8")
+                try:
+                    key = field_data.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise ProtobufDecodeError("invalid utf-8 in map key") from exc
             elif field_number == 2:  # value (Feed)
                 feed = Feed.deserialize(field_data)
         else:
-            break
+            offset = _skip_field(data, offset, wire_type, field_number)
     return key, feed
 
 
@@ -460,37 +569,37 @@ class SubscriptionRequest:
         request = cls()
         offset = 0
         while offset < len(data):
-            tag, offset = _decode_varint(data, offset)
-            field_number = tag >> 3
-            wire_type = tag & 0x07
+            field_number, wire_type, offset = _read_tag(data, offset)
 
             if wire_type == LEN_DELIMITED:
-                length, offset = _decode_varint(data, offset)
-                field_data = data[offset:offset + length]
-                offset += length
+                field_data, offset = _read_length_delimited(data, offset)
 
                 if field_number == 1:  # guid
-                    request.guid = field_data.decode("utf-8")
+                    request.guid = _decode_utf8(field_data, "guid")
                 elif field_number == 2:  # method
-                    request.method = field_data.decode("utf-8")
+                    request.method = _decode_utf8(field_data, "method")
                 elif field_number == 3:  # data
                     # Parse data fields
                     data_offset = 0
                     while data_offset < len(field_data):
-                        sub_tag, data_offset = _decode_varint(field_data, data_offset)
-                        sub_field = sub_tag >> 3
-                        sub_wire = sub_tag & 0x07
+                        sub_field, sub_wire, data_offset = _read_tag(
+                            field_data, data_offset
+                        )
 
                         if sub_wire == VARINT and sub_field == 1:  # mode
                             mode_val, data_offset = _decode_varint(field_data, data_offset)
                             request.mode = RequestMode(mode_val)
                         elif sub_wire == LEN_DELIMITED and sub_field == 2:  # instrumentKeys
-                            key_len, data_offset = _decode_varint(field_data, data_offset)
-                            key = field_data[data_offset:data_offset + key_len].decode("utf-8")
-                            data_offset += key_len
-                            request.instrument_keys.append(key)
+                            key_data, data_offset = _read_length_delimited(
+                                field_data, data_offset
+                            )
+                            request.instrument_keys.append(
+                                _decode_utf8(key_data, "instrument key")
+                            )
                         else:
-                            break
+                            data_offset = _skip_field(
+                                field_data, data_offset, sub_wire, sub_field
+                            )
             else:
-                break
+                offset = _skip_field(data, offset, wire_type, field_number)
         return request

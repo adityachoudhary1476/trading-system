@@ -9,7 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from trading_system.india.upstox_v3_pb import FeedResponse, RequestMode
+from trading_system.india.upstox_v3_pb import (
+    Feed,
+    FeedResponse,
+    ProtobufDecodeError,
+    RequestMode,
+)
 from trading_system.india.upstox_v3_ws import UpstoxV3WebSocket
 from tests.fixtures.india_fixtures import (
     V3_NIFTY_KEY,
@@ -88,18 +93,92 @@ def test_v3_frame_without_price_emits_no_event():
     assert received == []
 
 
-def test_v3_corrupt_frame_does_not_crash_the_socket():
-    """A corrupt binary frame must not raise or emit a bogus event.
+def test_v3_corrupt_frame_is_reported_not_swallowed():
+    """A corrupt frame must be reported, not decoded into a default message.
 
-    The hand-rolled protobuf decoder is lenient: undecodable bytes yield an
-    empty FeedResponse rather than raising, so the socket stays alive and
-    simply produces nothing for that frame.
+    The decoder used to be lenient, so garbled bytes were indistinguishable
+    from a legitimately empty frame: the feed just went quiet with no signal
+    that anything was wrong.
     """
     received = []
+    invalid = []
     sock = _socket(received.append)
-    for payload in (b"\xff\xff\xff\xff not a protobuf frame", b"", b"\x0a\x7f"):
-        sock._handle_message_from_ws(None, payload)  # must not raise
+    sock.on_invalid_cb(lambda e: invalid.append(e))
+    sock._handle_message_from_ws(None, b"\x0a\x7f")  # length overruns the buffer
     assert received == []
+    assert len(invalid) == 1
+    assert isinstance(invalid[0], ProtobufDecodeError)
+
+
+def test_v3_garbage_and_overlong_varint_are_reported():
+    received = []
+    invalid = []
+    sock = _socket(received.append)
+    sock.on_invalid_cb(lambda e: invalid.append(e))
+    for payload in (b"\xff\xff\xff\xff", b"\x08" + b"\x80" * 12):
+        sock._handle_message_from_ws(None, payload)
+    assert received == []
+    assert len(invalid) == 2
+
+
+def test_v3_empty_frame_is_accepted_as_no_data():
+    """An empty payload is a valid, if uninteresting, message - not a fault."""
+    received = []
+    invalid = []
+    sock = _socket(received.append)
+    sock.on_invalid_cb(lambda e: invalid.append(e))
+    sock._handle_message_from_ws(None, b"")
+    assert received == []
+    assert invalid == []
+
+
+def test_v3_one_bad_instrument_does_not_lose_the_rest_of_the_frame():
+    """A single unparseable feed entry must not cost the others."""
+    from trading_system.india.upstox_v3_pb import _encode_string, _encode_tag, _encode_varint
+
+    bad_key = "NSE_EQ|BROKEN"
+    corrupt_feed = b"\x0a\x7f"  # claims a 127-byte submessage, carries none
+    # Hand-build a feeds map entry whose value is the corrupt feed, then wrap it
+    # as a FeedResponse field 2 alongside the valid feed.
+    bad_entry = _encode_string(1, bad_key) + _encode_tag(2, 2) + _encode_varint(
+        len(corrupt_feed)
+    ) + corrupt_feed
+    payload = (
+        v3_feed_bytes()
+        + _encode_tag(2, 2)
+        + _encode_varint(len(bad_entry))
+        + bad_entry
+    )
+
+    received = []
+    invalid = []
+    sock = _socket(
+        received.append,
+        symbol_map={V3_SBIN_KEY: "NSE:SBIN", bad_key: "NSE:BROKEN"},
+    )
+    sock.on_invalid_cb(lambda e: invalid.append(e))
+    sock._handle_message_from_ws(None, payload)
+    assert [ev.symbol for ev in received] == ["NSE:SBIN"]
+    assert len(invalid) == 1
+    assert isinstance(invalid[0], ProtobufDecodeError)
+
+
+def test_v3_unknown_fields_are_skipped_not_rejected():
+    """Forward compatibility: a field this client does not know must be
+    ignored, not treated as corruption."""
+    from trading_system.india.upstox_v3_pb import _encode_varint_field, _encode_string
+
+    # A FeedResponse carrying an unknown varint field 9 and an unknown
+    # length-delimited field 7 alongside a valid feed.
+    payload = v3_feed_bytes() + _encode_varint_field(9, 42) + _encode_string(7, "future")
+    received = []
+    invalid = []
+    sock = _socket(received.append)
+    sock.on_invalid_cb(lambda e: invalid.append(e))
+    sock._handle_message_from_ws(None, payload)
+    assert invalid == []
+    assert len(received) == 1
+    assert received[0].ltp == 123.45
 
 
 def test_v3_json_control_message_is_ignored():
