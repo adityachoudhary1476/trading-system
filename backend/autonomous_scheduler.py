@@ -979,6 +979,22 @@ def _execute_one_option_decision(
     """
     from backend.options_phase_b import EVENT_PHASE_B_NO_EXECUTION
 
+    # --- Kill switch (checked early so halted bots never touch deployments) ---
+    if controller.is_halted:
+        underlyings = _env_option_underlyings()
+        if not underlyings:
+            underlyings = getattr(
+                getattr(controller, "config", None),
+                "user_constraints",
+                None,
+            ) and getattr(controller.config.user_constraints, "allowed_option_underlyings", frozenset()) or frozenset()
+        deps = _list_options_enabled_deployments(controller, underlyings)
+        dep = deps[0] if deps else None
+        return {
+            "result": "kill_switch_halted",
+            "deployment_id": dep.deployment_id if dep else None,
+        }
+
     # --- Pre-checks ---
     underlyings = _env_option_underlyings()
     if not underlyings:
@@ -1036,16 +1052,8 @@ def _execute_one_option_decision(
             "deployment_id": deployment_id,
         }
 
-    # --- Kill switch ---
-    if controller.is_halted:
-        return {
-            "result": "kill_switch_halted",
-            "deployment_id": deployment_id,
-        }
-
+    # --- Execute via controller ---
     runner = controller.control_center.get_runner(sid)
-
-    # --- BUY path: discover + buy ---
     if action_value.lower() == "buy":
         max_contracts = getattr(cfg, "max_options_contracts_per_trade", None)
         if max_contracts is not None and target_qty > max_contracts:
