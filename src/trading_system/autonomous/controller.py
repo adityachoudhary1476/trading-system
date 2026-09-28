@@ -1281,6 +1281,155 @@ class AutonomousController(BaseModel):
 
         return quote
 
+    def _instrument_for_position(self, position, underlying: str):
+        """Resolve the quote-ready ``Instrument`` for an open option position.
+
+        The BUY path discovered this instrument from the instrument
+        repository, so its ``InternalSymbol.key`` (the broker position symbol)
+        and ``provider_symbol`` (the Upstox/NSE wire token) are the only values
+        that the short-selling guard in ``submit_order_intent`` and the quote
+        provider resolve correctly. Reconstructing from raw position metadata
+        (expiry as YYYYMMDD vs. the provider's YYMMMDD token, provider_symbol as
+        the canonical contract_id pipe-string vs. the wire key) produced a key
+        that never matched the stored position and a provider_symbol the Upstox
+        API rejected -- both caused exits to be rejected in production.
+
+        Returns ``None`` if the position lacks the contract metadata needed to
+        identify a contract at all.
+        """
+        pos_contract_id = getattr(position, "options_contract_id", None)
+        pos_strike = getattr(position, "strike", None)
+        pos_expiry = getattr(position, "expiry", None)
+        pos_option_type = getattr(position, "option_type", None)
+        pos_contract_size = getattr(position, "contract_size", 1)
+        if not (pos_contract_id and pos_strike and pos_expiry and pos_option_type):
+            return None
+
+        from trading_system.india.instruments import (
+            Instrument,
+            InstrumentType,
+            InternalSymbol,
+        )
+
+        itype = InstrumentType.OPTION_CE if pos_option_type == "CE" else InstrumentType.OPTION_PE
+        pos_symbol = getattr(position, "symbol", None)
+        repo_instr = None
+        if self._instrument_repo is not None and pos_symbol:
+            try:
+                repo_instr = self._instrument_repo.registry.get(
+                    InternalSymbol.parse(pos_symbol)
+                )
+            except Exception:
+                repo_instr = None
+        if repo_instr is None and self._instrument_repo is not None:
+            repo_instr = getattr(
+                self._instrument_repo, "_derivatives", {}
+            ).get(pos_contract_id)
+        if repo_instr is None and self._instrument_repo is not None:
+            repo_instr = self._instrument_repo.find_contract(
+                underlying=underlying, expiry=pos_expiry,
+                option_type=pos_option_type, strike=pos_strike,
+            )
+
+        if repo_instr is not None:
+            instrument = repo_instr
+            # Stamping lot_size from the position (repository may use a
+            # different default; the filled contract lot must win).
+            if pos_contract_size:
+                instrument.lot_size = int(pos_contract_size)
+            return instrument
+
+        # Fallback when the instrument is not in the repository: reconstruct
+        # from position metadata but use the position's broker symbol for BOTH
+        # the InternalSymbol key and the provider_symbol, so they at least stay
+        # consistent with the BUY-side position.
+        if pos_symbol and ":" in pos_symbol:
+            exch, sym = pos_symbol.split(":", 1)
+        else:
+            exch, sym = "NFO", pos_symbol or (
+                f"{underlying}{pos_expiry.replace('-', '')}"
+                f"{int(pos_strike)}{pos_option_type}"
+            )
+        instrument = Instrument(
+            internal=InternalSymbol(exchange=exch.upper(), symbol=sym),
+            instrument_type=itype,
+            name=f"{underlying} {pos_option_type} {pos_strike} {pos_expiry}",
+            provider_symbol=pos_symbol,
+        )
+        instrument.underlying = underlying
+        instrument.expiry = pos_expiry
+        instrument.strike = float(pos_strike)
+        instrument.option_type = pos_option_type
+        instrument.lot_size = int(pos_contract_size) if pos_contract_size else 1
+        return instrument
+
+    def mark_option_positions_to_market(
+        self,
+        *,
+        deployment_id: str,
+        underlying: str,
+        positions,
+        max_age_seconds: float = 300.0,
+    ) -> int:
+        """Refresh the broker mark for each open option position from live quotes.
+
+        A position's ``current_price`` is otherwise only written as a side effect
+        of submitting an order, so on any tick where the strategy emits no
+        signal the stored mark stays at the entry premium, unrealized P&L reads
+        0%, and a stop-loss or take-profit can never be reached. Risk limits are
+        only as good as the mark they are measured against, so the mark is
+        refreshed before any threshold is evaluated.
+
+        Fail-closed on pricing: a missing, stale or unparseable quote leaves the
+        existing mark untouched rather than guessing a price. Returns the number
+        of positions successfully re-marked. Never raises.
+        """
+        if self._quote_provider is None:
+            return 0
+        marked = 0
+        for pos in positions or ():
+            try:
+                instrument = self._instrument_for_position(pos, underlying)
+                if instrument is None:
+                    continue
+                quote = self._quote_provider.get_quote(instrument)
+                if quote is None:
+                    continue
+                if not self._quote_provider.is_fresh(
+                    quote, max_age_seconds=max_age_seconds
+                ):
+                    self._record_event(
+                        AutonomousEventType.ERROR,
+                        symbol=underlying,
+                        message=(
+                            f"mark-to-market quote stale: age={quote.age_seconds:.0f}s"
+                            f" for {getattr(pos, 'options_contract_id', None)}"
+                        ),
+                    )
+                    continue
+                ltp = float(getattr(quote, "ltp", 0.0) or 0.0)
+                if ltp <= 0:
+                    continue
+                if self.control_center.update_deployment_market_price(
+                    deployment_id, pos.symbol, ltp
+                ):
+                    marked += 1
+            except Exception as exc:  # noqa: BLE001
+                # A bad quote for one contract must not stop the others, and must
+                # never abort the tick: the stale mark simply fails to trigger.
+                # Logged rather than swallowed, because a silent failure here
+                # means a risk limit that silently never fires.
+                self._record_event(
+                    AutonomousEventType.ERROR,
+                    symbol=underlying,
+                    message=(
+                        f"mark-to-market failed for"
+                        f" {getattr(pos, 'options_contract_id', None)}: {exc}"
+                    ),
+                )
+                continue
+        return marked
+
     def execute_option_order(
         self,
         *,
@@ -1375,66 +1524,14 @@ class AutonomousController(BaseModel):
 
             if pos_contract_id and pos_strike and pos_expiry and pos_option_type:
                 underlying = decision.opportunity_symbol.split(":")[-1] if ":" in decision.opportunity_symbol else decision.opportunity_symbol
-                itype = InstrumentType.OPTION_CE if pos_option_type == "CE" else InstrumentType.OPTION_PE
-
-                # --- Resolve the ORIGINAL instrument from the repository ---
-                # The BUY path discovered this instrument from the same repository,
-                # so its InternalSymbol.key (the broker position symbol) and
-                # provider_symbol (the Upstox/NSE wire token) are the only values
-                # that the short-selling guard in submit_order_intent and the
-                # quote provider can resolve correctly.  Reconstructing the
-                # Instrument from raw position metadata (expiry as YYYYMMDD vs.
-                # the provider's YYMMMDD token, provider_symbol as the canonical
-                # contract_id pipe-string vs. the wire key) produced a key that
-                # never matched the stored position and a provider_symbol that
-                # the Upstox API rejected — both caused exits to be rejected in
-                # production.
-                pos_symbol = getattr(existing_position, "symbol", None)
-                repo_instr = None
-                if self._instrument_repo is not None and pos_symbol:
-                    try:
-                        repo_instr = self._instrument_repo.registry.get(
-                            InternalSymbol.parse(pos_symbol)
-                        )
-                    except Exception:
-                        repo_instr = None
-                if repo_instr is None and self._instrument_repo is not None:
-                    repo_instr = getattr(
-                        self._instrument_repo, "_derivatives", {}
-                    ).get(pos_contract_id)
-                if repo_instr is None and self._instrument_repo is not None:
-                    repo_instr = self._instrument_repo.find_contract(
-                        underlying=underlying, expiry=pos_expiry,
-                        option_type=pos_option_type, strike=pos_strike,
+                instrument = self._instrument_for_position(existing_position, underlying)
+                if instrument is None:
+                    self._record_event(
+                        AutonomousEventType.ERROR,
+                        symbol=decision.opportunity_symbol,
+                        message="exit rejected: could not resolve instrument for existing position",
                     )
-
-                if repo_instr is not None:
-                    instrument = repo_instr
-                    # Stamping lot_size from the position (repository may use a
-                    # different default; the filled contract lot must win).
-                    if pos_contract_size:
-                        instrument.lot_size = int(pos_contract_size)
-                else:
-                    # Fallback when the instrument is not in the repository:
-                    # reconstruct from position metadata but use the position's
-                    # broker symbol for BOTH the InternalSymbol key and the
-                    # provider_symbol, so they at least stay consistent with the
-                    # BUY-side position.
-                    if pos_symbol and ":" in pos_symbol:
-                        exch, sym = pos_symbol.split(":", 1)
-                    else:
-                        exch, sym = "NFO", pos_symbol or f"{underlying}{pos_expiry.replace('-', '')}{int(pos_strike)}{pos_option_type}"
-                    instrument = Instrument(
-                        internal=InternalSymbol(exchange=exch.upper(), symbol=sym),
-                        instrument_type=itype,
-                        name=f"{underlying} {pos_option_type} {pos_strike} {pos_expiry}",
-                        provider_symbol=pos_symbol,
-                    )
-                    instrument.underlying = underlying
-                    instrument.expiry = pos_expiry
-                    instrument.strike = float(pos_strike)
-                    instrument.option_type = pos_option_type
-                    instrument.lot_size = int(pos_contract_size) if pos_contract_size else 1
+                    return None
 
                 quote = self._quote_provider.get_quote(instrument)
                 if quote is None:

@@ -1650,16 +1650,24 @@ class TestSlTpSweep:
             max_contracts=1, stop_loss_pct=sl, take_profit_pct=tp,
         )
         _attach_phase_b(controller, premium=premium)
-        return controller, center, dep, _execute_one_option_decision, _sweep_sl_tp_positions
+        return (
+            controller, center, dep, _execute_one_option_decision,
+            _sweep_sl_tp_positions, controller._quote_provider,
+        )
 
     @staticmethod
-    def _reprice(runner, multiplier: float) -> None:
-        """Mark the open position to ``multiplier`` x its entry price."""
-        for pos in _open_positions(runner).values():
-            pos.current_price = pos.avg_entry_price * multiplier
+    def _move_market(quotes, runner, multiplier: float) -> None:
+        """Move the *market* to ``multiplier`` x entry, as a real price move would.
+
+        Deliberately does not touch ``position.current_price``: the sweep
+        re-marks open positions from the live quote, so writing the mark
+        directly would test nothing.
+        """
+        entry = next(iter(_open_positions(runner).values())).avg_entry_price
+        quotes._premium = entry * multiplier
 
     def test_take_profit_closes_position_without_any_signal(self):
-        controller, center, dep, execute, sweep = self._wire("bot-sweep-tp")
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-tp")
         opened = execute(
             controller, _make_decision(option_intent="CE"),
             spot_price=25000.0, target_qty=1,
@@ -1668,7 +1676,7 @@ class TestSlTpSweep:
 
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
-        self._reprice(runner, 1.10)  # +10%, well past the 6% take-profit
+        self._move_market(quotes, runner, 1.10)  # +10%, well past the 6% take-profit
 
         fired = sweep(controller)
         assert len(fired) == 1, f"expected exactly one SL/TP exit, got {fired}"
@@ -1680,14 +1688,14 @@ class TestSlTpSweep:
         )
 
     def test_stop_loss_closes_position_without_any_signal(self):
-        controller, center, dep, execute, sweep = self._wire("bot-sweep-sl")
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-sl")
         execute(
             controller, _make_decision(option_intent="PE"),
             spot_price=25000.0, target_qty=1,
         )
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
-        self._reprice(runner, 0.90)  # -10%, well past the 3% stop-loss
+        self._move_market(quotes, runner, 0.90)  # -10%, well past the 3% stop-loss
 
         fired = sweep(controller)
         assert len(fired) == 1, f"expected exactly one SL/TP exit, got {fired}"
@@ -1696,35 +1704,35 @@ class TestSlTpSweep:
 
     def test_sweep_is_a_noop_inside_the_band(self):
         """+1% is inside both thresholds: must not touch the position."""
-        controller, center, dep, execute, sweep = self._wire("bot-sweep-band")
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-band")
         execute(
             controller, _make_decision(option_intent="CE"),
             spot_price=25000.0, target_qty=1,
         )
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
-        self._reprice(runner, 1.01)
+        self._move_market(quotes, runner, 1.01)
 
         assert sweep(controller) == []
         assert len(_open_positions(runner)) == 1, "sweep closed a position early"
 
     def test_sweep_is_idempotent(self):
         """A second sweep must not double-close or error on a flat book."""
-        controller, center, dep, execute, sweep = self._wire("bot-sweep-idem")
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-idem")
         execute(
             controller, _make_decision(option_intent="CE"),
             spot_price=25000.0, target_qty=1,
         )
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
-        self._reprice(runner, 1.10)
+        self._move_market(quotes, runner, 1.10)
 
         assert len(sweep(controller)) == 1
         assert sweep(controller) == [], "sweep fired again on an already-flat book"
 
     def test_sweep_respects_disabled_thresholds(self):
         """With both legs off, the sweep must not close anything."""
-        controller, center, dep, execute, sweep = self._wire(
+        controller, center, dep, execute, sweep, quotes = self._wire(
             "bot-sweep-disabled", sl=None, tp=None,
         )
         execute(
@@ -1733,31 +1741,16 @@ class TestSlTpSweep:
         )
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
-        self._reprice(runner, 1.50)  # +50%: would fire if a threshold were armed
+        self._move_market(quotes, runner, 1.50)  # +50%: would fire if a threshold were armed
 
         assert sweep(controller) == []
         assert len(_open_positions(runner)) == 1, (
             "sweep closed a position with SL/TP disabled"
         )
 
-    def test_sweep_skips_stale_or_unpriced_position(self):
-        """current_price <= 0 means no authoritative mark: never fire."""
-        controller, center, dep, execute, sweep = self._wire("bot-sweep-noprice")
-        execute(
-            controller, _make_decision(option_intent="CE"),
-            spot_price=25000.0, target_qty=1,
-        )
-        sid = center.find_session_for_deployment(dep.deployment_id)
-        runner = center.get_runner(sid)
-        for pos in _open_positions(runner).values():
-            pos.current_price = 0.0
-
-        assert sweep(controller) == []
-        assert len(_open_positions(runner)) == 1
-
-    def test_sweep_books_realized_pnl(self):
-        """The exit must realize the loss, not just flatten the quantity."""
-        controller, center, dep, execute, sweep = self._wire("bot-sweep-pnl")
+    def test_sweep_ignores_stale_quote(self):
+        """A stale quote must not be used to mark, so no exit may fire."""
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-stale")
         execute(
             controller, _make_decision(option_intent="CE"),
             spot_price=25000.0, target_qty=1,
@@ -1765,7 +1758,31 @@ class TestSlTpSweep:
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
         entry = next(iter(_open_positions(runner).values())).avg_entry_price
-        self._reprice(runner, 0.90)
+
+        # Price is way past take-profit, but the quote is too old to trust.
+        quotes._stale = True
+        quotes._premium = entry * 5.0
+
+        assert sweep(controller) == []
+        assert len(_open_positions(runner)) == 1, (
+            "sweep exited on a stale quote"
+        )
+        mark = next(iter(_open_positions(runner).values())).current_price
+        assert mark == pytest.approx(entry), (
+            f"a stale quote must not overwrite the mark (mark={mark})"
+        )
+
+    def test_sweep_books_realized_pnl(self):
+        """The exit must realize the loss, not just flatten the quantity."""
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-pnl")
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        entry = next(iter(_open_positions(runner).values())).avg_entry_price
+        self._move_market(quotes, runner, 0.90)
 
         fired = sweep(controller)
         assert len(fired) == 1, fired
@@ -1783,14 +1800,14 @@ class TestSlTpSweep:
 
     def test_sweep_ignores_non_active_deployment(self):
         """A stopped deployment has a detached session; must not be closed."""
-        controller, center, dep, execute, sweep = self._wire("bot-sweep-stopped")
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-stopped")
         execute(
             controller, _make_decision(option_intent="CE"),
             spot_price=25000.0, target_qty=1,
         )
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
-        self._reprice(runner, 1.10)
+        self._move_market(quotes, runner, 1.10)
 
         center.stop_deployment(dep.deployment_id)
         assert sweep(controller) == []
@@ -1844,6 +1861,7 @@ class TestSlTpExitDuringALiveTick:
 
     @staticmethod
     def _open_and_breach(bot_id: str, multiplier: float):
+        """Open a position, then move the market (not the stored mark)."""
         from backend.autonomous_scheduler import _execute_one_option_decision
 
         center, registry, intelligence, gate, spec, strategy_id = _build_control_center()
@@ -1862,14 +1880,15 @@ class TestSlTpExitDuringALiveTick:
 
         sid = center.find_session_for_deployment(dep.deployment_id)
         runner = center.get_runner(sid)
-        for pos in _open_positions(runner).values():
-            pos.current_price = pos.avg_entry_price * multiplier
-        return controller, center, dep, sid, runner, opened
+        quotes = controller._quote_provider
+        entry = next(iter(_open_positions(runner).values())).avg_entry_price
+        quotes._premium = entry * multiplier
+        return controller, center, dep, sid, runner, quotes, opened
 
     def test_tick_flattens_take_profit_with_no_eligible_decision(self, monkeypatch):
         from backend import autonomous_scheduler
 
-        controller, center, dep, sid, runner, opened = self._open_and_breach(
+        controller, center, dep, sid, runner, quotes, opened = self._open_and_breach(
             "bot-tick-tp", 1.10,
         )
         # Force the session/data gates open so the tick reaches the decision
@@ -1899,7 +1918,7 @@ class TestSlTpExitDuringALiveTick:
     def test_tick_flattens_stop_loss_with_no_eligible_decision(self, monkeypatch):
         from backend import autonomous_scheduler
 
-        controller, center, dep, sid, runner, opened = self._open_and_breach(
+        controller, center, dep, sid, runner, quotes, opened = self._open_and_breach(
             "bot-tick-sl", 0.90,
         )
         monkeypatch.setattr(
@@ -1919,7 +1938,7 @@ class TestSlTpExitDuringALiveTick:
     def test_tick_leaves_position_alone_inside_the_band(self, monkeypatch):
         from backend import autonomous_scheduler
 
-        controller, center, dep, sid, runner, opened = self._open_and_breach(
+        controller, center, dep, sid, runner, quotes, opened = self._open_and_breach(
             "bot-tick-band", 1.01,
         )
         monkeypatch.setattr(
@@ -1941,7 +1960,7 @@ class TestSlTpExitDuringALiveTick:
         from backend import autonomous_scheduler
         from trading_system.autonomous.safety import KillSwitchReason
 
-        controller, center, dep, sid, runner, opened = self._open_and_breach(
+        controller, center, dep, sid, runner, quotes, opened = self._open_and_breach(
             "bot-tick-halted", 1.10,
         )
         controller.halt_bot(reason=KillSwitchReason.MANUAL, detail="test")
@@ -1955,5 +1974,85 @@ class TestSlTpExitDuringALiveTick:
         assert len(_open_positions(runner)) == 1, (
             "a halted bot closed a position: the kill switch must win"
         )
+
+
+class TestSlTpRequiresAFreshMark:
+    """The sweep reads ``position.current_price``, so that mark must be live.
+
+    A position's ``current_price`` is only refreshed as a side effect of
+    submitting an order. On a tick where the strategy emits no signal, nothing
+    marks the position to market, so a stale entry-price mark makes P&L 0% and
+    the threshold can never be reached. These tests move the *quote*, not the
+    position, so they only pass if the scheduler marks open positions itself.
+    """
+
+    @staticmethod
+    def _open(bot_id: str):
+        from backend.autonomous_scheduler import _execute_one_option_decision
+
+        center, registry, intelligence, gate, spec, strategy_id = _build_control_center()
+        controller = _build_controller(center, bot_id=bot_id)
+        dep = _create_options_deployment(
+            controller, bot_id=bot_id, spec=spec, strategy_id=strategy_id,
+            options_enabled=True, allowed_option_types=["CE", "PE"],
+            max_contracts=1, stop_loss_pct=0.03, take_profit_pct=0.06,
+        )
+        provider = _attach_phase_b(controller, premium=185.0)
+        opened = _execute_one_option_decision(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert opened["result"] == "submitted", opened
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        # _attach_phase_b returns the instrument repo; the quote provider that
+        # actually drives marks is the one on the controller.
+        return controller, center, dep, sid, center.get_runner(sid), controller._quote_provider
+
+    def test_quote_move_alone_triggers_take_profit(self, monkeypatch):
+        from backend import autonomous_scheduler
+
+        controller, center, dep, sid, runner, provider = self._open("bot-mark-tp")
+        entry = next(iter(_open_positions(runner).values())).avg_entry_price
+
+        # The market moves; the position's stored mark is untouched.
+        provider._premium = entry * 1.10
+        pos = next(iter(_open_positions(runner).values()))
+        assert pos.current_price == pytest.approx(entry), (
+            "precondition: the stored mark should still be the entry price"
+        )
+
+        monkeypatch.setattr(
+            autonomous_scheduler, "_is_regular_session", lambda ts: True
+        )
+        monkeypatch.setattr(
+            autonomous_scheduler, "_has_fresh_data", lambda *a, **k: False
+        )
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        assert result.get("risk_exits"), (
+            "a real quote move did not produce an exit: the open position is "
+            f"never marked to market, so SL/TP can never fire. tick={result}"
+        )
+        assert _open_positions(runner) == {}
+
+    def test_quote_drop_alone_triggers_stop_loss(self, monkeypatch):
+        from backend import autonomous_scheduler
+
+        controller, center, dep, sid, runner, provider = self._open("bot-mark-sl")
+        entry = next(iter(_open_positions(runner).values())).avg_entry_price
+
+        provider._premium = entry * 0.90
+        monkeypatch.setattr(
+            autonomous_scheduler, "_is_regular_session", lambda ts: True
+        )
+        monkeypatch.setattr(
+            autonomous_scheduler, "_has_fresh_data", lambda *a, **k: False
+        )
+        result = autonomous_scheduler._run_one_tick(controller)
+
+        assert result.get("risk_exits"), (
+            f"a real quote drop did not produce an exit: tick={result}"
+        )
+        assert _open_positions(runner) == {}
         # And no live order endpoint was hit (Upstox/FYERS) — there is no
         # network code path inside execute_option_order.

@@ -1130,6 +1130,24 @@ def _sweep_sl_tp_positions(
             if runner is None:
                 continue
             positions = _get_open_option_positions(center, dep.deployment_id)
+            if positions:
+                # Refresh the mark BEFORE evaluating thresholds: a position's
+                # current_price is only ever written as a side effect of
+                # submitting an order, so on a signal-less tick it would still
+                # hold the entry premium, P&L would read 0%, and no threshold
+                # could ever be reached.
+                underlying = dep.symbol.split(":")[-1] if ":" in dep.symbol else dep.symbol
+                try:
+                    controller.mark_option_positions_to_market(
+                        deployment_id=dep.deployment_id,
+                        underlying=underlying,
+                        positions=list(positions),
+                        max_age_seconds=_env_max_option_quote_age(),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "SL/TP mark-to-market failed for %s: %s", dep.deployment_id, exc
+                    )
             for pos in positions:
                 if _check_sl_tp_for_position(runner, pos, ts) is None:
                     continue
