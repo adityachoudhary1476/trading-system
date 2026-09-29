@@ -635,15 +635,24 @@ class PaperAPIRouter:
         # has a session with real account/balance data.
         self.center.activate_deployment(deployment.deployment_id)
 
-        broker = PaperBroker(initial_cash=cfg.initial_cash)
-        circuit_breaker = PaperCircuitBreaker()
-        runner = PaperStrategyRunner(
-            deployment=deployment,
-            broker=broker,
-            spec=spec,
-            circuit_breaker=circuit_breaker,
-        )
-        session_id = self.center.attach_runner(deployment.deployment_id, runner)
+        # create_deployment is idempotent on (dataset, config), so a repeated
+        # POST returns the SAME deployment. Building a fresh broker here would
+        # overwrite the live runner's book and silently wipe open positions.
+        # Reuse the existing runner when one is already attached.
+        live_sid = self.center.find_session_for_deployment(deployment.deployment_id)
+        live_runner = self.center.get_runner(live_sid) if live_sid else None
+        if live_runner is not None:
+            session_id = live_sid
+        else:
+            broker = PaperBroker(initial_cash=cfg.initial_cash)
+            circuit_breaker = PaperCircuitBreaker()
+            runner = PaperStrategyRunner(
+                deployment=deployment,
+                broker=broker,
+                spec=spec,
+                circuit_breaker=circuit_breaker,
+            )
+            session_id = self.center.attach_runner(deployment.deployment_id, runner)
 
         # Also persist a checkpoint so the session survives a server restart.
         try:
@@ -651,6 +660,15 @@ class PaperAPIRouter:
         except Exception:
             logger.exception(
                 "save_session failed for deployment %s after creation",
+                deployment.deployment_id,
+                exc_info=True,
+            )
+        # ...and the live book, which is what actually holds positions.
+        try:
+            self.center.save_live_book(session_id)
+        except Exception:
+            logger.exception(
+                "save_live_book failed for deployment %s after creation",
                 deployment.deployment_id,
                 exc_info=True,
             )

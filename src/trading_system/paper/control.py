@@ -93,6 +93,7 @@ from .deployment import (
     rec_to_deployment,
 )
 from .events import PaperOperationEvent, PaperOperationEventType
+from .book import apply_book_to_broker, book_from_broker
 from .gate import (
     PAPER_TRADING_GATE_REASONS,
     DeploymentGate,
@@ -555,6 +556,24 @@ class PaperTradingControlCenter:
         self._runners[sid] = runner
         return checkpoint
 
+    def save_live_book(self, session_id: str) -> bool:
+        """Persist the session's whole book. Returns True when it was saved.
+
+        Separate from ``save_session``, which writes an immutable checkpoint
+        that can never be updated once the book changes. This is the call the
+        scheduler makes every tick so open positions survive a restart.
+        """
+        runner = self._runners.get(session_id)
+        if runner is None:
+            return False
+        book = book_from_broker(
+            broker=runner.broker,
+            session_id=session_id,
+            deployment_id=runner.deployment.deployment_id,
+        )
+        self.session_store.save_book(book)
+        return True
+
     def ensure_live_session(self, deployment_id: str) -> Optional[str]:
         """Return the session_id for a live runner, restoring from DB if needed.
 
@@ -569,13 +588,18 @@ class PaperTradingControlCenter:
         sid = self.find_session_for_deployment(deployment_id)
         if sid is not None:
             return sid
-        # Slow path: reconstruct from the persisted checkpoint.
+        # Slow path: reconstruct from whatever was persisted.
         deployment = self._load_or_cache_deployment(deployment_id)
         sid = session_identity(deployment)
         checkpoint = self.session_store.get_checkpoint(sid)
-        if checkpoint is None:
+        book = self.session_store.get_book(sid)
+        # Either record is enough to rebuild a runner. Gating on the checkpoint
+        # alone would refuse to restore a session whose book was persisted but
+        # whose checkpoint write was refused -- which is the normal case, since
+        # a changed book can never be re-checkpointed.
+        if checkpoint is None and book is None:
             return None
-        broker_state = checkpoint.broker_state or {}
+        broker_state = (checkpoint.broker_state if checkpoint else None) or {}
         initial_cash = float(
             broker_state.get("initial_cash", deployment.config.initial_cash)
         )
@@ -587,6 +611,20 @@ class PaperTradingControlCenter:
             broker.add_capital(cash - initial_cash)
         elif cash < initial_cash:
             broker.withdraw_capital(initial_cash - cash)
+        # Restore the live book when one was persisted. The checkpoint only ever
+        # captured a single position and cannot be written again once the book
+        # changes, so the book table is the only durable record of the real
+        # position set. Without this a restart silently reopened every
+        # deployment with a flat book while positions were still open.
+        if book is not None:
+            try:
+                apply_book_to_broker(broker, book)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "failed to restore live book for session %s; "
+                    "continuing with the checkpoint-derived book",
+                    sid,
+                )
         # Resolve the strategy spec from the registry.
         resolved_spec: Optional[StrategySpec] = None
         try:
@@ -608,9 +646,14 @@ class PaperTradingControlCenter:
             spec=resolved_spec,
             circuit_breaker=PaperCircuitBreaker(),
         )
-        try:
-            self.restore_session(session_id=sid, runner=runner)
-        except Exception:
+        if checkpoint is not None:
+            try:
+                self.restore_session(session_id=sid, runner=runner)
+            except Exception:
+                self.attach_runner(deployment_id, runner)
+        else:
+            # Book-only restore: the book is already applied to the broker, so
+            # there is no operational checkpoint to replay.
             self.attach_runner(deployment_id, runner)
         return sid
 

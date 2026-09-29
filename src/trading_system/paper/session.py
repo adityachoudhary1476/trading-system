@@ -43,6 +43,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import sessionmaker
 
 from ..storage.database import Base
+from .book import BOOK_SCHEMA_VERSION, PaperBook
 from .deployment import (
     PaperDeployment,
     PaperDeploymentStatus,
@@ -450,6 +451,31 @@ class PaperSessionRecord(Base):
     updated_at = Column(DateTime(timezone=True), nullable=False)
 
 
+class PaperBookRecord(Base):
+    """Mutable live book for one session.
+
+    Deliberately separate from :class:`PaperSessionRecord`, which is an
+    immutable content-addressed audit record that can never track a live book
+    (its ``checkpoint_id`` hashes the state it stores, so any change to the
+    book makes the write a permanent refusal). This row is overwritten in
+    place and holds the whole book, so a restart can rebuild the broker.
+    """
+
+    __tablename__ = "paper_books"
+
+    session_id = Column(String(64), primary_key=True)
+    deployment_id = Column(String(64), nullable=False, index=True)
+    initial_cash = Column(String(40), nullable=False)
+    cash = Column(String(40), nullable=False)
+    realized_pnl = Column(String(40), nullable=False)
+    positions_json = Column(Text, nullable=False, default="[]")
+    orders_json = Column(Text, nullable=False, default="[]")
+    state_hash = Column(String(64), nullable=False)
+    schema_version = Column(Integer, nullable=False, default=BOOK_SCHEMA_VERSION)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    updated_at = Column(DateTime(timezone=True), nullable=False)
+
+
 class PaperOrderRecord(Base):
     """Phase 20 — persisted external order-intent idempotency record.
 
@@ -545,6 +571,76 @@ class PaperSessionStore:
                 q = q.where(PaperSessionRecord.session_status == status)
             recs = s.execute(q.order_by(PaperSessionRecord.updated_at.asc())).scalars().all()
             return [self._from_record(r) for r in recs]
+
+    # -- live book (mutable; see PaperBookRecord) -------------------------------
+    def save_book(self, book: PaperBook) -> PaperBook:
+        """Persist the live book, overwriting any previous state for the session.
+
+        This is intentionally an upsert and not the immutable
+        :meth:`save_checkpoint` path: a live book is expected to change, and
+        refusing to persist a changed book is precisely the defect that loses
+        open positions on restart.
+        """
+        rec = self._book_to_record(book)
+        with self._Session() as s:
+            existing = s.get(PaperBookRecord, book.session_id)
+            if existing is None:
+                s.add(rec)
+            else:
+                # Preserve the original creation time; the row is the same book.
+                # Explicit field assignment rather than a setattr loop: the paper
+                # package forbids dynamic attribute access.
+                existing.deployment_id = rec.deployment_id
+                existing.initial_cash = rec.initial_cash
+                existing.cash = rec.cash
+                existing.realized_pnl = rec.realized_pnl
+                existing.positions_json = rec.positions_json
+                existing.orders_json = rec.orders_json
+                existing.state_hash = rec.state_hash
+                existing.schema_version = rec.schema_version
+                existing.updated_at = rec.updated_at
+            s.commit()
+        return book
+
+    def get_book(self, session_id: str) -> Optional[PaperBook]:
+        """Return the persisted live book for ``session_id`` (or None)."""
+        with self._Session() as s:
+            rec = s.get(PaperBookRecord, session_id)
+            if rec is None:
+                return None
+            return self._book_from_record(rec)
+
+    @staticmethod
+    def _book_to_record(book: PaperBook) -> PaperBookRecord:
+        return PaperBookRecord(
+            session_id=book.session_id,
+            deployment_id=book.deployment_id,
+            initial_cash=str(float(book.initial_cash)),
+            cash=str(float(book.cash)),
+            realized_pnl=str(float(book.realized_pnl)),
+            positions_json=json.dumps(book.positions, default=str),
+            orders_json=json.dumps(book.orders, default=str),
+            state_hash=book.state_hash or book.compute_hash(),
+            schema_version=int(book.schema_version),
+            created_at=_parse_dt(book.created_at),
+            updated_at=_parse_dt(_now_iso()),
+        )
+
+    @staticmethod
+    def _book_from_record(rec: PaperBookRecord) -> PaperBook:
+        return PaperBook(
+            session_id=rec.session_id,
+            deployment_id=rec.deployment_id,
+            initial_cash=float(rec.initial_cash),
+            cash=float(rec.cash),
+            realized_pnl=float(rec.realized_pnl),
+            positions=json.loads(rec.positions_json or "[]"),
+            orders=json.loads(rec.orders_json or "[]"),
+            state_hash=rec.state_hash or "",
+            schema_version=int(rec.schema_version),
+            created_at=rec.created_at.isoformat() if rec.created_at else _now_iso(),
+            updated_at=rec.updated_at.isoformat() if rec.updated_at else _now_iso(),
+        )
 
     # -- order-intent idempotency (durable) ------------------------------------
     def record_order(

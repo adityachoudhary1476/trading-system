@@ -2257,6 +2257,11 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
     # after the kill switch (a halted bot must not trade at all).
     risk_exits = _sweep_sl_tp_positions(controller, now=started_at)
 
+    # Persist immediately: the sweep above can close positions, and every gate
+    # below (fresh data, candidates, decision pipeline) can return early, so a
+    # single save at the end of the tick would be skipped by all of them.
+    _persist_live_books(controller)
+
     # --- 4. Fresh data for at least one allowed symbol at any deployed timeframe ---
     allowed_symbols = list(controller.config.user_constraints.allowed_symbols)
     allowed_timeframes = list(controller.config.user_constraints.allowed_timeframes)
@@ -2416,10 +2421,21 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
             )
 
     # --- Phase 22: Adaptive Multi-Strategy tick ---
-    phase22_result = _run_phase22_integration(controller, target_qty=target_qty)
+    # Persist the live book in a finally: without this the book lives only in
+    # this process's memory, so a restart rebuilds a flat book while positions
+    # are still open. The checkpoint path cannot help, because a changed book
+    # can never be re-checkpointed. Saving from ``finally`` also covers the
+    # case where the tick raises *after* an order was submitted -- exactly the
+    # window in which an unwritten book loses the most money.
+    phase22_result: dict = {}
+    portfolio_result: dict = {}
+    try:
+        phase22_result = _run_phase22_integration(controller, target_qty=target_qty)
 
-    # --- V1: Autonomous Portfolio tick (portfolio-level paper trading) ---
-    portfolio_result = _run_portfolio_tick(controller)
+        # --- V1: Autonomous Portfolio tick (portfolio-level paper trading) ---
+        portfolio_result = _run_portfolio_tick(controller)
+    finally:
+        _persist_live_books(controller)
 
     return {
         **base,
@@ -2431,6 +2447,36 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         "phase22": phase22_result,
         "portfolio": portfolio_result,
     }
+
+
+def _persist_live_books(controller) -> list[str]:
+    """Write every live runner's book to the durable book table.
+
+    Best-effort per session: a persistence failure must never abort a tick or
+    stop trading, but it must be logged loudly, because a book that is only in
+    memory is a book that a restart will lose.
+    """
+    saved: list[str] = []
+    center = controller.control_center
+    saver = getattr(center, "save_live_book", None)
+    if not callable(saver):
+        return saved
+    try:
+        session_ids = list(getattr(center, "_runners", {}).keys())
+    except Exception:  # noqa: BLE001
+        logger.exception("could not enumerate live sessions to persist books")
+        return saved
+    for sid in session_ids:
+        try:
+            if saver(sid):
+                saved.append(sid)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "failed to persist live book for session %s; open positions "
+                "will be lost if this process restarts before the next save",
+                sid,
+            )
+    return saved
 
 
 def _run_portfolio_tick(controller) -> dict:
