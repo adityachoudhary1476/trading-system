@@ -680,6 +680,136 @@ def test_exit_submits_against_real_underlying_not_broker_token():
     )
     assert "NSE_FO" not in underlying
 
+
+# 12. Deployment / mandate recovery (the "bricks forever" traps)
+# ---------------------------------------------------------------------------
+
+
+def test_failed_deployment_is_skipped_so_a_fresh_one_can_be_created():
+    """A FAILED deployment can never return to ACTIVE and must not be adopted.
+
+    ``FAILED`` has an empty transition set, so ``ensure_account`` re-activating
+    it can never work. Because ``find_portfolio_deployment`` had no status
+    filter it latched onto that dead deployment on every tick, failing closed
+    forever and stranding open positions with no risk path.
+    """
+    from trading_system.paper.deployment import PaperDeploymentStatus
+
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    dead = SimpleNamespace(
+        deployment_id="dep-dead",
+        dataset_id=f"autonomous-portfolio:{FakeController.BOT_ID}",
+        notes=f"bot:{FakeController.BOT_ID}",
+        status=PaperDeploymentStatus.FAILED,
+    )
+    live = SimpleNamespace(
+        deployment_id="dep-live",
+        dataset_id=f"autonomous-portfolio:{FakeController.BOT_ID}",
+        notes=f"bot:{FakeController.BOT_ID}",
+        status=PaperDeploymentStatus.ACTIVE,
+    )
+    controller.control_center.deployment = live
+    controller.control_center.list_deployments = lambda: [dead, live]
+
+    assert portfolio.find_portfolio_deployment() is live
+
+
+def test_stopped_deployment_is_still_adopted_for_reactivation():
+    """STOPPED is recoverable (STOPPED -> ACTIVE), so keep adopting it."""
+    from trading_system.paper.deployment import PaperDeploymentStatus
+
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    stopped = SimpleNamespace(
+        deployment_id="dep-stopped",
+        dataset_id=f"autonomous-portfolio:{FakeController.BOT_ID}",
+        notes=f"bot:{FakeController.BOT_ID}",
+        status=PaperDeploymentStatus.STOPPED,
+    )
+    controller.control_center.deployment = stopped
+    controller.control_center.list_deployments = lambda: [stopped]
+
+    assert portfolio.find_portfolio_deployment() is stopped
+
+
+def test_creation_falls_back_to_next_mandate_when_gate_rejects_first():
+    """One rejected strategy must not brick the portfolio for every tick.
+
+    The gate is the authority on deployability and can reject an individual
+    strategy. Previously only the first candidate was ever attempted, so a
+    single rejection produced ``portfolio_deployment_failed`` forever.
+    """
+    from trading_system.autonomous.coordinator import DeploymentCreationResult
+
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    spec_a = SimpleNamespace(timeframe="1d", strategy_id="strat-a")
+    spec_b = SimpleNamespace(timeframe="1d", strategy_id="strat-b")
+    portfolio.mandate_candidates = lambda: [
+        ("strat-a", "NSE:NIFTY", spec_a),
+        ("strat-b", "NSE:NIFTY", spec_b),
+    ]
+
+    attempted: list[str] = []
+    new_dep = SimpleNamespace(
+        deployment_id="dep-new",
+        dataset_id=f"autonomous-portfolio:{FakeController.BOT_ID}",
+        notes=f"bot:{FakeController.BOT_ID}",
+        status="active",
+    )
+
+    def _create(strategy_id, symbol, spec):
+        attempted.append(strategy_id)
+        if strategy_id == "strat-a":
+            return None, "failure"  # gate rejects the preferred candidate
+        return new_dep, "created"
+
+    portfolio._create_deployment_for_mandate = _create
+
+    dep = portfolio._create_portfolio_deployment()
+
+    assert attempted == ["strat-a", "strat-b"], (
+        "must try the next mandate after a rejection"
+    )
+    assert dep is new_dep
+    reasons = [a.reason for a in portfolio.actions]
+    assert not any(r and r.startswith("portfolio_deployment_failed") for r in reasons), (
+        f"should not fail closed when a fallback succeeded: {reasons}"
+    )
+    assert "portfolio_mandate_fallback" in reasons
+
+
+def test_creation_fails_closed_only_after_all_mandates_rejected():
+    from trading_system.autonomous.coordinator import DeploymentCreationResult  # noqa: F401
+
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    portfolio.mandate_candidates = lambda: [
+        ("strat-a", "NSE:NIFTY", SimpleNamespace(timeframe="1d")),
+        ("strat-b", "NSE:NIFTY", SimpleNamespace(timeframe="1d")),
+    ]
+    portfolio._create_deployment_for_mandate = lambda s, sym, sp: (None, "failure")
+
+    assert portfolio._create_portfolio_deployment() is None
+    reasons = [a.reason for a in portfolio.actions]
+    assert any(r and r.startswith("portfolio_deployment_failed") for r in reasons), (
+        f"all candidates rejected must fail closed: {reasons}"
+    )
+
+
+def test_no_candidates_fails_closed():
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    portfolio.mandate_candidates = lambda: []
+
+    assert portfolio._create_portfolio_deployment() is None
+    assert any(
+        a.reason == "no_eligible_strategy_for_portfolio_mandate"
+        for a in portfolio.actions
+    )
+
+
 # ---------------------------------------------------------------------------
 # 10b. Existing behaviour does not regress
 # ---------------------------------------------------------------------------

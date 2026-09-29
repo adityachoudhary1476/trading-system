@@ -445,8 +445,21 @@ class AutonomousPortfolio:
     # ------------------------------------------------------------------ #
     # Account (one portfolio deployment + paper session)
     # ------------------------------------------------------------------ #
+    #: Statuses that can never return to ACTIVE (see ``_VALID_TRANSITIONS`` in
+    #: ``paper/control.py``: ``FAILED`` has an empty transition set). Latching
+    #: onto such a deployment would brick the portfolio permanently --
+    #: ``ensure_account`` would retry the same dead deployment every tick and
+    #: fail closed forever, stranding every open position with no risk path.
+    UNRECOVERABLE_DEPLOYMENT_STATUSES = frozenset({"failed"})
+
     def find_portfolio_deployment(self):
-        """Return this bot's portfolio deployment, or None."""
+        """Return this bot's recoverable portfolio deployment, or None.
+
+        Terminal/unrecoverable deployments (currently ``FAILED``) are skipped so
+        that ``ensure_account`` provisions a fresh deployment instead of
+        retrying a dead one. Non-terminal statuses (``STOPPED``/``PAUSED``/
+        ``CREATED``) are still returned -- ``ensure_account`` re-activates those.
+        """
         try:
             deployments = self.controller.control_center.list_deployments()
         except Exception:  # noqa: BLE001
@@ -456,18 +469,21 @@ class AutonomousPortfolio:
                 continue
             if not (dep.notes or "").startswith(f"bot:{self.bot_id}"):
                 continue
+            status = getattr(dep, "status", None)
+            status_value = getattr(status, "value", status)
+            if str(status_value or "").lower() in self.UNRECOVERABLE_DEPLOYMENT_STATUSES:
+                continue
             return dep
         return None
 
-    def mandate_strategy(self):
-        """Resolve the ``(strategy_id, symbol, spec)`` mandate for the portfolio.
+    def mandate_candidates(self):
+        """Return every usable ``(strategy_id, symbol, spec)`` mandate, best first.
 
-        The portfolio deployment is the *container* for the paper account, but
-        it is still created through the existing deployment gate — so it must
-        bind to a real, non-retired strategy with the required evidence.
-        PAPER_APPROVED / PAPER_EXPERIMENTAL strategies are preferred and the
-        bot's allowed symbols are honoured when possible. Returns None when no
-        usable strategy exists (the caller then fails closed).
+        Whether a candidate is actually deployable is decided later by the
+        deployment gate, and the gate can reject an individual strategy
+        (retired status, missing evidence, symbol/timeframe mismatch). Callers
+        therefore need the full ordered list, not just the first hit -- a single
+        rejected strategy must never be able to brick the portfolio.
         """
         center = self.controller.control_center
         allowed = set(
@@ -492,14 +508,35 @@ class AutonomousPortfolio:
                 pass
 
         if not candidates:
-            return None
+            return []
 
         preferred = [c for c in candidates if not allowed or c[1] in allowed]
+        ordered: list[tuple[str, str, Any]] = []
+        seen: set[str] = set()
         for strategy_id, symbol in preferred + candidates:
+            if strategy_id in seen:
+                continue
             spec = lookup_strategy_spec(center, strategy_id)
-            if spec is not None:
-                return strategy_id, symbol, spec
-        return None
+            if spec is None:
+                continue
+            seen.add(strategy_id)
+            ordered.append((strategy_id, symbol, spec))
+        return ordered
+
+    def mandate_strategy(self):
+        """Resolve the single best ``(strategy_id, symbol, spec)`` mandate.
+
+        The portfolio deployment is the *container* for the paper account, but
+        it is still created through the existing deployment gate — so it must
+        bind to a real, non-retired strategy with the required evidence.
+        PAPER_APPROVED / PAPER_EXPERIMENTAL strategies are preferred and the
+        bot's allowed symbols are honoured when possible. Returns None when no
+        usable strategy exists (the caller then fails closed).
+
+        Prefer :meth:`mandate_candidates` when actually creating a deployment.
+        """
+        ordered = self.mandate_candidates()
+        return ordered[0] if ordered else None
 
     def _discover_approved_strategies(self) -> list[Any]:
         from trading_system.research.phase23.discovery import Phase23Discovery
@@ -565,21 +602,56 @@ class AutonomousPortfolio:
 
 
     def _create_portfolio_deployment(self):
-        """Create the single portfolio deployment through the existing gate."""
-        from trading_system.paper.deployment import (
-            DEFAULT_STOP_LOSS_PCT,
-            DEFAULT_TAKE_PROFIT_PCT,
-            PaperDeploymentConfig,
-        )
+        """Create the single portfolio deployment through the existing gate.
 
-        resolved = self.mandate_strategy()
-        if resolved is None:
+        Tries each eligible mandate in turn. The gate is the authority on
+        deployability and can reject an individual strategy, so a single
+        rejection must not brick the portfolio: the next candidate gets a
+        chance, and only exhausting every candidate fails closed.
+        """
+        candidates = self.mandate_candidates()
+        if not candidates:
             self.record_action(
                 PortfolioActionType.FAIL_CLOSED,
                 reason="no_eligible_strategy_for_portfolio_mandate",
             )
             return None
-        strategy_id, symbol, spec = resolved
+
+        last_reason = ""
+        for index, (strategy_id, symbol, spec) in enumerate(candidates):
+            dep, reason = self._create_deployment_for_mandate(strategy_id, symbol, spec)
+            if dep is not None:
+                if index:
+                    self.record_action(
+                        PortfolioActionType.STARTED,
+                        symbol=symbol,
+                        strategy_id=strategy_id,
+                        reason="portfolio_mandate_fallback",
+                        detail=(
+                            f"created after {index} rejected mandate(s); "
+                            f"first_rejection={last_reason}"
+                        ),
+                    )
+                return dep
+            last_reason = f"{strategy_id}:{reason}"
+
+        self.record_action(
+            PortfolioActionType.FAIL_CLOSED,
+            reason=f"portfolio_deployment_failed:{last_reason}",
+        )
+        return None
+
+    def _create_deployment_for_mandate(self, strategy_id, symbol, spec):
+        """Attempt deployment creation for one ``(strategy_id, symbol, spec)``.
+
+        Returns ``(deployment_or_None, reason)``. Failures are reported back to
+        the caller rather than raised, so it can fall back to another mandate.
+        """
+        from trading_system.paper.deployment import (
+            DEFAULT_STOP_LOSS_PCT,
+            DEFAULT_TAKE_PROFIT_PCT,
+            PaperDeploymentConfig,
+        )
 
         config = PaperDeploymentConfig(
             execution_mode="paper",
@@ -611,15 +683,12 @@ class AutonomousPortfolio:
 
         if result == DeploymentCreationResult.DUPLICATE_DEPLOYMENT:
             # Another process created it concurrently — re-resolve.
-            return self.find_portfolio_deployment()
+            return self.find_portfolio_deployment(), "duplicate"
         if result != DeploymentCreationResult.SUCCESS or dep is None:
-            self.record_action(
-                PortfolioActionType.FAIL_CLOSED,
-                symbol=symbol,
-                strategy_id=strategy_id,
-                reason=f"portfolio_deployment_failed:{result.value}",
-            )
-            return None
+            # Reported to the caller so it can try the next mandate; only an
+            # exhaustion of all candidates is recorded as FAIL_CLOSED.
+            reason = getattr(result, "value", str(result))
+            return None, reason
 
         self.record_action(
             PortfolioActionType.STARTED,
@@ -628,7 +697,7 @@ class AutonomousPortfolio:
             reason="portfolio_account_provisioned",
             detail=f"deployment={dep.deployment_id}",
         )
-        return self.find_portfolio_deployment() or dep
+        return self.find_portfolio_deployment() or dep, "created"
 
     def on_start(self) -> Optional[str]:
         """Called when the operator starts the autonomous bot."""
@@ -927,8 +996,6 @@ class AutonomousPortfolio:
                 return "strategy_reversal_signal"
         return None
 
-
-
     @staticmethod
     def _underlying_symbol(position_symbol: str) -> str:
         """Best-effort underlying for an exit decision (options need CE/PE)."""
@@ -984,9 +1051,14 @@ class AutonomousPortfolio:
         *,
         spot_price: float,
         opportunity_by_strategy: dict,
-        session_id: str,
+        session_id: Optional[str],
     ) -> list[dict[str, Any]]:
-        """Manage/close open positions. Returns one result dict per position."""
+        """Manage/close open positions. Returns one result dict per position.
+
+        ``session_id`` is accepted for call-site clarity but resolution actually
+        goes through ``_runner()`` (see the ``session_id`` property), so exits
+        still work when the tick could not provision a fresh account.
+        """
         results: list[dict[str, Any]] = []
         config = self._deployment_config()
         if self._runner() is None:
@@ -1408,13 +1480,25 @@ class AutonomousPortfolio:
         regime = self._classify_regime(df)
 
         session_id = self.ensure_account()
-        if session_id is None:
+        provisioning_failed = session_id is None
+        if provisioning_failed:
             self.record_action(
                 PortfolioActionType.DATA_UNAVAILABLE,
                 reason="portfolio_account_unavailable",
             )
-            self._publish_snapshot(now=started_at)
-            return {**base, "result": "skip", "reason": "portfolio_account_unavailable"}
+            # Risk exits must NOT be blocked by account provisioning. Losing the
+            # ability to open new trades must never mean losing the ability to
+            # close existing risk. If an existing deployment/session can still
+            # be resolved, keep managing open positions and only gate entries.
+            session_id = self.session_id
+            if session_id is None:
+                # Nothing to manage against -- genuinely cannot act.
+                self._publish_snapshot(now=started_at)
+                return {
+                    **base,
+                    "result": "skip",
+                    "reason": "portfolio_account_unavailable",
+                }
 
         marks = self.refresh_marks()
 
@@ -1454,7 +1538,14 @@ class AutonomousPortfolio:
         )
 
         entries: list[dict[str, Any]] = []
-        if regime_reason:
+        if provisioning_failed:
+            self.record_action(
+                PortfolioActionType.SIGNAL_REJECTED,
+                symbol=symbol,
+                reason="portfolio_account_unavailable",
+                detail="no new entries while the portfolio account is unavailable",
+            )
+        elif regime_reason:
             self.record_action(
                 PortfolioActionType.SIGNAL_REJECTED,
                 symbol=symbol,
