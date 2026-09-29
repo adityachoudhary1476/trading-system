@@ -19,6 +19,7 @@ from trading_system.autonomous import (
     PortfolioActionType,
     StrategyOpportunity,
 )
+from trading_system.autonomous.events import AutonomousEventType
 
 
 UTC = timezone.utc
@@ -91,6 +92,15 @@ class FakeEventLog:
 
     def record(self, *args, **kwargs):
         self.recorded.append(kwargs)
+        # Mirror AutonomousEventLog: the event lands in ``events`` so the
+        # controller's rejection_reason_since() can read it back.
+        event_type = args[0] if args else kwargs.get("event_type")
+        self.events.append(
+            SimpleNamespace(
+                event_type=event_type,
+                message=kwargs.get("message", ""),
+            )
+        )
 
 
 class FakeControlCenter:
@@ -162,6 +172,28 @@ class FakeController:
         """
         self.execution_calls.append(kwargs)
         return self._execution_result(kwargs)
+
+    # Mirror the real controller's execution-rejection introspection so the
+    # portfolio reads a real rejection message instead of an empty detail.
+    _EXECUTION_REJECTION_EVENT_TYPES = frozenset(
+        {
+            AutonomousEventType.ERROR,
+            AutonomousEventType.POLICY_VIOLATION,
+            AutonomousEventType.DECISION_REJECTED,
+        }
+    )
+
+    def execution_attempt_mark(self):
+        return len(self.event_log.events)
+
+    def rejection_reason_since(self, mark):
+        for event in reversed(self.event_log.events[max(0, int(mark)):]):
+            if (
+                event.event_type in self._EXECUTION_REJECTION_EVENT_TYPES
+                and event.message
+            ):
+                return event.message
+        return ""
 
     def _execution_result(self, kwargs):
         """FILLED for NIFTY entries; None otherwise (fail-closed on anything else)."""
@@ -679,6 +711,129 @@ def test_exit_submits_against_real_underlying_not_broker_token():
         "instrument from this and rejects opaque tokens"
     )
     assert "NSE_FO" not in underlying
+
+
+# ---------------------------------------------------------------------------
+# 11b. A refused exit records WHY (the production no-sell diagnosis)
+# ---------------------------------------------------------------------------
+
+
+def test_refused_exit_records_the_rejection_reason_not_an_empty_detail():
+    """``exit_fail_closed`` must name the cause.
+
+    ``execute_option_order`` signals refusal with ``None`` and no reason, so the
+    action used to be persisted with an empty ``detail``. That is what made the
+    production no-sell undiagnosable: the log said only that the exit failed
+    closed, never why. The controller records a descriptive rejection event, so
+    the portfolio must read it back and store it.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    broker = controller.control_center._broker
+    broker.add_position(
+        PROD_PE["symbol"],
+        options_contract_id=PROD_PE["options_contract_id"],
+        option_type=PROD_PE["option_type"],
+        avg_entry_price=199.06615,
+        current_price=150.0,  # well past the stop loss -> exit is attempted
+        qty=PROD_PE["qty"],
+    )
+    pos = broker.positions()[PROD_PE["symbol"]]
+    pos.strike = PROD_PE["strike"]
+    pos.expiry = PROD_PE["expiry"]
+    pos.contract_size = PROD_PE["contract_size"]
+    portfolio._set_attribution(
+        PROD_PE["options_contract_id"], PROD_PE["symbol"], "strat-vwap"
+    )
+
+    def _refuse(kwargs):
+        # Exactly what the real controller does on a refused exit: record a
+        # descriptive rejection event, then return None.
+        controller.event_log.record(
+            AutonomousEventType.ERROR,
+            symbol="NSE:NIFTY50",
+            message=(
+                "exit rejected: could not resolve instrument for existing position"
+            ),
+        )
+        return None
+
+    controller._execution_result = _refuse
+    results = portfolio.exit_positions(
+        spot_price=22_780.25, opportunity_by_strategy={}, session_id="sess-1"
+    )
+
+    assert results and results[0]["result"] == "rejected"
+    assert results[0]["reason"] == "exit_fail_closed"
+    assert results[0]["detail"] == (
+        "exit rejected: could not resolve instrument for existing position"
+    )
+    fail_closed = [
+        a for a in portfolio.actions if a.action == PortfolioActionType.FAIL_CLOSED
+    ]
+    assert fail_closed, "a refused exit must record a FAIL_CLOSED action"
+    assert fail_closed[-1].reason == "exit_fail_closed"
+    assert fail_closed[-1].detail == (
+        "exit rejected: could not resolve instrument for existing position"
+    ), (
+        "detail must carry the controller's rejection reason; got "
+        f"{fail_closed[-1].detail!r}"
+    )
+
+
+def test_rejection_reason_ignores_events_from_earlier_attempts():
+    """Only events from THIS attempt may be read, or a stale cause is reported.
+
+    The event log is cumulative, so reading "the last rejection" without a mark
+    surfaces the previous tick's message and misattributes the failure.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    broker = controller.control_center._broker
+    broker.add_position(
+        PROD_PE["symbol"],
+        options_contract_id=PROD_PE["options_contract_id"],
+        option_type=PROD_PE["option_type"],
+        avg_entry_price=199.06615,
+        current_price=150.0,
+        qty=PROD_PE["qty"],
+    )
+    pos = broker.positions()[PROD_PE["symbol"]]
+    pos.strike = PROD_PE["strike"]
+    pos.expiry = PROD_PE["expiry"]
+    pos.contract_size = PROD_PE["contract_size"]
+    portfolio._set_attribution(
+        PROD_PE["options_contract_id"], PROD_PE["symbol"], "strat-vwap"
+    )
+
+    # An unrelated rejection from earlier in the same process.
+    controller.event_log.record(
+        AutonomousEventType.ERROR, symbol="X", message="exit quote stale: age=900s"
+    )
+
+    def _refuse(kwargs):
+        controller.event_log.record(
+            AutonomousEventType.ERROR,
+            symbol="NSE:NIFTY50",
+            message="option execution skipped: no active session/deployment for broker",
+        )
+        return None
+
+    controller._execution_result = _refuse
+    portfolio.exit_positions(
+        spot_price=22_780.25, opportunity_by_strategy={}, session_id="sess-1"
+    )
+
+    fail_closed = [
+        a for a in portfolio.actions if a.action == PortfolioActionType.FAIL_CLOSED
+    ]
+    assert fail_closed[-1].detail == (
+        "option execution skipped: no active session/deployment for broker"
+    ), (
+        "must not report a stale reason from an earlier attempt; got "
+        f"{fail_closed[-1].detail!r}"
+    )
+    assert "age=900s" not in fail_closed[-1].detail
 
 
 # 12. Deployment / mandate recovery (the "bricks forever" traps)

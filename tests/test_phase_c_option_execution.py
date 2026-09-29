@@ -63,6 +63,7 @@ from trading_system.autonomous.bot_config import (
     UserConstraints,
 )
 from trading_system.autonomous.controller import AutonomousController
+from trading_system.autonomous.events import AutonomousEventType
 from trading_system.autonomous.coordinator import (
     AutonomousDeploymentCoordinator,
     DeploymentCreationResult,
@@ -2106,3 +2107,60 @@ class TestSlTpRequiresAFreshMark:
         assert _open_positions(runner) == {}
         # And no live order endpoint was hit (Upstox/FYERS) — there is no
         # network code path inside execute_option_order.
+
+class TestExecutionRejectionIntrospection:
+    """The real controller must be able to explain a refused execution.
+
+    ``execute_option_order`` returns ``None`` for every rejection and puts the
+    cause only in the event log, so the portfolio could not tell *why* an exit
+    failed closed. These tests pin the real ``rejection_reason_since`` contract:
+    read only events from the marked attempt, so a stale cause is never
+    reported.
+    """
+
+    @staticmethod
+    def _controller():
+        center, _registry, _intelligence, _gate, _spec, _sid = _build_control_center()
+        return _build_controller(center, bot_id="bot-reject-introspect")
+
+    def test_mark_then_rejection_reason_returns_that_attempt_only(self):
+        controller = self._controller()
+
+        controller._record_event(
+            AutonomousEventType.ERROR, message="exit quote stale: age=900s (earlier)"
+        )
+
+        mark = controller.execution_attempt_mark()
+        controller._record_event(
+            AutonomousEventType.ERROR,
+            message="failed to fetch exit premium for NSE:NIFTY50|2026-10-06|22800|PE",
+        )
+
+        reason = controller.rejection_reason_since(mark)
+        assert "failed to fetch exit premium" in reason
+        assert "age=900s" not in reason, "must not surface a stale earlier cause"
+
+    def test_no_rejection_event_returns_empty_string(self):
+        """An attempt that recorded no rejection must NOT inherit an old cause.
+
+        This is the case that distinguishes a mark-aware implementation from one
+        that just reads the last rejection in the log: a stale ERROR sitting
+        before the mark must not be reported as this attempt's reason.
+        """
+        controller = self._controller()
+
+        controller._record_event(
+            AutonomousEventType.ERROR, message="exit quote stale: age=900s (earlier)"
+        )
+
+        mark = controller.execution_attempt_mark()
+        # This attempt recorded no rejection event of its own.
+        controller._record_event(AutonomousEventType.DECISION_CREATED, message="ok")
+
+        assert controller.rejection_reason_since(mark) == "", (
+            "must report no cause rather than a stale earlier rejection"
+        )
+
+    def test_a_fresh_process_has_no_rejection_reason(self):
+        controller = self._controller()
+        assert controller.rejection_reason_since(controller.execution_attempt_mark()) == ""

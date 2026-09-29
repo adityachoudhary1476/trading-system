@@ -146,6 +146,20 @@ def _resolve_option_order_side(
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# Event types that explain a refused execution attempt. Used only for
+# introspection (see AutonomousController.rejection_reason_since); every
+# rejection site in execute_option_order already records one of these.
+# --------------------------------------------------------------------------- #
+_EXECUTION_REJECTION_EVENT_TYPES = frozenset(
+    {
+        AutonomousEventType.ERROR,
+        AutonomousEventType.POLICY_VIOLATION,
+        AutonomousEventType.DECISION_REJECTED,
+    }
+)
+
+
 class AutonomousController(BaseModel):
     """Phase 1 Autonomous Controller — lifecycle/orchestration skeleton.
 
@@ -308,6 +322,38 @@ class AutonomousController(BaseModel):
             self._event_log.record(event_type, **kwargs)
         except Exception:
             pass
+
+    # ------------------------------------------------------------------ #
+    # Execution-rejection introspection
+    # ------------------------------------------------------------------ #
+
+    def execution_attempt_mark(self) -> int:
+        """Snapshot the event log so a later call can explain one execution attempt.
+
+        ``execute_option_order`` signals every rejection with ``return None``,
+        so a caller has no way to tell *why* it refused. Each rejection already
+        records a descriptive event, but the log is cumulative: reading "the
+        last rejection" after the fact can surface a stale message from an
+        earlier tick. Take this mark before the attempt and pass it to
+        :meth:`rejection_reason_since` to read only what that attempt recorded.
+        """
+        return len(self._event_log.events)
+
+    def rejection_reason_since(self, mark: int) -> str:
+        """Why the execution attempt after ``mark`` was refused, or ``''``.
+
+        Returns the message of the most recent rejection event recorded by that
+        attempt. ``''`` means the attempt recorded no rejection event, so the
+        caller should not claim a cause it cannot evidence.
+        """
+        events = self._event_log.events
+        for event in reversed(events[max(0, int(mark)):]):
+            if (
+                event.event_type in _EXECUTION_REJECTION_EVENT_TYPES
+                and event.message
+            ):
+                return event.message
+        return ""
 
     # ------------------------------------------------------------------ #
     # Lifecycle transitions

@@ -1046,6 +1046,33 @@ class AutonomousPortfolio:
             return from_contract
         return cls._underlying_symbol(getattr(position, "symbol", ""))
 
+    def _execution_attempt_mark(self) -> Optional[int]:
+        """Event-log mark for the next execution attempt, or None if unsupported.
+
+        Defensive on purpose: the portfolio is driven by test doubles as well
+        as the real controller, and a double without introspection support must
+        degrade to the old empty-detail behaviour rather than raise.
+        """
+        mark = getattr(self.controller, "execution_attempt_mark", None)
+        if not callable(mark):
+            return None
+        try:
+            return int(mark())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _rejection_reason_since(self, mark: Optional[int]) -> str:
+        """Rejection message recorded by the attempt taken after ``mark``."""
+        if mark is None:
+            return ""
+        reason = getattr(self.controller, "rejection_reason_since", None)
+        if not callable(reason):
+            return ""
+        try:
+            return str(reason(mark) or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
     def exit_positions(
         self,
         *,
@@ -1111,6 +1138,7 @@ class AutonomousPortfolio:
                 reference_price=spot_price,
                 option_type=option_type,
             )
+            _mark = self._execution_attempt_mark()
             result = self.controller.execute_option_order(
                 decision=exit_decision,
                 spot_price=spot_price,
@@ -1128,6 +1156,13 @@ class AutonomousPortfolio:
                     else "exit_fail_closed"
                 )
                 detail = str(getattr(result, "reject_reason", "") or "")
+                if not detail:
+                    # execute_option_order signals refusal with None and no
+                    # reason, so the action was previously logged with an empty
+                    # detail -- the reason existed only in the event log. Read
+                    # back just the events this attempt recorded so the stored
+                    # detail names the actual cause instead of "exit_fail_closed".
+                    detail = self._rejection_reason_since(_mark)
                 self.record_action(
                     PortfolioActionType.FAIL_CLOSED,
                     symbol=symbol,
