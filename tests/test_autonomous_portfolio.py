@@ -559,6 +559,128 @@ def test_exit_stop_loss_uses_paper_path_and_records_pnl():
 
 
 # ---------------------------------------------------------------------------
+# 11. Exit order resolves the real underlying (production no-sell bug)
+# ---------------------------------------------------------------------------
+
+# Values lifted verbatim from the production portfolio snapshot that exhibited
+# the bug: broker position symbols are opaque Upstox instrument tokens, while
+# the canonical contract id names the real underlying.
+PROD_PE = {
+    "symbol": "NSE:NSE_FO|40716",
+    "options_contract_id": "NSE:NIFTY50|2026-10-06|22800|PE",
+    "option_type": "PE",
+    "strike": 22800.0,
+    "expiry": "2026-10-06",
+    "contract_size": 65,
+    "qty": 2.0,
+}
+PROD_CE = {
+    "symbol": "NSE:NSE_FO|40712",
+    "options_contract_id": "NSE:NIFTY|2026-10-06|22750|CE",
+    "option_type": "CE",
+    "strike": 22750.0,
+    "expiry": "2026-10-06",
+    "contract_size": 65,
+    "qty": 1.0,
+}
+
+
+def test_underlying_symbol_cannot_parse_a_broker_token():
+    """Documents the root cause: the old heuristic passes tokens straight through."""
+    assert AutonomousPortfolio._underlying_symbol("NSE:NSE_FO|40716") == "NSE:NSE_FO|40716"
+    # The controller then splits on ":" and resolves against "NSE_FO|40716".
+    assert "NSE_FO|40716".split(":")[-1] == "NSE_FO|40716"
+
+
+def test_underlying_is_recovered_from_contract_id():
+    assert (
+        AutonomousPortfolio._underlying_from_contract_id(PROD_PE["options_contract_id"])
+        == "NSE:NIFTY50"
+    )
+    assert (
+        AutonomousPortfolio._underlying_from_contract_id(PROD_CE["options_contract_id"])
+        == "NSE:NIFTY"
+    )
+
+
+def test_underlying_from_contract_id_refuses_to_guess():
+    """A bare id has no exchange/underlying split -- must not be fabricated."""
+    assert AutonomousPortfolio._underlying_from_contract_id("") is None
+    assert AutonomousPortfolio._underlying_from_contract_id(None) is None
+    assert AutonomousPortfolio._underlying_from_contract_id("NIFTY_CE_1") is None
+    assert AutonomousPortfolio._underlying_from_contract_id("|2026-01-29|25000|CE") is None
+
+
+def test_resolve_underlying_prefers_contract_id_then_falls_back():
+    # Positions are attribute objects in production, not mappings.
+    pe = SimpleNamespace(symbol=PROD_PE["symbol"],
+                         options_contract_id=PROD_PE["options_contract_id"])
+    ce = SimpleNamespace(symbol=PROD_CE["symbol"],
+                         options_contract_id=PROD_CE["options_contract_id"])
+    assert AutonomousPortfolio._resolve_underlying(pe) == "NSE:NIFTY50"
+    assert AutonomousPortfolio._resolve_underlying(ce) == "NSE:NIFTY"
+    # No contract id -> legacy heuristic still handles a normal symbol.
+    assert (
+        AutonomousPortfolio._resolve_underlying(
+            SimpleNamespace(symbol="NFO:NIFTY26SEP24500CE", options_contract_id=None)
+        )
+        == "NSE:NIFTY"
+    )
+
+
+def test_exit_submits_against_real_underlying_not_broker_token():
+    """The exit order must carry a resolvable underlying symbol.
+
+    Regression guard for the production no-sell: the exit decision was built
+    with ``NSE:NSE_FO|40716``, the controller resolved the instrument against
+    the bogus ``NSE_FO|40716`` and rejected the close (``exit_fail_closed``),
+    so a detected reversal never actually sold the position.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    broker = controller.control_center._broker
+    broker.add_position(
+        PROD_PE["symbol"],
+        options_contract_id=PROD_PE["options_contract_id"],
+        option_type=PROD_PE["option_type"],
+        avg_entry_price=199.06615,
+        current_price=190.2,
+        qty=PROD_PE["qty"],
+    )
+    pos = broker.positions()[PROD_PE["symbol"]]
+    pos.strike = PROD_PE["strike"]
+    pos.expiry = PROD_PE["expiry"]
+    pos.contract_size = PROD_PE["contract_size"]
+    portfolio._set_attribution(
+        PROD_PE["options_contract_id"], PROD_PE["symbol"], "strat-vwap"
+    )
+
+    def _exit_fill(kwargs):
+        broker.close_position(PROD_PE["symbol"])
+        return SimpleNamespace(
+            status="FILLED",
+            order_id="exit-prod-1",
+            options_contract_id=PROD_PE["options_contract_id"],
+            symbol=PROD_PE["symbol"],
+            filled_quantity=PROD_PE["qty"],
+            avg_fill_price=190.2,
+        )
+
+    controller._execution_result = _exit_fill
+    results = portfolio.exit_positions(
+        spot_price=22_780.25, opportunity_by_strategy={}, session_id="sess-1"
+    )
+
+    assert results and results[0]["result"] == "exited"
+    call = controller.execution_calls[0]
+    underlying = call["decision"].opportunity_symbol
+    assert underlying == "NSE:NIFTY50", (
+        f"exit submitted against {underlying!r}; the controller resolves the "
+        "instrument from this and rejects opaque tokens"
+    )
+    assert "NSE_FO" not in underlying
+
+# ---------------------------------------------------------------------------
 # 10b. Existing behaviour does not regress
 # ---------------------------------------------------------------------------
 

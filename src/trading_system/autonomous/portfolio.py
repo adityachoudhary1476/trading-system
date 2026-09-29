@@ -939,6 +939,46 @@ class AutonomousPortfolio:
                 return f"NSE:{name}"
         return f"NSE:{raw}" if raw else "NSE:NIFTY"
 
+    @staticmethod
+    def _underlying_from_contract_id(contract_id: str) -> Optional[str]:
+        """Derive the underlying symbol from a canonical option contract id.
+
+        Canonical form is ``EXCHANGE:UNDERLYING|expiry|strike|TYPE``, e.g.
+        ``NSE:NIFTY50|2026-10-06|22800|PE``. Returns None when the id is absent
+        or not in that pipe form -- a bare id carries no exchange/underlying
+        split, so guessing would fabricate a symbol.
+        """
+        raw = str(contract_id or "").strip()
+        if "|" not in raw:
+            return None
+        head = raw.split("|", 1)[0].strip()
+        if ":" not in head:
+            return None
+        exchange, underlying = head.split(":", 1)
+        exchange = exchange.strip()
+        underlying = underlying.strip()
+        if not exchange or not underlying:
+            return None
+        return f"{exchange}:{underlying}"
+
+    @classmethod
+    def _resolve_underlying(cls, position: Any) -> str:
+        """Underlying symbol to trade an exit against.
+
+        Prefers the canonical contract id, which always names the real
+        underlying. Broker position symbols are frequently opaque instrument
+        tokens (``NSE:NSE_FO|40716``) that encode no underlying at all; feeding
+        one to the exit path made the controller resolve against
+        ``NSE_FO|40716`` and reject the close, which is why positions were
+        never sold in production. Falls back to the prefix heuristic.
+        """
+        from_contract = cls._underlying_from_contract_id(
+            getattr(position, "options_contract_id", None)
+        )
+        if from_contract:
+            return from_contract
+        return cls._underlying_symbol(getattr(position, "symbol", ""))
+
     def exit_positions(
         self,
         *,
@@ -993,7 +1033,7 @@ class AutonomousPortfolio:
             realized_before = self._realized_pnl()
             exit_decision = _buy_sell_decision(
                 decision_id=f"portfolio-exit:{contract_id or symbol}",
-                symbol=self._underlying_symbol(symbol),
+                symbol=self._resolve_underlying(position),
                 strategy_id=strategy_id or "portfolio",
                 action="sell",
                 reference_price=spot_price,
