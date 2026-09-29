@@ -893,6 +893,13 @@ def _autonomous_deployment_config():
     so a position can only ever be closed by a strategy signal — and the
     built-in strategies emit HOLD while a position is open. Thresholds come
     from the environment so an operator can retune them without a code change.
+
+    An operator may still explicitly disable a leg via the env sentinel
+    (``off``/``none``/``0``), and disabling both is permitted — that is a
+    deliberate, tested choice. Such a deployment has no per-position exit, so
+    the SL/TP sweep logs a warning whenever it finds open positions it cannot
+    act on (see ``_warn_if_no_exit_path``): the no-exit state is allowed but
+    never silent.
     """
     from trading_system.paper.deployment import PaperDeploymentConfig
 
@@ -1091,6 +1098,68 @@ def _close_option_position(
     }
 
 
+def _warn_if_no_exit_path(controller, dep, runner, positions) -> None:
+    """Log loudly when open positions have no automated exit path.
+
+    A position can only ever be closed by this sweep or by a strategy SELL,
+    and the built-in strategies are entry-only (they never emit SELL), so if
+    this sweep cannot act the position is held indefinitely. When that happens
+    silently the position just never sells, with nothing in the logs to explain
+    why. Fail-visible, never fail-open.
+    """
+    cfg = getattr(runner, "config", None)
+    if cfg is None:
+        logger.warning(
+            "SL/TP sweep cannot act on %d open position(s) for %s: runner has no "
+            "config; positions are held indefinitely (no strategy exit exists)",
+            len(positions), dep.deployment_id,
+        )
+        return
+    if cfg.stop_loss_pct is None and cfg.take_profit_pct is None:
+        logger.warning(
+            "SL/TP sweep cannot act on %d open position(s) for %s: neither "
+            "stop_loss_pct nor take_profit_pct is configured; positions are held "
+            "indefinitely (no strategy exit exists)",
+            len(positions), dep.deployment_id,
+        )
+    if not getattr(controller, "_quote_provider", None):
+        logger.warning(
+            "SL/TP sweep cannot act on %d open position(s) for %s: no quote "
+            "provider, so marks stay at entry premium and no threshold can be "
+            "reached",
+            len(positions), dep.deployment_id,
+        )
+
+
+def _warn_if_unmanaged_positions(center, dep) -> None:
+    """Log when a deployment holds open positions this sweep does not manage.
+
+    The sweep only considers option positions, so an open *equity* position is
+    invisible to it. Equity positions have their own exit path in the paper
+    runner, but if that path is ever inactive the position is held with nothing
+    to explain it. Only warns when a position actually exists, so a deployment
+    with a flat book stays quiet.
+    """
+    try:
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid) if sid is not None else None
+        if runner is None:
+            return
+        open_positions = [
+            p for p in runner.broker.positions().values()
+            if getattr(p, "qty", 0) and not getattr(p, "is_option", False)
+        ]
+    except Exception:  # noqa: BLE001
+        return
+    if open_positions:
+        logger.warning(
+            "SL/TP sweep skipped %d open non-option position(s) for %s "
+            "(%s); the SL/TP sweep only manages option positions",
+            len(open_positions), dep.deployment_id,
+            ", ".join(sorted(str(getattr(p, "symbol", "?")) for p in open_positions)),
+        )
+
+
 def _sweep_sl_tp_positions(
     controller, *, now: Optional[datetime] = None
 ) -> list[dict]:
@@ -1130,6 +1199,7 @@ def _sweep_sl_tp_positions(
                 continue
             positions = _get_open_option_positions(center, dep.deployment_id)
             if positions:
+                _warn_if_no_exit_path(controller, dep, runner, positions)
                 # Refresh the mark BEFORE evaluating thresholds: a position's
                 # current_price is only ever written as a side effect of
                 # submitting an order, so on a signal-less tick it would still
@@ -1137,16 +1207,25 @@ def _sweep_sl_tp_positions(
                 # could ever be reached.
                 underlying = dep.symbol.split(":")[-1] if ":" in dep.symbol else dep.symbol
                 try:
-                    controller.mark_option_positions_to_market(
+                    marked = controller.mark_option_positions_to_market(
                         deployment_id=dep.deployment_id,
                         underlying=underlying,
                         positions=list(positions),
                         max_age_seconds=_env_max_option_quote_age(),
                     )
+                    if marked < len(positions):
+                        logger.warning(
+                            "SL/TP mark-to-market incomplete for %s: %d/%d positions "
+                            "re-marked; an un-re-marked position keeps its entry "
+                            "premium so its threshold may never be reached",
+                            dep.deployment_id, marked, len(positions),
+                        )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "SL/TP mark-to-market failed for %s: %s", dep.deployment_id, exc
                     )
+            else:
+                _warn_if_unmanaged_positions(center, dep)
             for pos in positions:
                 if _check_sl_tp_for_position(runner, pos, ts) is None:
                     continue

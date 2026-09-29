@@ -1822,6 +1822,56 @@ class TestSlTpSweep:
 
         assert _sweep_sl_tp_positions(controller) == []
 
+    def test_sweep_warns_when_thresholds_unarmed(self, caplog):
+        """An open position with no SL/TP can never exit; the sweep must say so.
+
+        A position is only closed by this sweep or a strategy SELL, and the
+        built-in strategies are entry-only, so unarmed thresholds mean the
+        position is held forever. That must be visible in the logs, not silent.
+        """
+        import logging
+
+        controller, center, dep, execute, sweep, quotes = self._wire(
+            "bot-sweep-unarmed", sl=None, tp=None
+        )
+        opened = execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert opened["result"] == "submitted", opened
+        self._move_market(quotes, center.get_runner(
+            center.find_session_for_deployment(dep.deployment_id)), 1.10)
+
+        with caplog.at_level(logging.WARNING):
+            fired = sweep(controller)
+
+        assert fired == [], "unarmed thresholds must not fabricate an exit"
+        assert any(
+            "neither stop_loss_pct nor take_profit_pct" in r.message
+            for r in caplog.records
+        ), [r.message for r in caplog.records]
+
+    def test_sweep_silent_when_armed_and_actionable(self, caplog):
+        """A healthy sweep must stay quiet: no spurious 'cannot act' warnings."""
+        import logging
+
+        controller, center, dep, execute, sweep, quotes = self._wire("bot-sweep-quiet")
+        execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        runner = center.get_runner(center.find_session_for_deployment(dep.deployment_id))
+        self._move_market(quotes, runner, 1.02)  # within thresholds: hold
+
+        with caplog.at_level(logging.WARNING):
+            fired = sweep(controller)
+
+        assert fired == []
+        assert not [
+            r for r in caplog.records
+            if "cannot act on" in r.message or "held indefinitely" in r.message
+        ], [r.message for r in caplog.records]
+
 
 class TestSlTpSweepRunsOnEveryTick:
     """Regression: the sweep must not sit behind an early return.
