@@ -352,6 +352,11 @@ class PaperBroker(Broker):
             else:
                 pos.avg_entry_price = 0.0
             pos.qty = new_qty
+            if old_qty == 0:
+                # Age is measured from the first fill of a flat->non-flat
+                # transition, not from increases: adding to a position does
+                # not restart the clock on the capital already at risk.
+                pos.opened_at = self._now().isoformat()
         else:
             # Reducing / closing / reversing.
             closing_qty = min(abs(signed), abs(old_qty))
@@ -369,10 +374,13 @@ class PaperBroker(Broker):
                 # fully closed
                 pos.qty = 0.0
                 pos.avg_entry_price = 0.0
+                pos.opened_at = None
             elif (old_qty > 0 and remaining < 0) or (old_qty < 0 and remaining > 0):
-                # reversed: leftover is opposite side at the new price
+                # reversed: leftover is opposite side at the new price.
+                # A reversal is a brand-new position, so the age restarts.
                 pos.qty = remaining
                 pos.avg_entry_price = price
+                pos.opened_at = self._now().isoformat()
             else:
                 # partial reduce, same side remains
                 pos.qty = remaining
@@ -386,6 +394,74 @@ class PaperBroker(Broker):
 
     def positions(self) -> dict:
         return dict(self._positions)
+
+    def settle_expired_position(
+        self, symbol: str, settlement_spot: float
+    ) -> Optional[dict]:
+        """Settle an expired option contract at intrinsic value.
+
+        An expired contract cannot be closed through the normal order path:
+        the Phase 7 contract-validity check rejects any order for a contract
+        whose expiry has passed, so a market exit would be refused and the
+        position would be stranded with its capital locked up forever. This is
+        the only path that can retire such a position.
+
+        Cash and realized P&L are applied here, on the broker, because the
+        broker owns both ledgers. Settling the Position object alone would
+        leave ``self._cash`` and ``self._realized_pnl`` disagreeing with the
+        book, which is a far worse bug than the one being fixed.
+
+        Returns None (settling nothing) when the position is absent, flat, has
+        no expiry, or the settlement spot is unusable.
+        """
+        pos = self._positions.get(symbol)
+        if pos is None or pos.qty == 0:
+            return None
+        if not getattr(pos, "expiry", None):
+            return None
+        try:
+            spot = float(settlement_spot)
+        except (TypeError, ValueError):
+            return None
+        if not spot > 0 or spot != spot or spot == float("inf"):
+            return None
+
+        from ..paper_trading import settle_option_expiry
+        from ..paper_trading.option_accounting import OptionAccountingDecision
+
+        signed_qty = pos.qty
+        contract_size = int(getattr(pos, "contract_size", 1) or 1)
+        strike = float(getattr(pos, "strike", 0.0) or 0.0)
+        option_type = getattr(pos, "option_type", None) or "CE"
+        if option_type == "CE":
+            intrinsic = max(0.0, spot - strike)
+        elif option_type == "PE":
+            intrinsic = max(0.0, strike - spot)
+        else:
+            return None
+
+        realized_before = pos.realized_pnl
+        verdict = settle_option_expiry(pos, spot)
+        if verdict != OptionAccountingDecision.ALLOW:
+            return None
+        realized = pos.realized_pnl - realized_before
+
+        # A long receives intrinsic value; a short pays it to be relieved of
+        # the obligation. Mirrors the sign convention used by _apply_fill_to_book.
+        cash_delta = (1.0 if signed_qty > 0 else -1.0) * intrinsic * abs(
+            signed_qty
+        ) * contract_size
+        self._cash += cash_delta
+        self._realized_pnl += realized
+
+        return {
+            "symbol": symbol,
+            "quantity": signed_qty,
+            "settlement_spot": spot,
+            "intrinsic_price": intrinsic,
+            "realized_pnl": realized,
+            "cash_delta": cash_delta,
+        }
 
     # -- capital management (paper-only) --------------------------------------
     def add_capital(self, amount: float) -> float:

@@ -1187,8 +1187,58 @@ class TestSchedulerOptionExit:
         assert flat_rec.qty == 0.0
         assert flat_rec.avg_entry_price == 0.0
 
+    def test_exit_ignores_entry_only_policy_that_would_strand_capital(self):
+        """Entry-time policy must not decide whether capital may leave.
+
+        ``allowed_option_types`` and the per-trade contract cap constrain
+        *entries*. Applying them to the exit leg means a config change made
+        after a position was opened can make that position permanently
+        unexitable -- the capital is stranded with no rule that can free it.
+        """
+        from trading_system.paper.deployment import PaperDeploymentRecord
+
+        controller, center, dep, execute = self._wire("bot-exit-policy-carveout")
+
+        opened = execute(
+            controller, _make_decision(option_intent="CE"),
+            spot_price=25000.0, target_qty=1,
+        )
+        assert opened["result"] == "submitted", opened
+
+        sid = center.find_session_for_deployment(dep.deployment_id)
+        runner = center.get_runner(sid)
+        assert _open_positions(runner), "expected an open position after BUY"
+
+        # Persist the hostile config the way an operator edit would. Every
+        # call re-reads deployments from the database and rebuilds the config
+        # from ``config_json``, so mutating a returned Python object would
+        # prove nothing.
+        with center.registry.store._Session() as s:
+            rec = s.get(PaperDeploymentRecord, dep.deployment_id)
+            config_data = _json.loads(rec.config_json or "{}")
+            config_data["allowed_option_types"] = ["PE"]  # held position is CE
+            config_data["max_options_contracts_per_trade"] = 0
+            rec.config_json = _json.dumps(config_data)
+            rec.allowed_option_types_json = '["PE"]'
+            rec.max_options_contracts_per_trade = 0
+            s.commit()
+
+        closed = execute(
+            controller,
+            _make_decision(action="exit", option_intent=None, decision_id="exit-carveout"),
+            spot_price=25000.0, target_qty=1,
+        )
+
+        assert closed["result"] == "submitted", (
+            "entry-only policy blocked an exit and stranded capital: "
+            f"{closed}"
+        )
+        assert _open_positions(runner) == {}, (
+            f"position still open after EXIT: "
+            f"{ {k: v.qty for k, v in _open_positions(runner).items()} }"
+        )
+
     def test_sell_without_option_intent_closes_position(self):
-        """SELL must not require option_intent — the contract is known."""
         controller, center, dep, execute = self._wire("bot-sched-sell-nointent")
 
         opened = execute(

@@ -9,7 +9,7 @@ are faked; no real credentials or network access is required. PAPER-only.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -70,15 +70,59 @@ class FakeBroker:
                 (kwargs.get("current_price", entry) - entry) * kwargs.get("qty", 1.0),
             ),
             market_value=kwargs.get("market_value", 0.0),
+            realized_pnl=kwargs.get("realized_pnl", 0.0),
             options_contract_id=kwargs.get("options_contract_id"),
             option_type=kwargs.get("option_type"),
             strike=kwargs.get("strike"),
             expiry=kwargs.get("expiry"),
             contract_size=kwargs.get("contract_size", 1),
             underlying=kwargs.get("underlying", "NIFTY"),
+            opened_at=kwargs.get("opened_at"),
         )
+        # Mirrors Position.holding_seconds so the time-stop path is exercised
+        # through the same call shape production uses.
+        def _holding_seconds(now=None):
+            if not pos.opened_at:
+                return None
+            opened = datetime.fromisoformat(pos.opened_at)
+            if opened.tzinfo is None:
+                opened = opened.replace(tzinfo=timezone.utc)
+            return max(0.0, ((now or datetime.now(timezone.utc)) - opened).total_seconds())
+
+        pos.holding_seconds = _holding_seconds
         self._positions[symbol] = pos
         return pos
+
+    def settle_expired_position(self, symbol, settlement_spot):
+        """Settle at intrinsic value, mirroring the real broker's accounting."""
+        pos = self._positions.get(symbol)
+        if pos is None or pos.qty == 0 or not pos.expiry:
+            return None
+        if not settlement_spot or settlement_spot <= 0:
+            return None
+        if pos.option_type == "CE":
+            intrinsic = max(0.0, settlement_spot - (pos.strike or 0.0))
+        elif pos.option_type == "PE":
+            intrinsic = max(0.0, (pos.strike or 0.0) - settlement_spot)
+        else:
+            return None
+        realized = (intrinsic - pos.avg_entry_price) * pos.qty * pos.contract_size
+        cash_delta = (1.0 if pos.qty > 0 else -1.0) * intrinsic * abs(pos.qty) * pos.contract_size
+        signed_qty = pos.qty
+        self.account_obj.realized_pnl += realized
+        self.account_obj.cash += cash_delta
+        pos.realized_pnl += realized
+        pos.qty = 0.0
+        pos.avg_entry_price = 0.0
+        pos.opened_at = None
+        return {
+            "symbol": symbol,
+            "quantity": signed_qty,
+            "settlement_spot": settlement_spot,
+            "intrinsic_price": intrinsic,
+            "realized_pnl": realized,
+            "cash_delta": cash_delta,
+        }
 
     def close_position(self, symbol):
         """Remove the position, like a real PaperBroker exit fill."""
@@ -218,6 +262,19 @@ def make_portfolio(controller, **kwargs):
     runner = SimpleNamespace(broker=controller.control_center._broker)
     controller.control_center._runner = runner
     return AutonomousPortfolio(controller, **kwargs)
+
+
+def _future_expiry(days: int = 30) -> str:
+    """An expiry safely in the future, so tests do not rot as the clock moves.
+
+    Expiry is an exit trigger, so any test that wants a *different* reason to
+    fire must not accidentally hand it an already-expired contract.
+    """
+    return (datetime.now(timezone.utc) + timedelta(days=days)).date().isoformat()
+
+
+def _past_expiry(days: int = 1) -> str:
+    return (datetime.now(timezone.utc) - timedelta(days=days)).date().isoformat()
 
 
 def opportunity(strategy_id, direction, score=0.5):
@@ -561,7 +618,10 @@ def test_exit_stop_loss_uses_paper_path_and_records_pnl():
         qty=1.0,
     )
     pos.strike = 25000.0
-    pos.expiry = "2026-01-29"
+    # A live contract. Expiry is now its own exit trigger and is evaluated
+    # before price thresholds, so a past-dated position here would report
+    # "expired" and this test would no longer cover the stop-loss path.
+    pos.expiry = _future_expiry()
     portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
 
     def _exit_fill(kwargs):
@@ -1075,3 +1135,348 @@ def test_portfolio_snapshot_is_persisted_for_cross_process_reads():
     # A fresh portfolio instance in another process reads the same state.
     other = AutonomousPortfolio(controller, persistence=store)
     assert other.read_snapshot()["pnl"]["unrealized"] == pytest.approx(800.0)
+
+
+# --------------------------------------------------------------------- #
+# Strategy-independent exits
+# --------------------------------------------------------------------- #
+
+
+def _hold(controller, **kwargs):
+    """An open option position owned by a strategy that has gone silent."""
+    broker = controller.control_center._broker
+    pos = broker.add_position(
+        kwargs.pop("symbol", "NFO:NIFTY_CE_1"),
+        options_contract_id="NIFTY_CE_1",
+        option_type="CE",
+        strike=25000.0,
+        **kwargs,
+    )
+    return pos
+
+
+def _set_time_stop(monkeypatch, seconds: float) -> None:
+    """Enable the strategy-independent time stop.
+
+    Deliberately an environment variable, not a ``PaperDeploymentConfig``
+    field: ``deployment_identity`` hashes the whole config, so a new field
+    would change the id of every existing deployment and orphan its session,
+    book and open positions.
+    """
+    monkeypatch.setenv("AUTONOMOUS_MAX_HOLDING_SECONDS", str(seconds))
+
+
+def _stub_exit_fill(controller):
+    """Accept any exit order as filled, and actually close the position.
+
+    The default fake refuses to fill anything it did not itself create, so an
+    exit test that wants to assert *why* an exit fired has to opt into a fill.
+    """
+    broker = controller.control_center._broker
+
+    def _fill(kwargs):
+        symbol = kwargs.get("symbol", "")
+        broker.account_obj.realized_pnl += 0.0
+        broker.close_position(symbol)
+        return SimpleNamespace(
+            status="FILLED",
+            order_id="exit-1",
+            options_contract_id="NIFTY_CE_1",
+            symbol=symbol,
+            filled_quantity=1.0,
+            avg_fill_price=kwargs.get("current_price", 100.0),
+        )
+
+    controller._execution_result = _fill
+
+
+def test_time_stop_exits_a_position_whose_strategy_went_quiet(monkeypatch):
+    """The core failure this fixes.
+
+    Before, a position could only be closed by its owning strategy. When that
+    strategy stopped producing opportunities the position stayed open forever
+    with no SL/TP configured. The time stop closes it regardless.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _set_time_stop(monkeypatch, 3600.0)
+
+    _hold(
+        controller,
+        avg_entry_price=100.0,
+        current_price=100.0,
+        opened_at=(datetime.now(timezone.utc) - timedelta(hours=2)).isoformat(),
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # No stop_loss_pct / take_profit_pct, and NO opportunities at all.
+    _stub_exit_fill(controller)
+    results = portfolio.exit_positions(
+        spot_price=25_000.0, opportunity_by_strategy={}, session_id="sess-1"
+    )
+
+    assert results and results[0]["result"] == "exited"
+    assert results[0]["reason"] == "time_stop"
+
+
+def test_time_stop_does_not_fire_early(monkeypatch):
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _set_time_stop(monkeypatch, 3600.0)
+
+    _hold(
+        controller,
+        avg_entry_price=100.0,
+        current_price=100.0,
+        opened_at=(datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(),
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # A matching, non-exiting opinion, so the strategy rule stays silent and
+    # only the time stop could have decided.
+    results = portfolio.exit_positions(
+        spot_price=25_000.0,
+        opportunity_by_strategy={"momentum": opportunity("momentum", 1)},
+        session_id="sess-1",
+    )
+
+    assert results == []
+
+
+def test_time_stop_is_inert_when_disabled():
+    """Default None means opt-in, not a new silent default behaviour."""
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _hold(
+        controller,
+        avg_entry_price=100.0,
+        current_price=100.0,
+        opened_at=(datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # A matching, non-exiting opinion, so the strategy rule is silent and only
+    # the time stop could have decided.
+    results = portfolio.exit_positions(
+        spot_price=25_000.0,
+        opportunity_by_strategy={"momentum": opportunity("momentum", 1)},
+        session_id="sess-1",
+    )
+
+    assert results == []
+
+
+def test_time_stop_does_not_perturb_deployment_identity():
+    """The reason the time stop is env-driven rather than a config field.
+
+    ``deployment_identity`` hashes the entire config, so *any* new field
+    changes the id of every existing deployment even when unset. Sessions,
+    books and open positions all key off ``deployment_id``, so that silently
+    orphans live state. This pins the invariant that exit-layer work must not
+    add fields to PaperDeploymentConfig.
+    """
+    from trading_system.paper.deployment import (
+        PaperDeploymentConfig,
+        deployment_identity,
+    )
+
+    cfg = PaperDeploymentConfig(
+        execution_mode="paper", initial_cash=100_000.0, stop_loss_pct=0.03
+    )
+    expected = deployment_identity(
+        "spec", "hash", "NSE:SBIN", "1d", "ds", cfg
+    )
+    assert expected == deployment_identity(
+        "spec", "hash", "NSE:SBIN", "1d", "ds",
+        PaperDeploymentConfig(
+            execution_mode="paper", initial_cash=100_000.0, stop_loss_pct=0.03
+        ),
+    )
+    # The time stop must be absent from the hashed config entirely.
+    assert "max_holding_seconds" not in cfg.model_dump(mode="json")
+
+
+def test_time_stop_does_not_liquidate_a_position_of_unknown_age(monkeypatch):
+    """A book written before age tracking has no opened_at.
+
+    Treating that as "infinitely old" would liquidate real positions on the
+    first tick after a restart.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _set_time_stop(monkeypatch, 60.0)
+
+    _hold(controller, avg_entry_price=100.0, current_price=100.0, opened_at=None)
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    results = portfolio.exit_positions(
+        spot_price=25_000.0,
+        opportunity_by_strategy={"momentum": opportunity("momentum", 1)},
+        session_id="sess-1",
+    )
+
+    assert results == []
+
+
+def test_expired_position_is_settled_not_market_exited():
+    """An expired contract has no market to exit into.
+
+    Sending an order would be refused by the Phase 7 expiry check and produce a
+    misleading fail-closed while the capital stayed locked. It must be settled
+    at intrinsic value instead.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    broker = controller.control_center._broker
+
+    pos = _hold(controller, avg_entry_price=100.0, current_price=100.0)
+    pos.expiry = _past_expiry()
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    def _must_not_execute(kwargs):
+        raise AssertionError("an expired contract must never be market-exited")
+
+    controller._execution_result = _must_not_execute
+    results = portfolio.exit_positions(
+        spot_price=25_100.0, opportunity_by_strategy={}, session_id="sess-1"
+    )
+
+    assert results and results[0]["result"] == "settled"
+    assert results[0]["reason"] == "expired"
+    # strike 25000, spot 25100 -> intrinsic 100
+    assert results[0]["avg_fill_price"] == pytest.approx(100.0)
+    assert any(
+        a.action == PortfolioActionType.EXPIRED for a in portfolio.actions
+    ), [a.action for a in portfolio.actions]
+
+
+def test_expired_position_is_settled_even_when_no_strategy_opinion_exists():
+    """Expiry must not depend on the owning strategy, same as every other exit."""
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    pos = _hold(controller, avg_entry_price=100.0, current_price=100.0)
+    pos.expiry = _past_expiry()
+    # No attribution at all, and no opportunities.
+
+    results = portfolio.exit_positions(
+        spot_price=24_800.0, opportunity_by_strategy={}, session_id="sess-1"
+    )
+
+    assert results and results[0]["result"] == "settled"
+    # CE with spot below strike expires worthless
+    assert results[0]["avg_fill_price"] == pytest.approx(0.0)
+
+
+def test_expiry_precedes_price_thresholds():
+    """An expired contract reports as expired, not as a stop-loss."""
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    controller.control_center.deployment.config.stop_loss_pct = 0.10
+
+    pos = _hold(controller, avg_entry_price=100.0, current_price=50.0)
+    pos.expiry = _past_expiry()
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    reason = portfolio._exit_reason(
+        position=pos, strategy_id="momentum", opportunity_by_strategy={}
+    )
+    assert reason == "expired"
+
+
+def test_held_position_with_no_exit_reason_is_recorded_not_silent():
+    """Unnoticed holding is the shape of a stranded position."""
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _hold(controller, avg_entry_price=100.0, current_price=100.0, qty=1.0)
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # The strategy still has an opinion and it agrees with the position, so
+    # nothing says exit. This is the silent-hold case.
+    portfolio.exit_positions(
+        spot_price=25_000.0,
+        opportunity_by_strategy={"momentum": opportunity("momentum", 1)},
+        session_id="sess-1",
+    )
+
+    held = [
+        a for a in portfolio.actions
+        if a.action == PortfolioActionType.SKIPPED
+        and a.reason == "held_no_exit_condition"
+    ]
+    assert held, [(a.action, a.reason) for a in portfolio.actions]
+
+
+def test_stop_loss_is_a_fraction_of_committed_capital():
+    """The threshold is measured against capital at risk, not raw price.
+
+    Committed capital is ``qty * entry * contract_size`` -- the same basis the
+    broker books realized P&L on. A lot of 50 must be judged on exactly the
+    same percentage as a lot of 1; if the numerator and denominator used
+    different notions of size, a 10% threshold would fire at the wrong point
+    on one lot size and not the other.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    config = controller.control_center.deployment.config
+    config.stop_loss_pct = 0.10
+
+    # Exactly -10% of committed capital (2 * 100 * 50 = 10_000) -> boundary.
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=90.0,
+        qty=2.0, contract_size=50,
+    )
+    pos.expiry = _future_expiry()
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="momentum", opportunity_by_strategy={}
+    ) == "stop_loss"
+
+    # Just inside the threshold on the same lot must not fire.
+    pos2 = _hold(
+        controller, symbol="NFO:NIFTY_CE_2",
+        avg_entry_price=100.0, current_price=91.0, qty=2.0, contract_size=50,
+    )
+    pos2.expiry = _future_expiry()
+    portfolio._set_attribution("NIFTY_CE_2", "NFO:NIFTY_CE_2", "momentum")
+    assert (
+        portfolio._exit_reason(
+            position=pos2, strategy_id="momentum", opportunity_by_strategy={}
+        )
+        != "stop_loss"
+    )
+
+
+def test_take_profit_respects_short_direction():
+    """A short that falls is in profit.
+
+    The old formula was (current - entry) / entry, which is long-side
+    arithmetic: it scored this exact trade as a 10% LOSS.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    config = controller.control_center.deployment.config
+    config.take_profit_pct = 0.10
+
+    pos = _hold(controller, avg_entry_price=100.0, current_price=90.0, qty=-1.0)
+    pos.expiry = _future_expiry()
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="momentum", opportunity_by_strategy={}
+    ) == "take_profit"
+
+
+def test_short_rally_is_a_loss_not_a_take_profit():
+    """The mirror image: guards the sign in the other direction."""
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    config = controller.control_center.deployment.config
+    config.take_profit_pct = 0.10
+
+    pos = _hold(controller, avg_entry_price=100.0, current_price=110.0, qty=-1.0)
+    pos.expiry = _future_expiry()
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="momentum", opportunity_by_strategy={}
+    ) == "strategy_exit_signal"  # fell through to the strategy rule, not take_profit

@@ -20,6 +20,7 @@ these are plain data holders with convenience views.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 
 
@@ -43,6 +44,35 @@ class Position:
     expiry: Optional[str] = None
     option_type: Optional[str] = None
     contract_size: int = 1  # number of shares per option contract (default 1 for equities)
+
+    # --- Age tracking ---
+    # When this position most recently went from flat to non-flat, as an ISO
+    # timestamp. Maintained by PaperBroker on open/increase and cleared on
+    # close. Without it no time-based exit is possible: a position held for one
+    # bar and one held for a thousand look identical to every exit rule, so
+    # capital can be stranded indefinitely by a thesis that simply stops
+    # playing out.
+    opened_at: Optional[str] = None
+
+    def holding_seconds(self, now: Optional[datetime] = None) -> Optional[float]:
+        """Seconds this position has been open, or None if unknown.
+
+        Returns None rather than 0.0 when ``opened_at`` is missing, so callers
+        can tell "just opened" apart from "age unknown" and refuse to treat an
+        unknown age as a satisfied time stop.
+        """
+        if not self.opened_at:
+            return None
+        reference = now or datetime.now(timezone.utc)
+        try:
+            opened = datetime.fromisoformat(str(self.opened_at))
+        except (TypeError, ValueError):
+            return None
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        return max(0.0, (reference - opened).total_seconds())
 
     # -- views ----------------------------------------------------------------
     @property
@@ -88,6 +118,8 @@ class Position:
             d["expiry"] = self.expiry
             d["option_type"] = self.option_type
             d["contract_size"] = self.contract_size
+        if self.opened_at is not None:
+            d["opened_at"] = self.opened_at
         return d
 
 

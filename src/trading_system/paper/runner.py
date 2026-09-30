@@ -135,7 +135,9 @@ class PaperStrategyRunner:
         """Feed one bar to the runner. Returns the resulting signal/NO_ACTION.
 
         ``bar`` must contain open/high/low/close/volume (and an index value).
-        Repeated calls with the SAME bar are no-ops (idempotency).
+        Any bar at or before ``_last_processed_bar`` is a no-op: that watermark
+        is what stops a restarted runner from re-trading the history its data
+        provider replays.
         """
         # Deployment must be in an order-accepting state.
         if self.deployment.status not in STATUS_ACCEPTS_ORDERS:
@@ -147,7 +149,12 @@ class PaperStrategyRunner:
             return SignalType.NO_ACTION
 
         bar_df, ts = _coerce_bar(bar)
-        if self._last_processed_bar is not None and ts == self._last_processed_bar:
+        # Watermark, not equality. A restarted runner replays the data
+        # provider's lookback window, so an equality check would only ever
+        # reject the single most recent bar and would happily re-process every
+        # older one -- re-entering positions that are already on the book.
+        # Anything at or before the watermark has already been traded.
+        if self._last_processed_bar is not None and ts <= self._last_processed_bar:
             return SignalType.NO_ACTION
 
         self._window = pd.concat([self._window, bar_df])

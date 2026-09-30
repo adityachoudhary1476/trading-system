@@ -27,18 +27,22 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     Integer,
     String,
     Text,
+    inspect,
     select,
+    text,
 )
 from sqlalchemy.orm import sessionmaker
 
@@ -90,6 +94,8 @@ SESSION_ALLOWED_TRANSITIONS: frozenset[tuple[PaperSessionStatus, PaperSessionSta
 # Schema version constant — bumped to 3 because Phase 20 adds the
 # ``paper_sessions`` table. Phase 18/19 records are unchanged.
 SESSION_SCHEMA_VERSION = 3
+
+logger = logging.getLogger(__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -470,6 +476,11 @@ class PaperBookRecord(Base):
     realized_pnl = Column(String(40), nullable=False)
     positions_json = Column(Text, nullable=False, default="[]")
     orders_json = Column(Text, nullable=False, default="[]")
+    # The runner's bar watermark. Nullable so rows written before this column
+    # existed still load; a NULL cursor means "unknown", which the restore path
+    # treats as unsafe rather than as "nothing processed".
+    last_processed_bar_timestamp = Column(String(64), nullable=True)
+    bar_count = Column(Integer, nullable=False, default=0)
     state_hash = Column(String(64), nullable=False)
     schema_version = Column(Integer, nullable=False, default=BOOK_SCHEMA_VERSION)
     created_at = Column(DateTime(timezone=True), nullable=False)
@@ -513,6 +524,88 @@ class SessionIdentityError(RuntimeError):
     """
 
 
+def _add_missing_columns(engine) -> None:
+    """Additively reconcile the live schema with the declared models.
+
+    ``Base.metadata.create_all`` only creates *missing tables*. It never adds a
+    column to a table that already exists, so any environment that created
+    ``paper_books`` before a column was introduced would fail every subsequent
+    write with "no such column". This walks the declared models and issues an
+    ``ALTER TABLE ... ADD COLUMN`` for each column the live database lacks.
+
+    Strictly additive on purpose:
+
+    * columns are only ever ADDed -- never dropped, retyped or renamed, so no
+      existing data can be destroyed;
+    * a NOT NULL column is added with a server-side DEFAULT, which is what lets
+      the ALTER succeed against a table that already has rows;
+    * existing rows are then backfilled, because a server default only applies
+      to rows inserted afterwards on some backends.
+
+    Failures are logged and re-raised. Swallowing them would let a later write
+    fail with a confusing "no such column" instead of a clear error here.
+    """
+    inspector = inspect(engine)
+    existing_tables = set(inspector.get_table_names())
+    preparer = engine.dialect.identifier_preparer
+
+    for table_name, table in Base.metadata.tables.items():
+        if table_name not in existing_tables:
+            continue  # create_all made it with the full, current shape
+        present = {c["name"] for c in inspector.get_columns(table_name)}
+        added: list[str] = []
+        for column in table.columns:
+            if column.name in present:
+                continue
+            quoted_table = preparer.quote(table_name)
+            quoted_column = preparer.quote(column.name)
+            ddl_type = column.type.compile(engine.dialect)
+
+            default = column.default.arg if column.default is not None else None
+            default_sql = ""
+            if not column.nullable and default is not None:
+                if isinstance(default, bool):
+                    default_sql = f" DEFAULT {1 if default else 0}"
+                elif isinstance(default, (int, float)):
+                    default_sql = f" DEFAULT {default}"
+                else:
+                    default_sql = f" DEFAULT {default!r}"
+
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        text(
+                            f"ALTER TABLE {quoted_table} ADD COLUMN "
+                            f"{quoted_column} {ddl_type}{default_sql}"
+                        )
+                    )
+                    if default_sql:
+                        literal = (
+                            1 if default is True else 0 if default is False else default
+                        )
+                        if not isinstance(default, (bool, int, float)):
+                            literal = repr(default)
+                        conn.execute(
+                            text(
+                                f"UPDATE {quoted_table} SET {quoted_column} = "
+                                f"{literal} WHERE {quoted_column} IS NULL"
+                            )
+                        )
+                added.append(column.name)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "failed to add missing column %s.%s: %s",
+                    table_name,
+                    column.name,
+                    exc,
+                )
+                raise
+        if added:
+            logger.info(
+                "added missing column(s) to %s: %s", table_name, ", ".join(added)
+            )
+
+
 class PaperSessionStore:
     """Phase 20 — explicit, schema-versioned session persistence.
 
@@ -524,6 +617,8 @@ class PaperSessionStore:
     def __init__(self, engine) -> None:
         self.engine = engine
         Base.metadata.create_all(engine)
+        # create_all cannot widen an existing table, so reconcile afterwards.
+        _add_missing_columns(engine)
         self._Session = sessionmaker(bind=engine, future=True)
 
     # -- writes --------------------------------------------------------------
@@ -596,6 +691,8 @@ class PaperSessionStore:
                 existing.realized_pnl = rec.realized_pnl
                 existing.positions_json = rec.positions_json
                 existing.orders_json = rec.orders_json
+                existing.last_processed_bar_timestamp = rec.last_processed_bar_timestamp
+                existing.bar_count = rec.bar_count
                 existing.state_hash = rec.state_hash
                 existing.schema_version = rec.schema_version
                 existing.updated_at = rec.updated_at
@@ -620,6 +717,8 @@ class PaperSessionStore:
             realized_pnl=str(float(book.realized_pnl)),
             positions_json=json.dumps(book.positions, default=str),
             orders_json=json.dumps(book.orders, default=str),
+            last_processed_bar_timestamp=book.last_processed_bar_timestamp,
+            bar_count=int(book.bar_count or 0),
             state_hash=book.state_hash or book.compute_hash(),
             schema_version=int(book.schema_version),
             created_at=_parse_dt(book.created_at),
@@ -636,6 +735,8 @@ class PaperSessionStore:
             realized_pnl=float(rec.realized_pnl),
             positions=json.loads(rec.positions_json or "[]"),
             orders=json.loads(rec.orders_json or "[]"),
+            last_processed_bar_timestamp=rec.last_processed_bar_timestamp,
+            bar_count=int(rec.bar_count or 0),
             state_hash=rec.state_hash or "",
             schema_version=int(rec.schema_version),
             created_at=rec.created_at.isoformat() if rec.created_at else _now_iso(),

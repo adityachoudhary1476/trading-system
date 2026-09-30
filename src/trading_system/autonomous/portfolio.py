@@ -45,7 +45,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Optional
 
+import logging
+import os
+
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
 
 from .coordinator import (
     AutonomousDeploymentCoordinator,
@@ -73,6 +78,9 @@ class PortfolioActionType(str, Enum):
     STOPPED = "STOPPED"
     ENTERED = "ENTERED"
     EXITED = "EXITED"
+    # Settled at intrinsic value because the contract expired. Distinct from
+    # EXITED: no order was placed and no market price was available.
+    EXPIRED = "EXPIRED"
     SIGNAL_DETECTED = "SIGNAL_DETECTED"
     SIGNAL_REJECTED = "SIGNAL_REJECTED"
     OPTION_SELECTED = "OPTION_SELECTED"
@@ -972,29 +980,214 @@ class AutonomousPortfolio:
     ) -> Optional[str]:
         """Decide whether an open position must be closed.
 
-        Reuses (a) the deployment's configured stop-loss / take-profit
-        thresholds and (b) the owning strategy's latest exit/reversal signal.
+        Ordered most-independent-first. The first three triggers do not consult
+        the owning strategy at all, which is the point: exits used to be a
+        byproduct of the entry strategy, so a strategy that went quiet left its
+        capital stranded with no way out. A trigger that depends on the entry
+        strategy is a *bonus* exit, never the only one.
+
+        1. ``expired``       - the contract can never be traded again, so
+                               holding it is definitionally capital at risk.
+        2. ``time_stop``     - the position has outlived its thesis window.
+        3. ``stop_loss`` / ``take_profit`` - configured thresholds.
+        4. ``strategy_exit_signal`` / ``strategy_reversal_signal`` - optional,
+                               strategy-dependent bonuses.
         """
         config = self._deployment_config()
+
+        # --- 1. Expiry: an expired contract is untradeable, so it cannot be
+        # exited by any later rule. This must come first or the position is
+        # stuck forever behind a check that can never pass.
+        if self._is_expired(position):
+            return "expired"
+
+        # --- 2. Time stop: independent of both price and strategy. A thesis
+        # that has not played out within its window is a failed thesis.
+        if self._time_stop_breached(position):
+            return "time_stop"
+
+        # --- 3. Configured thresholds. Computed contract-size and direction
+        # aware to match the runner and the scheduler sweep, which is not the
+        # same as the naive (current-entry)/entry ratio this used to use --
+        # that one ignored contract_size entirely and computed shorts with
+        # long-side arithmetic.
         entry = float(getattr(position, "avg_entry_price", 0.0) or 0.0)
         current = float(getattr(position, "current_price", 0.0) or 0.0)
-        if entry > 0 and current > 0:
-            pnl_pct = (current - entry) / entry
-            stop_loss = getattr(config, "stop_loss_pct", None)
-            take_profit = getattr(config, "take_profit_pct", None)
-            if stop_loss is not None and pnl_pct <= -abs(float(stop_loss)):
-                return "stop_loss"
-            if take_profit is not None and pnl_pct >= abs(float(take_profit)):
-                return "take_profit"
+        qty = float(getattr(position, "qty", 0.0) or 0.0)
+        if entry > 0 and current > 0 and qty != 0:
+            cost_basis = abs(qty) * entry * int(
+                getattr(position, "contract_size", 1) or 1
+            )
+            if cost_basis > 0:
+                pnl = (current - entry) * qty * int(
+                    getattr(position, "contract_size", 1) or 1
+                )
+                pnl_pct = pnl / cost_basis
+                stop_loss = getattr(config, "stop_loss_pct", None)
+                take_profit = getattr(config, "take_profit_pct", None)
+                if stop_loss is not None and pnl_pct <= -abs(float(stop_loss)):
+                    return "stop_loss"
+                if take_profit is not None and pnl_pct >= abs(float(take_profit)):
+                    return "take_profit"
 
+        # --- 4. Strategy-dependent bonuses.
         if strategy_id:
             opportunity = opportunity_by_strategy.get(strategy_id)
-            position_direction = 1 if float(getattr(position, "qty", 0.0) or 0.0) > 0 else -1
+            position_direction = 1 if qty > 0 else -1
             if opportunity is None:
                 return "strategy_exit_signal"
             if opportunity.direction != position_direction:
                 return "strategy_reversal_signal"
         return None
+
+    def _settle_expired(
+        self, position: Any, spot_price: float, symbol: str
+    ) -> dict[str, Any]:
+        """Settle an expired contract at intrinsic value, or explain why not.
+
+        Never raises and never attempts a market exit: for an expired contract
+        there is no market to exit into.
+        """
+        strategy_id = self._position_strategy(position)
+        broker = getattr(self._runner(), "broker", None)
+        settle = getattr(broker, "settle_expired_position", None)
+        if settle is None:
+            detail = "broker does not support expiry settlement"
+            self.record_action(
+                PortfolioActionType.FAIL_CLOSED,
+                symbol=symbol,
+                strategy_id=strategy_id,
+                reason="expiry_settlement_unavailable",
+                detail=detail,
+            )
+            return {
+                "result": "fail_closed",
+                "reason": "expiry_settlement_unavailable",
+                "detail": detail,
+                "symbol": symbol,
+            }
+
+        try:
+            outcome = settle(symbol, spot_price)
+        except Exception as exc:  # noqa: BLE001
+            detail = f"expiry settlement raised {type(exc).__name__}: {exc}"
+            self.record_action(
+                PortfolioActionType.FAIL_CLOSED,
+                symbol=symbol,
+                strategy_id=strategy_id,
+                reason="expiry_settlement_unavailable",
+                detail=detail,
+            )
+            return {
+                "result": "fail_closed",
+                "reason": "expiry_settlement_unavailable",
+                "detail": detail,
+                "symbol": symbol,
+            }
+
+        if not outcome:
+            detail = (
+                f"cannot settle {symbol!r} at spot {spot_price!r}: "
+                "missing position, expiry, strike or usable settlement spot"
+            )
+            self.record_action(
+                PortfolioActionType.FAIL_CLOSED,
+                symbol=symbol,
+                strategy_id=strategy_id,
+                reason="expiry_settlement_unavailable",
+                detail=detail,
+            )
+            return {
+                "result": "fail_closed",
+                "reason": "expiry_settlement_unavailable",
+                "detail": detail,
+                "symbol": symbol,
+            }
+
+        self.record_action(
+            PortfolioActionType.EXPIRED,
+            symbol=symbol,
+            strategy_id=strategy_id,
+            contract_id=getattr(position, "options_contract_id", None) or "",
+            option_type=getattr(position, "option_type", None) or "",
+            reason="expired",
+            detail=(
+                f"settled at intrinsic {outcome['intrinsic_price']:.2f} "
+                f"from spot {outcome['settlement_spot']:.2f}"
+            ),
+        )
+        return {
+            "result": "settled",
+            "reason": "expired",
+            "symbol": symbol,
+            "contract_id": getattr(position, "options_contract_id", None),
+            "option_type": getattr(position, "option_type", None),
+            "filled_quantity": outcome.get("quantity"),
+            "avg_fill_price": outcome.get("intrinsic_price"),
+            "pnl": round(float(outcome.get("realized_pnl", 0.0)), 2),
+        }
+
+    @staticmethod
+    def _is_expired(position: Any) -> bool:
+        """True when the contract's expiry is already in the past.
+
+        ``expiry`` is a date string. An unparseable or absent expiry is
+        reported as *not* expired: refusing to trade on a missing field would
+        strand every position that lacks one, which is the exact failure this
+        layer exists to prevent.
+        """
+        expiry = getattr(position, "expiry", None)
+        if not expiry:
+            return False
+        try:
+            expiry_date = datetime.fromisoformat(str(expiry)[:10]).date()
+        except (TypeError, ValueError):
+            return False
+        return expiry_date < datetime.now(timezone.utc).date()
+
+    def _time_stop_seconds(self) -> Optional[float]:
+        """The configured time stop, or None when it is disabled.
+
+        Read from the environment rather than ``PaperDeploymentConfig`` on
+        purpose. ``deployment_identity`` hashes the entire config, so adding
+        any field to that model changes the identity of *every* deployment,
+        even one that never sets the new field. That would orphan live
+        deployments -- their sessions, books and open positions all key off
+        ``deployment_id`` -- the moment an unrelated risk knob was added.
+        Opt-in settings that must not perturb identity belong here.
+        """
+        raw = os.environ.get("AUTONOMOUS_MAX_HOLDING_SECONDS", "").strip()
+        if not raw:
+            return None
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning(
+                "ignoring unparseable AUTONOMOUS_MAX_HOLDING_SECONDS=%r", raw
+            )
+            return None
+        return value if value > 0 else None
+
+    def _time_stop_breached(self, position: Any) -> bool:
+        """True when the position has been held longer than its time stop.
+
+        Returns False when no time stop is configured, and also when the age is
+        unknown: a position restored from a book written before age tracking
+        has no ``opened_at``, and treating "unknown" as "infinitely old" would
+        liquidate a position on its first tick after a restart.
+        """
+        limit = self._time_stop_seconds()
+        if limit is None:
+            return False
+        holding = None
+        if hasattr(position, "holding_seconds"):
+            try:
+                holding = position.holding_seconds(now=self._now())
+            except Exception:  # noqa: BLE001
+                holding = None
+        if holding is None:
+            return False
+        return holding >= limit
 
     @staticmethod
     def _underlying_symbol(position_symbol: str) -> str:
@@ -1099,6 +1292,20 @@ class AutonomousPortfolio:
                 opportunity_by_strategy=opportunity_by_strategy,
             )
             if reason is None:
+                # Previously silent. A position with no exit reason and no
+                # price/staleness trouble is the exact shape of a stranded
+                # position, so it is recorded rather than skipped. Holding is
+                # not automatically wrong; holding *unnoticed* is.
+                if self._is_expired(position):
+                    continue
+                self.record_action(
+                    PortfolioActionType.SKIPPED,
+                    symbol=getattr(position, "symbol", ""),
+                    strategy_id=strategy_id,
+                    contract_id=getattr(position, "options_contract_id", None) or "",
+                    option_type=getattr(position, "option_type", None) or "",
+                    reason="held_no_exit_condition",
+                )
                 continue
 
             option_type = getattr(position, "option_type", None)
@@ -1118,6 +1325,15 @@ class AutonomousPortfolio:
                     strategy_id=strategy_id,
                     reason="position_missing_option_metadata",
                 )
+                continue
+
+            # An expired contract is settled, never market-exited. Sending an
+            # order for it would be refused by the Phase 7 expiry check, so the
+            # attempt would only ever produce a misleading "exit_fail_closed"
+            # while the position stayed open and the capital stayed locked.
+            if reason == "expired":
+                settlement = self._settle_expired(position, spot_price, symbol)
+                results.append(settlement)
                 continue
 
             self.record_action(

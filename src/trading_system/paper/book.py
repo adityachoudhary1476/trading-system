@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -40,7 +41,12 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance
     # the Phase 18 safety guard checks for.
     from ..execution.paper_broker import PaperBroker
 
-BOOK_SCHEMA_VERSION = 1
+# v2 added the runner bar watermark (``last_processed_bar_timestamp``,
+# ``bar_count``) and per-position ``opened_at``. v1 books are still readable:
+# a missing watermark is reported as "unknown", never as "nothing processed".
+BOOK_SCHEMA_VERSION = 2
+
+logger = logging.getLogger(__name__)
 
 
 def _now_iso() -> str:
@@ -65,6 +71,15 @@ class PaperBook(BaseModel):
     realized_pnl: float
     positions: list[dict] = Field(default_factory=list)
     orders: list[dict] = Field(default_factory=list)
+    # The runner's bar watermark. It lives here, not only on the checkpoint,
+    # because the checkpoint is immutable: ``save_checkpoint`` refuses a new
+    # ``checkpoint_id`` for an existing session, so the checkpoint's cursor is
+    # frozen at whatever it was when the session was first written (usually
+    # ``None``). The book is the only record that stays current, so it is the
+    # only place a resumable cursor can live. Losing it makes a restarted
+    # runner treat every replayed bar as new and re-enter live positions.
+    last_processed_bar_timestamp: Optional[str] = None
+    bar_count: int = 0
     state_hash: str = ""
     schema_version: int = BOOK_SCHEMA_VERSION
     created_at: str = Field(default_factory=_now_iso)
@@ -78,6 +93,8 @@ class PaperBook(BaseModel):
                     "realized_pnl": self.realized_pnl,
                     "positions": self.positions,
                     "orders": self.orders,
+                    "last_processed_bar_timestamp": self.last_processed_bar_timestamp,
+                    "bar_count": self.bar_count,
                 },
                 sort_keys=True,
                 default=str,
@@ -101,6 +118,7 @@ def _position_payload(position: Position) -> dict:
         "expiry": position.expiry,
         "option_type": position.option_type,
         "contract_size": int(position.contract_size),
+        "opened_at": position.opened_at,
     }
 
 
@@ -148,9 +166,19 @@ def _order_payload(order: Order) -> dict:
 
 
 def book_from_broker(
-    *, broker: "PaperBroker", session_id: str, deployment_id: str
+    *,
+    broker: "PaperBroker",
+    session_id: str,
+    deployment_id: str,
+    last_processed_bar: Any = None,
+    bar_count: int = 0,
 ) -> PaperBook:
-    """Snapshot the broker's **entire** book, not just one position."""
+    """Snapshot the broker's **entire** book, not just one position.
+
+    ``last_processed_bar`` is the runner's bar watermark, passed in because it
+    lives on the runner rather than the broker. It is part of the resumable
+    state, so it must be saved with the book or a restart re-trades history.
+    """
     account = broker.account()
     # hasattr rather than getattr: the paper package forbids dynamic attribute
     # access, and the fallback keeps test doubles without a ledger working.
@@ -165,6 +193,12 @@ def book_from_broker(
             _position_payload(p) for p in broker.positions().values() if p.is_open
         ],
         orders=[_order_payload(o) for o in ledger.values()],
+        last_processed_bar_timestamp=(
+            last_processed_bar.isoformat()
+            if isinstance(last_processed_bar, datetime)
+            else (str(last_processed_bar) if last_processed_bar is not None else None)
+        ),
+        bar_count=int(bar_count or 0),
     )
     book.state_hash = book.compute_hash()
     return book
@@ -174,12 +208,34 @@ def book_from_broker(
 # Book -> broker
 # --------------------------------------------------------------------------- #
 def _parse_dt(value: Any) -> datetime:
+    """Parse a persisted timestamp, refusing to invent one.
+
+    The previous fallback returned ``now()`` for anything unparseable, which
+    silently rewrote history: a corrupted fill timestamp became "just now",
+    making an old fill look recent and defeating any age-based logic that reads
+    the ledger. An unparseable value now raises, and the caller drops that one
+    row rather than fabricating a plausible one.
+
+    Naive values are localized to UTC so restored timestamps are always
+    comparable with freshly generated ones.
+    """
     if isinstance(value, datetime):
-        return value
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(str(value))  # raises on garbage
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def parse_book_cursor(value: Any) -> Optional[datetime]:
+    """Best-effort parse of a persisted bar watermark; ``None`` if unusable."""
+    if value is None:
+        return None
     try:
-        return datetime.fromisoformat(str(value))
+        return _parse_dt(value)
     except (TypeError, ValueError):
-        return datetime.now(timezone.utc)
+        return None
 
 
 def _fill_from_payload(data: dict) -> Fill:
@@ -231,6 +287,10 @@ def _position_from_payload(data: dict) -> Position:
         expiry=data.get("expiry"),
         option_type=data.get("option_type"),
         contract_size=int(data.get("contract_size", 1) or 1),
+        # Absent on books written before age tracking existed; a position with
+        # unknown age is reported as unknown rather than as brand new, so a
+        # time stop can refuse to fire on a guess.
+        opened_at=data.get("opened_at"),
     )
 
 
@@ -252,14 +312,25 @@ def apply_book_to_broker(broker: "PaperBroker", book: PaperBook) -> int:
     broker._positions = positions
 
     orders: dict[str, Order] = {}
+    dropped = 0
     for payload in book.orders:
         try:
             order = _order_from_payload(payload)
         except Exception:  # noqa: BLE001
             # One malformed ledger row must not cost the whole book: the
-            # positions and cash above are what protect capital.
+            # positions and cash above are what protect capital. The row is
+            # dropped rather than restored with a fabricated timestamp, so the
+            # loss is counted and logged instead of being invisible.
+            dropped += 1
             continue
         orders[order.order_id] = order
     broker._orders = orders
+    if dropped:
+        logger.warning(
+            "dropped %d unparseable order row(s) while restoring the book for "
+            "session %s; the ledger is incomplete for those orders",
+            dropped,
+            book.session_id,
+        )
 
     return len(positions)

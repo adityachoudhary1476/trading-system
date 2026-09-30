@@ -41,6 +41,7 @@ Phase 20 does not implement live trading.
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
 
@@ -182,6 +183,9 @@ from .liveness import (
 # --------------------------------------------------------------------------- #
 # Control Center
 # --------------------------------------------------------------------------- #
+logger = logging.getLogger(__name__)
+
+
 class PaperTradingControlCenter:
     """Deterministic, paper-only orchestration layer.
 
@@ -562,6 +566,11 @@ class PaperTradingControlCenter:
         Separate from ``save_session``, which writes an immutable checkpoint
         that can never be updated once the book changes. This is the call the
         scheduler makes every tick so open positions survive a restart.
+
+        The runner's bar watermark is saved with the book. The checkpoint
+        cannot carry it: ``save_checkpoint`` refuses a new ``checkpoint_id`` for
+        an existing session, so the checkpoint's cursor stays frozen at the
+        value it had when the session was first written.
         """
         runner = self._runners.get(session_id)
         if runner is None:
@@ -570,6 +579,8 @@ class PaperTradingControlCenter:
             broker=runner.broker,
             session_id=session_id,
             deployment_id=runner.deployment.deployment_id,
+            last_processed_bar=runner._last_processed_bar,
+            bar_count=runner._bar_count,
         )
         self.session_store.save_book(book)
         return True
@@ -655,7 +666,65 @@ class PaperTradingControlCenter:
             # Book-only restore: the book is already applied to the broker, so
             # there is no operational checkpoint to replay.
             self.attach_runner(deployment_id, runner)
+        # The bar watermark comes from the book, not the checkpoint. The
+        # checkpoint is immutable, so its cursor is frozen at the first write
+        # (usually ``None``); trusting it would make a restarted runner treat
+        # every replayed bar as new and re-enter live positions.
+        self._restore_bar_cursor(runner, book, checkpoint, sid)
         return sid
+
+    @staticmethod
+    def _restore_bar_cursor(runner, book, checkpoint, session_id: str) -> None:
+        """Reinstate the runner's bar watermark after a restart.
+
+        Takes the later of the book's cursor and the checkpoint's cursor so a
+        stale checkpoint can never move the watermark backwards, and warns
+        loudly when the two disagree -- divergence between the mutable book and
+        the immutable audit record is exactly the condition that silently
+        re-trades history, so it must never be silent.
+        """
+        import pandas as pd
+
+        def _as_ts(value):
+            if value is None:
+                return None
+            try:
+                ts = pd.Timestamp(value)
+            except Exception:  # noqa: BLE001
+                return None
+            return ts.tz_localize("UTC") if ts.tzinfo is None else ts
+
+        book_ts = _as_ts(book.last_processed_bar_timestamp) if book else None
+        cp_raw = checkpoint.last_processed_bar_timestamp if checkpoint else None
+        cp_ts = _as_ts(cp_raw)
+
+        chosen = book_ts
+        if cp_ts is not None and (chosen is None or cp_ts > chosen):
+            chosen = cp_ts
+
+        if book_ts is not None and cp_ts is not None and book_ts != cp_ts:
+            logger.warning(
+                "bar cursor divergence for session %s: book=%s checkpoint=%s; "
+                "using the later value. The checkpoint is immutable, so a "
+                "persistent mismatch means the book is the fresher record and "
+                "the checkpoint is stale by design",
+                session_id,
+                book_ts.isoformat(),
+                cp_ts.isoformat(),
+            )
+
+        if chosen is None and book is not None and book.positions:
+            logger.warning(
+                "no usable bar cursor for session %s while %d position(s) are "
+                "open; the restarted runner will treat replayed bars as new and "
+                "may re-enter the position",
+                session_id,
+                len(book.positions),
+            )
+
+        runner._last_processed_bar = chosen
+        if book is not None and book.bar_count:
+            runner._bar_count = max(int(runner._bar_count or 0), int(book.bar_count))
 
     # ------------------------------------------------------------------ #
     # Inspection (read-only, JSON-serializable)

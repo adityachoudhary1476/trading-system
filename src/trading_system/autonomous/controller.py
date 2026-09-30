@@ -1695,21 +1695,46 @@ class AutonomousController(BaseModel):
         # --- Phase 7 safety: contract validity ---
         option_type = explicit_option_type or instrument.option_type
         selection = OptionsContractSelection.from_instrument(instrument)
+
+        # An exit is any order carrying an existing position. Entry-time
+        # policy must not apply to it: a rule that sizes *new* risk, or a
+        # toggle that was switched off after the position was opened, cannot
+        # be allowed to decide whether already-committed capital gets to
+        # leave. Getting that wrong is how a position becomes permanently
+        # unexitable.
+        is_exit = existing_position is not None
+
         safety = self._safety_layer.validator.check_contract_validity(
             options_selection=selection,
             allowed_option_types=[option_type] if option_type else ["CE", "PE"],
             now_date=__import__("datetime").date.today().isoformat(),
         )
         if not safety.passed:
+            # The expiry check still applies to exits, and must: there is no
+            # market left to sell into, and inventing a fill price for a dead
+            # contract is worse than refusing. The caller settles it at
+            # intrinsic value instead. Naming expiry explicitly here stops this
+            # from being reported as a generic, unexplained fail-closed.
+            detail = (
+                "expired contract cannot be market-exited; settle at intrinsic value"
+                if is_exit
+                else f"Phase 7 contract safety failed: {safety.failed_checks}"
+            )
             self._record_event(
                 AutonomousEventType.POLICY_VIOLATION,
                 symbol=instrument.underlying or decision.opportunity_symbol,
-                message=f"Phase 7 contract safety failed: {safety.failed_checks}",
+                message=detail,
             )
             return None
 
         # --- Deployment config checks ---
-        if options_deployment_config is not None:
+        # Skipped for exits: options_enabled, allowed_option_types and the
+        # per-trade contract cap all constrain *entries*. Honoring them on the
+        # exit leg would trap capital in exactly the position they were
+        # written to avoid creating. Hard safety checks (paper-only,
+        # execution mode, contract validation above) are NOT entry-only and
+        # still apply.
+        if options_deployment_config is not None and not is_exit:
             if not getattr(options_deployment_config, "options_enabled", True):
                 self._record_event(
                     AutonomousEventType.ERROR,

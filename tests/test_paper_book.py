@@ -16,7 +16,8 @@ from trading_system.paper.book import (
     book_from_broker,
 )
 from trading_system.paper.session import PaperSessionStore
-from trading_system.execution.paper_broker import PaperBroker
+from trading_system.execution.paper_broker import PaperBroker, SlippageConfig
+from trading_system.storage.database import Base
 
 
 def _open_option(broker, symbol, contract_id, qty, entry, price, contract_size=65):
@@ -187,6 +188,74 @@ def test_malformed_ledger_row_does_not_cost_the_book():
 def store(tmp_path):
     from sqlalchemy import create_engine
     return PaperSessionStore(create_engine(f"sqlite:///{tmp_path/'book.db'}"))
+
+
+def test_existing_book_table_is_widened_on_open(tmp_path):
+    """A table created before a column existed must gain it, with data intact.
+
+    ``create_all`` only creates missing *tables*. An environment that already
+    has ``paper_books`` from an earlier release would otherwise fail every
+    save with "no such column: paper_books.last_processed_bar_timestamp" --
+    i.e. the live book would stop persisting the moment the column was added.
+    """
+    from sqlalchemy import create_engine, inspect, text
+
+    db = tmp_path / "legacy.db"
+    engine = create_engine(f"sqlite:///{db}")
+
+    # Recreate the pre-cursor schema by hand: same table, columns missing.
+    Base.metadata.create_all(engine)
+    with engine.begin() as conn:
+        for column in (
+            "last_processed_bar_timestamp",
+            "bar_count",
+            "schema_version",
+        ):
+            conn.execute(text(f"ALTER TABLE paper_books DROP COLUMN {column}"))
+        # An old-format row that must survive the upgrade.
+        conn.execute(
+            text(
+                "INSERT INTO paper_books (session_id, deployment_id, initial_cash,"
+                " cash, realized_pnl, positions_json, orders_json, state_hash,"
+                " created_at, updated_at) VALUES"
+                " ('legacy','d1','100000.0','100000.0','0.0','[]','[]','h1',"
+                " '2026-01-01T00:00:00+00:00','2026-01-01T00:00:00+00:00')"
+            )
+        )
+
+    before = {c["name"] for c in inspect(engine).get_columns("paper_books")}
+    assert "last_processed_bar_timestamp" not in before
+
+    # Opening the store is what must reconcile the schema.
+    store = PaperSessionStore(engine)
+
+    after = {c["name"] for c in inspect(engine).get_columns("paper_books")}
+    assert "last_processed_bar_timestamp" in after
+    assert "bar_count" in after
+    assert "schema_version" in after
+
+    # The pre-existing row is still readable, with safe defaults.
+    legacy = store.get_book("legacy")
+    assert legacy is not None
+    assert legacy.last_processed_bar_timestamp is None
+    assert legacy.bar_count == 0
+    assert legacy.state_hash == "h1"
+
+    # And the table is writable again.
+    broker = PaperBroker(initial_cash=100_000.0)
+    book = book_from_broker(
+        broker=broker, session_id="legacy", deployment_id="d1",
+        last_processed_bar="2026-01-02T00:00:00+00:00", bar_count=7,
+    )
+    store.save_book(book)
+    assert store.get_book("legacy").bar_count == 7
+
+
+def test_book_schema_version_is_bumped_for_the_cursor_fields():
+    """The book structure changed, so the recorded version must say so."""
+    from trading_system.paper.book import BOOK_SCHEMA_VERSION
+
+    assert BOOK_SCHEMA_VERSION >= 2
 
 
 def test_save_book_is_upsert_not_refused(store):
@@ -544,3 +613,391 @@ def test_repeated_deployment_post_does_not_wipe_open_positions(tmp_path):
         "open positions were wiped by a repeat POST; now "
         f"{sorted(after.broker.positions())}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Restart consistency invariants
+# --------------------------------------------------------------------------- #
+def _process_bars(runner, n=30):
+    """Feed a deterministic uptrend so the bar cursor advances and orders fill."""
+    import numpy as np
+    import pandas as pd
+
+    rng = np.random.default_rng(1)
+    idx = pd.date_range("2024-01-01", periods=n, freq="1D", tz="UTC")
+    close = 100 + np.cumsum(rng.normal(0.3, 0.6, n))
+    for ts, c in zip(idx, close):
+        runner.process_bar({
+            "timestamp": pd.Timestamp(ts),
+            "open": float(c) + 0.1, "high": float(c) + 1.0,
+            "low": float(c) - 1.0, "close": float(c),
+            "volume": 500.0,
+        })
+
+
+def _equity(runner):
+    return runner.broker.account().equity
+
+
+def test_restart_preserves_equity_and_never_reprocesses_a_handled_bar(tmp_path):
+    """The invariant that makes a restart safe: nothing observable may change.
+
+    Two properties, both of which are currently broken:
+
+    1. Equity and the position set must be identical either side of a restart.
+    2. The bar cursor must survive. ``save_checkpoint`` is INSERT-only, so the
+       checkpoint's ``last_processed_bar_timestamp`` is frozen at creation and
+       is ``None`` for any deployment built by the API. On restart the runner
+       therefore believes it has processed nothing, and every bar the data
+       provider replays is treated as new -- so a position already on the book
+       gets re-entered.
+    """
+    from sqlalchemy import create_engine
+    from trading_system.paper import PaperCircuitBreaker, PaperStrategyRunner
+    import sys
+    sys.path.insert(0, "tests")
+    from test_phase20_control_center import _build_eligible, _spec
+
+    engine = create_engine(f"sqlite:///{tmp_path/'consistency.db'}")
+
+    center = _center_over(engine)
+    spec = _spec(name="Restart consistency spec")
+    _strategy, deployment, _ds = _build_eligible(
+        center.registry.store, center.registry, center.intelligence,
+        center.gate, spec,
+    )
+    with center.registry.store._Session() as s:
+        s.merge(deployment.as_record())
+        s.commit()
+    # process_bar is a no-op unless the deployment is ACTIVE, so the cursor
+    # would never advance and the test would prove nothing. Note that
+    # activate_deployment() mutates a freshly-loaded copy, not the object we
+    # hold, so the ACTIVE deployment has to be re-read.
+    center.activate_deployment(deployment.deployment_id)
+    active = center.get_deployment(deployment.deployment_id)
+    assert active is not None and active.status.value == "active", (
+        f"deployment was not activated: {getattr(active, 'status', None)}"
+    )
+
+    broker = PaperBroker(initial_cash=deployment.config.initial_cash)
+    runner = PaperStrategyRunner(
+        deployment=active, broker=broker, spec=spec,
+        circuit_breaker=PaperCircuitBreaker(),
+    )
+    sid = center.attach_runner(deployment.deployment_id, runner)
+    _process_bars(runner, 30)
+    assert center.save_live_book(sid) is True
+
+    pre_equity = _equity(runner)
+    pre_positions = set(broker.positions())
+    pre_cursor = runner._last_processed_bar
+    assert pre_cursor is not None, "precondition: bars were processed"
+
+    # --- restart ---
+    restarted = _center_over(engine)
+    assert restarted._runners == {}
+    restored_sid = restarted.ensure_live_session(deployment.deployment_id)
+    assert restored_sid == sid
+    restored = restarted.get_runner(restored_sid)
+
+    # 1. Nothing observable changed.
+    assert _equity(restored) == pytest.approx(pre_equity), (
+        f"equity drifted across the restart: {pre_equity} -> {_equity(restored)}"
+    )
+    assert set(restored.broker.positions()) == pre_positions, (
+        "position set drifted across the restart: "
+        f"{sorted(pre_positions)} -> {sorted(restored.broker.positions())}"
+    )
+
+    # 2. The bar cursor survived -- otherwise every replayed bar re-trades.
+    assert restored._last_processed_bar is not None, (
+        "the bar cursor was lost across the restart; the runner will treat "
+        "every replayed bar as new and re-enter positions it already holds"
+    )
+    assert restored._last_processed_bar == pre_cursor, (
+        f"bar cursor regressed: {pre_cursor} -> {restored._last_processed_bar}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# The bar watermark
+# --------------------------------------------------------------------------- #
+def _bar(ts, close=100.0):
+    import pandas as pd
+
+    return {
+        "timestamp": pd.Timestamp(ts, tz="UTC"),
+        "open": close, "high": close + 1.0, "low": close - 1.0,
+        "close": close, "volume": 500.0,
+    }
+
+
+def _warm_runner():
+    from trading_system.paper import PaperCircuitBreaker, PaperStrategyRunner
+
+    spec = _bare_spec()
+    deployment = _bare_deployment()
+    # The runner refuses a deployment whose bound spec identity does not match,
+    # so bind the real hash rather than a placeholder.
+    from trading_system.paper.runner import _spec_identity
+
+    deployment.strategy_spec_hash = _spec_identity(spec)
+    return PaperStrategyRunner(
+        deployment=deployment,
+        broker=PaperBroker(initial_cash=100000.0),
+        spec=spec,
+        circuit_breaker=PaperCircuitBreaker(),
+    )
+
+
+def _bare_spec():
+    import sys
+    sys.path.insert(0, "tests")
+    from test_phase20_control_center import _spec
+
+    return _spec(name="watermark spec")
+
+
+def _bare_deployment():
+    from trading_system.paper.deployment import (
+        PaperDeployment,
+        PaperDeploymentConfig,
+        PaperDeploymentStatus,
+    )
+
+    return PaperDeployment(
+        deployment_id="dep-wm",
+        strategy_id="s-wm",
+        strategy_spec_hash="h-wm",
+        symbol="NSE:SBIN",
+        timeframe="1d",
+        dataset_id="market_data",
+        config=PaperDeploymentConfig(),
+        status=PaperDeploymentStatus.ACTIVE,
+    )
+
+
+def test_watermark_rejects_older_bars_not_just_the_same_one():
+    """A restarted runner replays a lookback window, not a single bar.
+
+    Equality-only idempotency rejects the newest bar and nothing else, so the
+    whole replayed window would be re-traded. The watermark must reject
+    anything at or before the last processed bar.
+    """
+    from trading_system.paper.runner import SignalType
+
+    runner = _warm_runner()
+    for i in range(1, 11):
+        runner.process_bar(_bar(f"2024-01-{i:02d}"))
+    cursor = runner._last_processed_bar
+    assert cursor is not None
+    window_before = len(runner._window)
+    count_before = runner._bar_count
+
+    # The same bar and every older bar in the replay window are no-ops.
+    assert runner.process_bar(_bar("2024-01-10")) == SignalType.NO_ACTION
+    assert runner.process_bar(_bar("2024-01-05")) == SignalType.NO_ACTION
+    assert runner.process_bar(_bar("2024-01-01")) == SignalType.NO_ACTION
+    assert runner._bar_count == count_before
+    assert len(runner._window) == window_before
+
+    # A genuinely newer bar is still processed.
+    runner.process_bar(_bar("2024-01-11"))
+    assert runner._bar_count == count_before + 1
+    assert runner._last_processed_bar > cursor
+
+
+def test_parse_book_cursor_refuses_to_invent_a_timestamp():
+    """A corrupt cursor must not become 'now', which would skip live bars."""
+    from trading_system.paper.book import parse_book_cursor
+
+    assert parse_book_cursor(None) is None
+    assert parse_book_cursor("not-a-timestamp") is None
+    assert parse_book_cursor("") is None
+
+    good = parse_book_cursor("2024-01-10T00:00:00+00:00")
+    assert good is not None and good.year == 2024
+    # Naive values are localized so comparisons cannot blow up later.
+    naive = parse_book_cursor("2024-01-10T00:00:00")
+    assert naive is not None and naive.tzinfo is not None
+
+
+def test_malformed_fill_timestamp_is_dropped_not_backdated(caplog):
+    """A corrupt fill time is dropped, never rewritten to 'now'.
+
+    Backdating would make an old fill look fresh and defeat any age-based
+    logic reading the ledger.
+    """
+    import logging
+
+    from trading_system.paper.book import PaperBook, apply_book_to_broker
+
+    broker = PaperBroker(initial_cash=100000.0)
+    # Enum values are upper-case (Side.BUY == "BUY"); a lower-case payload is
+    # exactly the kind of corruption this path has to survive.
+    good = {
+        "order_id": "ok-1", "symbol": "NSE:SBIN", "side": "BUY", "quantity": 1.0,
+        "order_type": "MARKET", "status": "FILLED", "filled_quantity": 1.0,
+        "avg_fill_price": 10.0, "limit_price": None,
+        "fills": [{
+            "fill_id": "f-ok", "order_id": "ok-1", "symbol": "NSE:SBIN",
+            "side": "BUY", "quantity": 1.0, "price": 10.0,
+            "timestamp": "2024-01-10T00:00:00+00:00", "fee": 0.0, "note": "",
+        }],
+        "created_at": "2024-01-10T00:00:00+00:00",
+        "updated_at": "2024-01-10T00:00:00+00:00",
+        "reject_reason": "",
+    }
+    bad = dict(good, order_id="bad-1", fills=[{
+        "fill_id": "f-bad", "order_id": "bad-1", "symbol": "NSE:SBIN",
+        "side": "BUY", "quantity": 1.0, "price": 10.0,
+        "timestamp": "corrupted", "fee": 0.0, "note": "",
+    }])
+
+    book = PaperBook(
+        session_id="s1", deployment_id="d1", initial_cash=100000.0,
+        cash=100000.0, realized_pnl=0.0, positions=[], orders=[good, bad],
+    )
+    with caplog.at_level(logging.WARNING, logger="trading_system.paper.book"):
+        apply_book_to_broker(broker, book)
+
+    assert set(broker._orders) == {"ok-1"}, broker._orders
+    assert any("dropped 1 unparseable order row" in r.message for r in caplog.records), (
+        "dropping a ledger row must be visible, not silent: "
+        f"{[r.message for r in caplog.records]}"
+    )
+
+
+# --------------------------------------------------------------------- #
+# Position age: a time stop is impossible without it
+# --------------------------------------------------------------------- #
+
+
+def test_opening_a_position_stamps_opened_at():
+    broker = PaperBroker(initial_cash=100_000.0)
+    pos = _open_option(broker, "NSE:SBIN", "NSE:X|2030-01-29|400|CE", 1, 100.0, 100.0)
+    assert pos.opened_at, "a new position must know when it was opened"
+
+
+def test_opened_at_survives_a_book_round_trip():
+    """Restart must not reset the age clock.
+
+    If opened_at were lost on restore, a position restored mid-thesis would
+    look brand new and its time stop would restart from zero on every
+    restart, making the rule unenforceable exactly when it is needed.
+    """
+    broker = PaperBroker(initial_cash=100_000.0)
+    pos = _open_option(broker, "NSE:SBIN", "NSE:X|2030-01-29|400|CE", 1, 100.0, 100.0)
+
+    book = book_from_broker(broker=broker, session_id="s1", deployment_id="d1")
+    fresh = PaperBroker(initial_cash=100_000.0)
+    apply_book_to_broker(fresh, book)
+
+    restored = fresh.positions()["NSE:SBIN"]
+    assert restored.opened_at == pos.opened_at
+
+
+def test_increasing_a_position_does_not_restart_the_age():
+    broker = PaperBroker(initial_cash=100_000.0)
+    pos = _open_option(broker, "NSE:SBIN", "NSE:X|2030-01-29|400|CE", 1, 100.0, 100.0)
+    opened_at = pos.opened_at
+    _open_option(broker, "NSE:SBIN", "NSE:X|2030-01-29|400|CE", 1, 110.0, 110.0)
+    assert broker.positions()["NSE:SBIN"].opened_at == opened_at, (
+        "adding to a position must not restart the clock on capital already at risk"
+    )
+
+
+def test_closing_a_position_clears_opened_at():
+    broker = PaperBroker(initial_cash=100_000.0)
+    symbol = "NSE:SBIN"
+    pos = _open_option(broker, symbol, "NSE:X|2030-01-29|400|CE", 1, 100.0, 100.0)
+    assert pos.opened_at
+    broker.submit_order(
+        symbol=symbol, side="SELL", quantity=1.0, order_type="MARKET",
+        current_price=110.0, options_contract_id="NSE:X|2030-01-29|400|CE",
+        strike=400.0, expiry="2030-01-29", option_type="CE", contract_size=65,
+    )
+    assert broker.positions()[symbol].opened_at is None
+
+
+def test_holding_seconds_is_unknown_not_zero_when_opened_at_is_missing():
+    """Unknown age must be distinguishable from a brand-new position.
+
+    A time stop that reads a missing opened_at as age 0 would either never
+    fire or, worse, be treated as "old enough" by an inverted check.
+    """
+    broker = PaperBroker(initial_cash=100_000.0)
+    pos = _open_option(broker, "NSE:SBIN", "NSE:X|2030-01-29|400|CE", 1, 100.0, 100.0)
+    pos.opened_at = None
+    assert pos.holding_seconds() is None
+
+
+# --------------------------------------------------------------------- #
+# Expiry settlement: the only way an expired contract can be retired
+# --------------------------------------------------------------------- #
+
+
+def test_settle_expired_long_call_pays_intrinsic_and_keeps_books_consistent():
+    broker = PaperBroker(initial_cash=1_000_000.0, slippage=SlippageConfig(slippage_bps=0.0))
+    symbol = "NSE:X"
+    _open_option(broker, symbol, "NSE:X|2030-01-29|400|CE", 2, 100.0, 100.0, contract_size=50)
+    cash_before = broker._cash
+
+    # Spot 450 vs strike 400 -> intrinsic 50.
+    outcome = broker.settle_expired_position(symbol, 450.0)
+
+    assert outcome is not None
+    assert outcome["intrinsic_price"] == pytest.approx(50.0)
+    # 2 contracts * 50 intrinsic * 50 contract size
+    assert outcome["cash_delta"] == pytest.approx(5000.0)
+    assert broker._cash == pytest.approx(cash_before + 5000.0)
+    # Realized: (50 - 100) * 2 * 50
+    assert outcome["realized_pnl"] == pytest.approx(-5000.0)
+    assert broker._realized_pnl == pytest.approx(-5000.0)
+    assert broker.positions()[symbol].qty == 0.0
+
+
+def test_settle_expired_out_of_the_money_long_call_raises_no_cash():
+    """Worthless at expiry: the capital is simply gone, not held in limbo."""
+    broker = PaperBroker(initial_cash=1_000_000.0, slippage=SlippageConfig(slippage_bps=0.0))
+    symbol = "NSE:X"
+    _open_option(broker, symbol, "NSE:X|2030-01-29|400|CE", 1, 100.0, 100.0, contract_size=50)
+    cash_before = broker._cash
+
+    outcome = broker.settle_expired_position(symbol, 300.0)
+
+    assert outcome is not None
+    assert outcome["intrinsic_price"] == pytest.approx(0.0)
+    assert outcome["cash_delta"] == pytest.approx(0.0)
+    assert broker._cash == pytest.approx(cash_before)
+    # Full premium lost
+    assert outcome["realized_pnl"] == pytest.approx(-5000.0)
+    assert broker.positions()[symbol].qty == 0.0
+
+
+def test_settle_expired_put_uses_put_intrinsic():
+    broker = PaperBroker(initial_cash=1_000_000.0, slippage=SlippageConfig(slippage_bps=0.0))
+    symbol = "NSE:X"
+    _open_option(broker, symbol, "NSE:X|2030-01-29|400|PE", 1, 100.0, 100.0, contract_size=50)
+
+    outcome = broker.settle_expired_position(symbol, 350.0)
+
+    assert outcome is not None
+    assert outcome["intrinsic_price"] == pytest.approx(50.0)
+
+
+def test_settle_expired_refuses_without_a_usable_spot():
+    """A missing official close must not be invented."""
+    broker = PaperBroker(initial_cash=1_000_000.0, slippage=SlippageConfig(slippage_bps=0.0))
+    symbol = "NSE:X"
+    _open_option(broker, symbol, "NSE:X|2030-01-29|400|CE", 1, 100.0, 100.0)
+
+    for bad in (0.0, -1.0, float("nan"), None, "not a number"):
+        assert broker.settle_expired_position(symbol, bad) is None, bad
+    # and the position is untouched
+    assert broker.positions()[symbol].qty == 1.0
+
+
+def test_settle_expired_is_a_noop_for_unknown_or_flat():
+    broker = PaperBroker(initial_cash=1_000_000.0, slippage=SlippageConfig(slippage_bps=0.0))
+    assert broker.settle_expired_position("NSE:NOPE", 450.0) is None
