@@ -51,6 +51,29 @@ def _to_float(x: Any) -> Optional[float]:
     return f
 
 
+# Indian option IV above this many percent is not a real quote, so a raw value
+# at or above it is unambiguously a percentage and a value below it is
+# unambiguously already a decimal. This is what lets the parser accept both
+# without a flag.
+_IV_PERCENT_CUTOFF = 3.0
+
+
+def _normalise_iv(x: Any) -> Optional[float]:
+    """The IV-unit authority lives in ``autonomous.greeks``; this is a shim.
+
+    Imported lazily because importing ``autonomous.greeks`` executes the
+    ``autonomous`` package ``__init__``, which imports the controller, which
+    imports this module. ``greeks`` itself has no internal dependencies, so the
+    only cost of the deferred import is a dict lookup per call.
+
+    Both the quote and chain paths route through here, so the two provably
+    share one implementation rather than two that can drift apart.
+    """
+    from ..autonomous.greeks import normalise_iv
+
+    return normalise_iv(x)
+
+
 @dataclass
 class OptionQuote:
     """Current market quote for an exact option contract."""
@@ -65,6 +88,15 @@ class OptionQuote:
     volume: Optional[float] = None
     raw: Optional[dict] = None
     source_symbol: str = ""
+    # --- Volatility inputs for greeks ---
+    # Upstox's quote payload carries these for option contracts, so reading
+    # them costs nothing: the response has already been paid for. They stay
+    # Optional because the field is absent for non-option instruments and
+    # because a missing IV must be reported as unknown rather than defaulted
+    # to a number that would silently produce wrong greeks.
+    underlying_price: Optional[float] = None
+    bid_iv: Optional[float] = None
+    ask_iv: Optional[float] = None
 
     @property
     def age_seconds(self) -> float:
@@ -73,6 +105,26 @@ class OptionQuote:
     @property
     def contract_id(self) -> str:
         return self.instrument.contract_id
+
+    @property
+    def implied_vol(self) -> Optional[float]:
+        """Mid of the bid/ask implied volatilities as a decimal fraction, e.g.
+        0.15 for 15%. Units are normalised on the way in, so this is directly
+        usable as a Black-Scholes sigma.
+
+        Returns None when neither side is present, and also when the two sides
+        cross (bid > ask), which indicates a bad payload rather than a real
+        quote. A greeks caller receiving None must treat volatility as unknown.
+        """
+        if self.bid_iv is None and self.ask_iv is None:
+            return None
+        low = self.bid_iv if self.bid_iv is not None else self.ask_iv
+        high = self.ask_iv if self.ask_iv is not None else self.bid_iv
+        if low is None or high is None:
+            return None
+        if high < low:
+            return None
+        return (low + high) / 2.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +136,10 @@ class OptionQuote:
             "ask": round(self.ask, 4) if self.ask is not None else None,
             "oi": self.oi,
             "volume": self.volume,
+            "underlying_price": self.underlying_price,
+            "bid_iv": self.bid_iv,
+            "ask_iv": self.ask_iv,
+            "implied_vol": self.implied_vol,
             "timestamp": self.timestamp.isoformat(),
             "fetched_at": self.fetched_at.isoformat(),
             "age_seconds": round(self.age_seconds, 3),
@@ -174,6 +230,25 @@ class CurrentOptionQuoteProvider:
             or quote_data.get("traded_volume")
         )
 
+        # Volatility inputs for the greeks path. Upstox spells these several
+        # ways across payload versions, so each is looked up tolerantly rather
+        # than assuming one key. All three stay None when absent, which is the
+        # correct signal: an unknown volatility must not become a default.
+        underlying_price = _to_float(
+            quote_data.get("underlying_price")
+            or quote_data.get("underlyingPrice")
+        )
+        bid_iv = _normalise_iv(
+            quote_data.get("bid_iv")
+            or quote_data.get("bidIv")
+            or quote_data.get("bidIV")
+        )
+        ask_iv = _normalise_iv(
+            quote_data.get("ask_iv")
+            or quote_data.get("askIv")
+            or quote_data.get("askIV")
+        )
+
         return OptionQuote(
             instrument=instrument,
             ltp=ltp,
@@ -185,6 +260,9 @@ class CurrentOptionQuoteProvider:
             volume=vol,
             raw=quote_data,
             source_symbol=upstox_symbol,
+            underlying_price=underlying_price,
+            bid_iv=bid_iv,
+            ask_iv=ask_iv,
         )
 
     def is_fresh(

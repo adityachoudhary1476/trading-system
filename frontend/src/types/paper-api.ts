@@ -862,3 +862,87 @@ export interface AutonomousPortfolioTickResponse {
   portfolio: AutonomousPortfolioSnapshot | null;
   schema_version: number;
 }
+
+// --------------------------------------------------------------------------- //
+// Options analytics — per-strike greeks, observational only.
+//
+// Every greeks field is `number | null`, and null means "could not be computed",
+// never 0. A greeks table that renders 0.00 for an unsolvable strike is
+// indistinguishable from a genuinely zero-delta strike, and those two mean
+// opposite things.
+// --------------------------------------------------------------------------- //
+
+export type OptionType = "CE" | "PE";
+
+/** How implied vol was obtained. "solved" means inverted out of a mid premium. */
+export type IvSource = "quote" | "solved";
+
+export type Moneyness = "ITM" | "ATM" | "OTM";
+
+export interface OptionGreeksRow {
+  strike: number;
+  option_type: OptionType;
+  instrument_key: string | null;
+  ltp: number | null;
+  bid: number | null;
+  ask: number | null;
+  oi: number | null;
+  change_oi: number | null;
+  /** Decimal fraction (0.15 = 15%), not percent. */
+  implied_vol: number | null;
+  iv_source: IvSource | null;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  rho: number | null;
+  moneyness: Moneyness | null;
+}
+
+export interface OptionGreeksSummary {
+  atm_strike: number | null;
+  lower_strike: number | null;
+  upper_strike: number | null;
+  rows_total: number;
+  /** Rows that actually produced greeks. Read coverage alongside every total. */
+  rows_with_greeks: number;
+  /** rows_with_greeks / rows_total, or null when there are no rows at all. */
+  coverage: number | null;
+  call_delta_total: number | null;
+  put_delta_total: number | null;
+  net_delta: number | null;
+  gamma_total: number | null;
+  theta_total: number | null;
+  vega_total: number | null;
+  call_oi: number | null;
+  put_oi: number | null;
+  put_call_oi_ratio: number | null;
+}
+
+export interface OptionsAnalyticsResponse {
+  underlying: string;
+  expiry: string;
+  as_of: string;
+  spot_price: number | null;
+  strike_interval: number | null;
+  /** What was requested. Differs from the effective window when truncated. */
+  window_strikes: number | null;
+  window_truncated: boolean;
+  rows: OptionGreeksRow[];
+  summary: OptionGreeksSummary;
+  notes: string[];
+}
+
+export interface OptionExpiriesResponse {
+  underlying: string;
+  /** Ascending ISO dates. Empty when the chain provider cannot list them. */
+  expiries: string[];
+  count: number;
+  /**
+   * "provider" when the exchange listed them, "unavailable" when the lookup
+   * could not be answered. Never "provider" with an empty list, because "no
+   * expiries exist" and "we could not ask" are different answers.
+   */
+  source: "provider" | "unavailable";
+  notes: string[];
+}

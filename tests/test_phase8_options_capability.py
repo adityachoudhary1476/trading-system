@@ -323,6 +323,94 @@ class TestSyntheticChainProviderRejected:
 
 
 # --------------------------------------------------------------------------- #
+# Test 5b — real chain provider whose snapshot persistence is failing
+# --------------------------------------------------------------------------- #
+class TestChainPersistenceDegraded:
+    """A real chain provider that can no longer write snapshots still serves
+    valid live chain data, so it stays ``available`` for trading — but its
+    IV/OI history has holes and every derived figure (IV rank, percentile,
+    max pain) is computed from that history. The degradation must be reported
+    rather than hidden, or analytics quietly rot.
+    """
+
+    @staticmethod
+    def _controller(chain_provider):
+        return SimpleNamespace(
+            _option_discoverer=CurrentOptionDiscoverer(repository=SimpleNamespace()),
+            _quote_provider=SimpleNamespace(is_authenticated=True),
+            _chain_provider=chain_provider,
+        )
+
+    def _probe(self, engine, chain_provider):
+        store, registry, intelligence, gate, dep = _build_eligible_deployment(
+            engine, options_enabled=True
+        )
+        from trading_system.paper.control import PaperTradingControlCenter
+        center = PaperTradingControlCenter(
+            registry=registry, intelligence=intelligence, gate=gate,
+        )
+        router = PaperAPIRouter(center, controller=self._controller(chain_provider))
+        env = router.dispatch(
+            "GET", f"/deployments/{dep.deployment_id}/options-capability"
+        )
+        assert env.status == 200
+        return env.body
+
+    def test_degraded_persistence_is_surfaced(self, engine):
+        chain_provider = SimpleNamespace(
+            persistence_status=lambda: {
+                "healthy": False,
+                "failures": 4,
+                "last_error": "OperationalError: deadlock detected",
+                "last_error_at": "2026-01-08T09:30:00+00:00",
+            }
+        )
+        body = self._probe(engine, chain_provider)
+        chain = body["providers"]["chain"]
+        assert chain["status"] == "available"
+        assert "DEGRADED" in chain["detail"]
+        assert "4 failure" in chain["detail"]
+        assert "deadlock" in chain["detail"]
+
+    def test_healthy_persistence_reports_plain_detail(self, engine):
+        chain_provider = SimpleNamespace(
+            persistence_status=lambda: {
+                "healthy": True, "failures": 0,
+                "last_error": None, "last_error_at": None,
+            }
+        )
+        body = self._probe(engine, chain_provider)
+        assert body["providers"]["chain"]["status"] == "available"
+        assert body["providers"]["chain"]["detail"] == "real chain provider attached"
+
+    def test_provider_without_persistence_status_is_tolerated(self, engine):
+        """Older/double providers have no probe. Absence must not crash the
+        observational endpoint."""
+        chain_provider = SimpleNamespace()
+        body = self._probe(engine, chain_provider)
+        assert body["providers"]["chain"]["status"] == "available"
+
+    def test_raising_probe_does_not_break_the_endpoint(self, engine):
+        def _boom():
+            raise RuntimeError("probe exploded")
+
+        body = self._probe(engine, SimpleNamespace(persistence_status=_boom))
+        assert body["providers"]["chain"]["status"] == "available"
+
+    def test_capability_still_true_despite_persistence_fault(self, engine):
+        """Single-leg capability depends on discoverer + quote only, so a
+        history-write fault must not be misreported as a capability loss."""
+        chain_provider = SimpleNamespace(
+            persistence_status=lambda: {
+                "healthy": False, "failures": 1, "last_error": "boom",
+                "last_error_at": None,
+            }
+        )
+        body = self._probe(engine, chain_provider)
+        assert body["capable"] is True
+
+
+# --------------------------------------------------------------------------- #
 # Test 6 — deployment not found
 # --------------------------------------------------------------------------- #
 class TestDeploymentNotFound:

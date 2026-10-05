@@ -6,7 +6,7 @@ PAPER-only; no network, no live broker.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -17,6 +17,7 @@ from trading_system.paper.book import (
 )
 from trading_system.paper.session import PaperSessionStore
 from trading_system.execution.paper_broker import PaperBroker, SlippageConfig
+from trading_system.paper_trading import Position
 from trading_system.storage.database import Base
 
 
@@ -1001,3 +1002,122 @@ def test_settle_expired_refuses_without_a_usable_spot():
 def test_settle_expired_is_a_noop_for_unknown_or_flat():
     broker = PaperBroker(initial_cash=1_000_000.0, slippage=SlippageConfig(slippage_bps=0.0))
     assert broker.settle_expired_position("NSE:NOPE", 450.0) is None
+
+
+# --------------------------------------------------------------------------- #
+# Greeks anchors on Position: persistence and the decay-ratio contract
+# --------------------------------------------------------------------------- #
+def _future_expiry(days: int = 60) -> str:
+    """A date far enough ahead that the test cannot expire as the clock moves.
+
+    The broker refuses to mark-to-market an expired option, so a hard-coded
+    expiry would turn this into a date bomb.
+    """
+    return (date.today() + timedelta(days=days)).isoformat()
+
+
+class TestPositionGreeksAnchors:
+    """``entry_delta`` is a one-time measurement taken at the fill. It has to
+    survive a restart, because a delta-decay test compares two points in time
+    and an anchor reconstructed after the restart would be measured against
+    today's market, reporting no decay ever.
+    """
+
+    def test_defaults_are_none_so_greeks_read_as_unknown(self):
+        pos = Position(symbol="NSE:NIFTY", qty=1, avg_entry_price=100.0)
+        assert pos.entry_delta is None
+        assert pos.last_delta is None
+        assert pos.has_greeks() is False
+        assert pos.delta_retention() is None
+
+    def test_has_greeks_needs_both_points(self):
+        pos = Position(symbol="X", qty=1, entry_delta=0.5)
+        assert pos.has_greeks() is False
+        assert pos.delta_retention() is None
+        pos.last_delta = 0.25
+        assert pos.has_greeks() is True
+
+    def test_delta_retention_is_ratio_of_absolute_deltas(self):
+        pos = Position(symbol="X", qty=1, entry_delta=0.50, last_delta=0.25)
+        assert pos.delta_retention() == pytest.approx(0.5)
+
+    def test_delta_retention_handles_negative_deltas(self):
+        """A long put's delta is negative; the ratio is about magnitude."""
+        pos = Position(symbol="X", qty=1, entry_delta=-0.40, last_delta=-0.20)
+        assert pos.delta_retention() == pytest.approx(0.5)
+
+    def test_zero_anchor_does_not_divide_by_zero(self):
+        pos = Position(symbol="X", qty=1, entry_delta=0.0, last_delta=0.2)
+        assert pos.has_greeks() is True
+        assert pos.delta_retention() is None
+
+    def test_as_dict_omits_unset_greeks(self):
+        pos = Position(symbol="X", qty=1)
+        payload = pos.as_dict()
+        assert "entry_delta" not in payload
+        assert "last_delta" not in payload
+
+    def test_as_dict_includes_set_greeks(self):
+        pos = Position(
+            symbol="X", qty=1, entry_delta=0.5, last_delta=0.2,
+            entry_iv=0.15, last_iv=0.18, greeks_as_of="2026-01-08T09:30:00+00:00",
+        )
+        payload = pos.as_dict()
+        assert payload["entry_delta"] == pytest.approx(0.5)
+        assert payload["last_delta"] == pytest.approx(0.2)
+        assert payload["entry_iv"] == pytest.approx(0.15)
+        assert payload["greeks_as_of"] == "2026-01-08T09:30:00+00:00"
+
+    def test_greeks_survive_a_book_round_trip(self, store):
+        broker = PaperBroker(initial_cash=1_000_000.0)
+        pos = _open_option(
+            broker, "NSE:NIFTY", f"NSE:OPTIDX|{_future_expiry()}|25000.0|CE",
+            1, 120.0, 100.0,
+        )
+        pos.entry_delta = 0.52
+        pos.last_delta = 0.21
+        pos.entry_iv = 0.145
+        pos.last_iv = 0.181
+        pos.greeks_as_of = "2026-01-08T09:30:00+00:00"
+
+        book = book_from_broker(
+            broker=broker, session_id="s", deployment_id="dep-greeks"
+        )
+        store.save_book(book)
+
+        saved = store.get_book("s")
+        assert saved is not None
+        fresh = PaperBroker(initial_cash=1_000_000.0)
+        apply_book_to_broker(fresh, saved)
+        restored = fresh.positions()[pos.symbol]
+        assert restored.entry_delta == pytest.approx(0.52)
+        assert restored.last_delta == pytest.approx(0.21)
+        assert restored.entry_iv == pytest.approx(0.145)
+        assert restored.last_iv == pytest.approx(0.181)
+        assert restored.greeks_as_of == "2026-01-08T09:30:00+00:00"
+        assert restored.delta_retention() == pytest.approx(0.21 / 0.52)
+
+    def test_book_written_before_greeks_existed_reads_as_unknown(self, store):
+        """Backward compatibility: a book with no greeks keys must load, and the
+        position must read as unknown rather than as zero exposure."""
+        broker = PaperBroker(initial_cash=1_000_000.0)
+        pos = _open_option(
+            broker, "NSE:NIFTY", f"NSE:OPTIDX|{_future_expiry()}|25000.0|CE",
+            1, 120.0, 100.0,
+        )
+        book = book_from_broker(
+            broker=broker, session_id="s", deployment_id="dep-legacy"
+        )
+        for raw in book.positions:
+            for key in (
+                "entry_delta", "last_delta", "entry_iv", "last_iv", "greeks_as_of",
+            ):
+                raw.pop(key, None)
+
+        store.save_book(book)
+        saved = store.get_book("s")
+        fresh = PaperBroker(initial_cash=1_000_000.0)
+        apply_book_to_broker(fresh, saved)
+        restored = fresh.positions()[pos.symbol]
+        assert restored.has_greeks() is False
+        assert restored.delta_retention() is None

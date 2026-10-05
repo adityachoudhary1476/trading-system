@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from pydantic import BaseModel, ConfigDict, ValidationError
@@ -65,6 +65,10 @@ from .models import (
     LifecycleRequest,
     OptionChainRowResponse,
     OptionChainSnapshotResponse,
+    OptionGreeksRowResponse,
+    OptionGreeksSummaryResponse,
+    OptionExpiriesResponse,
+    OptionsAnalyticsResponse,
     OptionsCapabilityResponse,
     OptionsProviderStatus,
     PROVIDER_STATUS_AVAILABLE,
@@ -258,6 +262,19 @@ class PaperAPIRouter:
             frozenset({"GET"}),
             self._route_options_chain,
         )
+        # Per-strike greeks and window aggregates (observational only).
+        self._add(
+            r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/options/analytics/"
+            r"(?P<symbol>[A-Za-z0-9:]+)$",
+            frozenset({"GET"}),
+            self._route_options_analytics,
+        )
+        # Listed expiries for an underlying (observational only).
+        self._add(
+            r"^/deployments/(?P<deployment_id>[A-Za-z0-9_-]+)/options/expiries$",
+            frozenset({"GET"}),
+            self._route_options_expiries,
+        )
 
         # Phase 6 — Autonomous Trading Operations Center
         self._add(r"^/autonomous/bot$", frozenset({"GET"}), self._route_autonomous_bot)
@@ -322,6 +339,17 @@ class PaperAPIRouter:
         for k, v in inline.items():
             merged_query.setdefault(k, []).extend(v)
         path = raw_path
+
+        # Percent-decode each segment before matching. Route patterns are
+        # written against decoded values (the symbol pattern allows ":", as in
+        # "NSE:SBIN"), and a client encoding the colon as %3A would otherwise
+        # fail to match and get a confusing route-not-found. Decoding per
+        # segment rather than wholesale means an encoded %2F cannot invent a
+        # new path segment.
+        if "%" in path:
+            from urllib.parse import unquote as _unquote
+
+            path = "/".join(_unquote(seg) for seg in path.split("/"))
 
         body_json: Optional[dict] = None
         if raw_body:
@@ -863,9 +891,32 @@ class PaperAPIRouter:
                 "production capability rejected"
             )
         else:
+            # A provider whose snapshot writes are failing still serves valid
+            # live chain data, so it stays ``available`` for trading — but the
+            # IV/OI history behind it has holes, and every derived figure
+            # (IV rank, percentile, max pain) is computed from that history.
+            # The degradation is reported rather than hidden.
+            detail = "real chain provider attached"
+            # Direct attribute access with AttributeError handling: the Python
+            # AST safety scan forbids ``getattr`` in this module.
+            try:
+                probe = chain_provider.persistence_status
+            except AttributeError:
+                probe = None
+            if callable(probe):
+                try:
+                    health = probe()
+                except Exception:  # noqa: BLE001
+                    health = None
+                if isinstance(health, dict) and not health.get("healthy", True):
+                    detail = (
+                        f"real chain provider attached; snapshot persistence "
+                        f"DEGRADED ({health.get('failures', 0)} failure(s), "
+                        f"last: {health.get('last_error')}) - IV/OI history is "
+                        f"incomplete, derived analytics are unreliable"
+                    )
             providers["chain"] = OptionsProviderStatus(
-                status=PROVIDER_STATUS_AVAILABLE,
-                detail="real chain provider attached",
+                status=PROVIDER_STATUS_AVAILABLE, detail=detail
             )
 
         # ``capable`` for single-leg options data means: discoverer + quote
@@ -956,7 +1007,9 @@ class PaperAPIRouter:
         execution.
         """
         symbol = ctx.params["symbol"]
-        expiry = ctx.query.get("expiry", "")
+        # _single, not .get(): query values arrive as lists, and handing
+        # get_chain() a list makes the expiry comparison never match.
+        expiry = _single(ctx.query, "expiry") or ""
 
         controller = self._controller
         if controller is None:
@@ -1011,6 +1064,217 @@ class PaperAPIRouter:
             strike_interval=chain.strike_interval,
             rows=rows,
             validation_status="validated",
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_options_expiries(self, ctx: RequestContext) -> ResponseEnvelope:
+        """Listed expiry dates for an underlying (observational only).
+
+        Lets a caller choose an expiry instead of guessing one. Upstox's chain
+        endpoint requires ``expiry_date`` and rejects the request without it, so
+        this removes a whole class of confusing failure. It is a read-only
+        listing: no chain is fetched, no order is placed, and the scheduler is
+        untouched.
+        """
+        from ..autonomous.chain_analytics import DEFAULT_UNDERLYING
+
+        raw_symbol = _single(ctx.query, "symbol") or DEFAULT_UNDERLYING
+
+        controller = self._controller
+        if controller is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="autonomous controller not attached",
+                status=404,
+            )
+
+        try:
+            chain_provider = controller._chain_provider  # type: ignore
+        except AttributeError:
+            chain_provider = None
+
+        if chain_provider is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="option chain provider is not attached",
+                status=404,
+            )
+
+        underlying = raw_symbol.upper().replace("NSE:", "")
+        # Explicit attribute access rather than getattr: listing is an optional
+        # capability, so a provider without it is a 404, not an AttributeError
+        # escaping as a 500.
+        try:
+            lister = chain_provider.list_expiries  # type: ignore[union-attr]
+        except AttributeError:
+            lister = None
+        if not callable(lister):
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="chain provider does not support expiry listing",
+                status=404,
+            )
+
+        listed = lister(underlying) or []
+        today = datetime.now(timezone.utc).date()
+        future: set[str] = set()
+        past = 0
+        malformed = 0
+        for value in listed:
+            try:
+                parsed = date.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                malformed += 1
+                continue
+            if parsed >= today:
+                future.add(str(value))
+            else:
+                past += 1
+        ordered = sorted(future)
+
+        notes: list[str] = []
+        if past:
+            notes.append(
+                f"{past} expired {'expiry' if past == 1 else 'expiries'} omitted; "
+                "greeks are undefined after expiry"
+            )
+        if malformed:
+            notes.append(f"{malformed} unparseable expiry values omitted")
+        if not ordered:
+            # Deliberately ambiguous: an empty list means "could not determine",
+            # not "the exchange lists none", because the provider does not
+            # invent an answer when a lookup fails.
+            notes.append(
+                "no expiries could be listed for this underlying — the chain "
+                "provider may be unauthenticated or the symbol unlisted"
+            )
+
+        body = OptionExpiriesResponse(
+            underlying=underlying,
+            expiries=ordered,
+            count=len(ordered),
+            source="provider" if ordered else "unavailable",
+            notes=notes,
+        )
+        return ResponseEnvelope(status=200, body=_safe_dump(body))
+
+    def _route_options_analytics(self, ctx: RequestContext) -> ResponseEnvelope:
+        """Per-strike greeks and window aggregates (observational only).
+
+        Derives Black-Scholes greeks for a bounded band of strikes around the
+        money from the same chain snapshot the raw chain endpoint exposes. Like
+        that endpoint, it does NOT place orders, does NOT change the scheduler,
+        and does NOT enable autonomous option execution — it only describes the
+        market.
+
+        The raw chain endpoint remains the right choice for OI history or anything
+        needing every strike; this one is for reading the greeks surface.
+        """
+        from ..autonomous.chain_analytics import DEFAULT_WINDOW_STRIKES, analyse_chain
+
+        symbol = ctx.params["symbol"]
+        expiry = _single(ctx.query, "expiry") or ""
+
+        controller = self._controller
+        if controller is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="autonomous controller not attached",
+                status=404,
+            )
+
+        try:
+            chain_provider = controller._chain_provider  # type: ignore
+        except AttributeError:
+            chain_provider = None
+
+        if chain_provider is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message="option chain provider is not attached",
+                status=404,
+            )
+
+        if not expiry:
+            raise APIErrorException(
+                code=APIErrorCode.BAD_REQUEST,
+                message="expiry query parameter is required",
+                status=400,
+            )
+
+        underlying = symbol.upper().replace("NSE:", "")
+        chain = chain_provider.get_chain(underlying, expiry)
+        if chain is None:
+            raise APIErrorException(
+                code=APIErrorCode.NOT_FOUND,
+                message=f"no option chain available for {underlying}",
+                status=404,
+            )
+
+        # _bounded_int validates and range-checks at the edge, so a nonsense
+        # value is a 400 rather than a silently clamped default. The upper bound
+        # is deliberately far above MAX_WINDOW_STRIKES: clamping a request for
+        # 99999 is legitimate, refusing it is not.
+        window = _bounded_int(
+            ctx.query, "strikes",
+            default=DEFAULT_WINDOW_STRIKES, lo=0, hi=1_000_000,
+        )
+        requested_window = _single(ctx.query, "strikes")
+
+        result = analyse_chain(chain, window_strikes=window)
+
+        body = OptionsAnalyticsResponse(
+            underlying=result.underlying,
+            expiry=result.expiry,
+            as_of=result.as_of,
+            spot_price=result.spot_price,
+            strike_interval=result.strike_interval,
+            # Echo what was asked for, not the effective window: a caller
+            # inspecting this needs to know their request was clamped, and
+            # window_truncated plus notes already say what it became.
+            window_strikes=(
+                int(requested_window) if requested_window is not None else None
+            ),
+            window_truncated=result.window_truncated,
+            notes=result.notes,
+            rows=[
+                OptionGreeksRowResponse(
+                    strike=row.strike,
+                    option_type=row.option_type,
+                    instrument_key=row.instrument_key,
+                    ltp=row.ltp,
+                    bid=row.bid,
+                    ask=row.ask,
+                    oi=row.oi,
+                    change_oi=row.change_oi,
+                    implied_vol=row.implied_vol,
+                    iv_source=row.iv_source,
+                    delta=row.delta,
+                    gamma=row.gamma,
+                    theta=row.theta,
+                    vega=row.vega,
+                    rho=row.rho,
+                    moneyness=row.moneyness,
+                )
+                for row in result.rows
+            ],
+            summary=OptionGreeksSummaryResponse(
+                atm_strike=result.summary.atm_strike,
+                lower_strike=result.summary.lower_strike,
+                upper_strike=result.summary.upper_strike,
+                rows_total=result.summary.rows_total,
+                rows_with_greeks=result.summary.rows_with_greeks,
+                coverage=result.summary.coverage,
+                call_delta_total=result.summary.call_delta_total,
+                put_delta_total=result.summary.put_delta_total,
+                net_delta=result.summary.net_delta,
+                gamma_total=result.summary.gamma_total,
+                theta_total=result.summary.theta_total,
+                vega_total=result.summary.vega_total,
+                call_oi=result.summary.call_oi,
+                put_oi=result.summary.put_oi,
+                put_call_oi_ratio=result.summary.put_call_oi_ratio,
+            ),
         )
         return ResponseEnvelope(status=200, body=_safe_dump(body))
 

@@ -159,6 +159,12 @@ _EXECUTION_REJECTION_EVENT_TYPES = frozenset(
     }
 )
 
+# How recently a position must have been opened for its entry delta to be
+# captured as the anchor. Generous enough to cover a normal mark-to-market
+# interval, tight enough that a delta measured a day into a position is never
+# mistaken for the exposure it was opened with.
+_GREEKS_ANCHOR_WINDOW_SECONDS = 1800.0
+
 
 class AutonomousController(BaseModel):
     """Phase 1 Autonomous Controller — lifecycle/orchestration skeleton.
@@ -1457,6 +1463,63 @@ class AutonomousController(BaseModel):
         instrument.lot_size = int(pos_contract_size) if pos_contract_size else 1
         return instrument
 
+    def _capture_position_greeks(
+        self,
+        pos: Any,
+        quote: Any,
+        *,
+        ltp: float,
+        spot_price: Optional[float],
+    ) -> None:
+        """Record greeks for a held option from a quote already in hand.
+
+        Best-effort by design: greeks enrich the risk picture, they are not a
+        safety gate, so a position whose greeks cannot be computed is left
+        untouched rather than being made to fail some unrelated check. The
+        delta-decay exit reads ``None`` as "cannot evaluate" and declines to
+        fire.
+
+        The entry anchor is only taken while the position is still fresh. An
+        anchor captured later would be measured against today's market and the
+        decay test would silently compare a delta with itself, always reporting
+        no decay. Refusing to anchor late keeps that failure mode unreachable
+        rather than merely unlikely.
+        """
+        from datetime import datetime as _dt, timezone as _tz
+
+        from .greeks import greeks_from_market_inputs
+
+        spot = getattr(quote, "underlying_price", None)
+        if spot is None or not (float(spot) > 0.0):
+            spot = spot_price
+        if spot is None:
+            return
+
+        greeks = greeks_from_market_inputs(
+            spot=spot,
+            strike=getattr(pos, "strike", None),
+            expiry=getattr(pos, "expiry", None),
+            option_type=getattr(pos, "option_type", None),
+            ltp=ltp,
+            quote_iv=getattr(quote, "implied_vol", None),
+        )
+        if greeks is None:
+            return
+
+        try:
+            if getattr(pos, "entry_delta", None) is None:
+                age = pos.holding_seconds() if hasattr(pos, "holding_seconds") else None
+                if age is not None and age <= _GREEKS_ANCHOR_WINDOW_SECONDS:
+                    pos.entry_delta = greeks.delta
+                    pos.entry_iv = greeks.implied_vol
+            pos.last_delta = greeks.delta
+            pos.last_iv = greeks.implied_vol
+            pos.greeks_as_of = _dt.now(_tz.utc).isoformat()
+        except AttributeError:
+            # A position stand-in that does not accept the greeks attributes.
+            # Observability must never be the reason a mark fails.
+            return
+
     def mark_option_positions_to_market(
         self,
         *,
@@ -1464,6 +1527,7 @@ class AutonomousController(BaseModel):
         underlying: str,
         positions,
         max_age_seconds: float = 300.0,
+        spot_price: Optional[float] = None,
     ) -> int:
         """Refresh the broker mark for each open option position from live quotes.
 
@@ -1473,6 +1537,12 @@ class AutonomousController(BaseModel):
         0%, and a stop-loss or take-profit can never be reached. Risk limits are
         only as good as the mark they are measured against, so the mark is
         refreshed before any threshold is evaluated.
+
+        Greeks are captured in the same pass, from the same quote, so the
+        delta-decay exit has a current reading to compare against the entry
+        anchor. ``spot_price`` is optional and used only when the quote payload
+        omits the underlying price; supplying it avoids a case where greeks go
+        unknown purely because of which fields Upstox happened to include.
 
         Fail-closed on pricing: a missing, stale or unparseable quote leaves the
         existing mark untouched rather than guessing a price. Returns the number
@@ -1508,6 +1578,9 @@ class AutonomousController(BaseModel):
                     deployment_id, pos.symbol, ltp
                 ):
                     marked += 1
+                    self._capture_position_greeks(
+                        pos, quote, ltp=ltp, spot_price=spot_price
+                    )
             except Exception as exc:  # noqa: BLE001
                 # A bad quote for one contract must not stop the others, and must
                 # never abort the tick: the stale mark simply fails to trigger.

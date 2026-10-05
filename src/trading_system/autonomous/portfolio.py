@@ -990,6 +990,10 @@ class AutonomousPortfolio:
                                holding it is definitionally capital at risk.
         2. ``time_stop``     - the position has outlived its thesis window.
         3. ``stop_loss`` / ``take_profit`` - configured thresholds.
+        3b. ``delta_decay``  - optional, env-gated and off by default: the
+                               option has lost more than its configured share
+                               of its entry delta. Evaluated after the
+                               thresholds so it can never loosen them.
         4. ``strategy_exit_signal`` / ``strategy_reversal_signal`` - optional,
                                strategy-dependent bonuses.
         """
@@ -1029,6 +1033,14 @@ class AutonomousPortfolio:
                     return "stop_loss"
                 if take_profit is not None and pnl_pct >= abs(float(take_profit)):
                     return "take_profit"
+
+        # --- 3b. Delta decay (opt-in, off by default). Deliberately *after* the
+        # P&L thresholds: the configured stop is a hard floor that this rule
+        # may never override, so switching it on can only close positions
+        # sooner than the percentage rule would have, never later. A position
+        # whose greeks are unknown passes straight through.
+        if self._delta_decay_breached(position):
+            return "delta_decay"
 
         # --- 4. Strategy-dependent bonuses.
         if strategy_id:
@@ -1188,6 +1200,73 @@ class AutonomousPortfolio:
         if holding is None:
             return False
         return holding >= limit
+
+    def _delta_decay_enabled(self) -> bool:
+        """Whether the delta-decay exit is switched on. Off unless opted in.
+
+        Env-gated for the same reason as the time stop: adding a field to
+        ``PaperDeploymentConfig`` would change ``deployment_identity`` and
+        orphan every live deployment. This rule is new and unproven in
+        production, so it ships dark and stays behaviourally inert until
+        someone sets the flag on purpose.
+        """
+        raw = os.environ.get("AUTONOMOUS_DELTA_DECAY_ENABLED", "").strip().lower()
+        return raw in ("1", "true", "yes", "on")
+
+    def _delta_decay_floor(self) -> float:
+        """Minimum share of entry delta a position must retain to be held.
+
+        Defaults to 0.5: once half the original directional exposure is gone,
+        the position is no longer the trade it was opened as. Clamped to
+        (0, 1) because a floor of 0 would exit every position and a floor of 1
+        would exit all of them, since decay is monotonic in time.
+        """
+        raw = os.environ.get("AUTONOMOUS_DELTA_DECAY_FLOOR", "").strip()
+        if not raw:
+            return 0.5
+        try:
+            value = float(raw)
+        except ValueError:
+            logger.warning("ignoring unparseable AUTONOMOUS_DELTA_DECAY_FLOOR=%r", raw)
+            return 0.5
+        if not 0.0 < value < 1.0:
+            logger.warning(
+                "AUTONOMOUS_DELTA_DECAY_FLOOR=%r outside (0, 1); using 0.5", raw
+            )
+            return 0.5
+        return value
+
+    def _delta_decay_breached(self, position: Any) -> bool:
+        """True when a held option has lost too much of its entry delta.
+
+        A percentage stop cannot see this. An option can bleed 20% and still be
+        a perfectly good position if it is a 0.10-delta contract decaying
+        normally, while a 0.50-delta contract losing 4% has had its thesis
+        broken. Both look identical to a P&L threshold. Delta decay asks the
+        question the threshold cannot: does this position still carry the
+        directional exposure it was bought for?
+
+        Returns False whenever the answer is unknown -- the rule is disabled,
+        the position is not an option, or its greeks were never computable --
+        so an unmeasurable position is held under the existing thresholds rather
+        than liquidated on a guess.
+        """
+        if not self._delta_decay_enabled():
+            return False
+        # Explicitly True, not merely "not False": a position object that does
+        # not declare itself an option must be excluded rather than allowed
+        # through by default.
+        if getattr(position, "is_option", None) is not True:
+            return False
+        retention = None
+        if hasattr(position, "delta_retention"):
+            try:
+                retention = position.delta_retention()
+            except Exception:  # noqa: BLE001
+                retention = None
+        if retention is None:
+            return False
+        return retention < self._delta_decay_floor()
 
     @staticmethod
     def _underlying_symbol(position_symbol: str) -> str:

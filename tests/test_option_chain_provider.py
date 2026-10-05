@@ -5,7 +5,10 @@ All tests use mock responses that mirror the real Upstox v2 response shape.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from unittest.mock import MagicMock
+
+import pytest
 
 from trading_system.india.option_chain_provider import (
     UpstoxOptionChainProvider,
@@ -346,6 +349,95 @@ class TestV3Response:
 
 
 class TestPersistence:
+    @staticmethod
+    def _provider_with_failing_session(error=None):
+        """Provider whose snapshot write always raises."""
+        session, sf = make_mock_session()
+        if error is None:
+            error = RuntimeError("disk is full")
+        session.commit.side_effect = error
+        discovery = MagicMock()
+        discovery._provider._get = MagicMock(return_value=SAMPLE_V2_CHAIN)
+        discovery._parse_symbol = MagicMock(return_value=("nse", "NIFTY", "index"))
+        discovery.index_symbol = MagicMock(return_value="NSE_INDEX|NIFTY")
+        return UpstoxOptionChainProvider(discovery=discovery, session_factory=sf)
+
+    def test_persist_failure_is_recorded_not_swallowed(self):
+        """A snapshot write that fails must be latched, not discarded.
+
+        The IV/OI history is what every derived figure (IV rank, percentile,
+        max pain) is computed from, so a silently dropped snapshot is a silent
+        hole in the data rather than a harmless retry.
+        """
+        provider = self._provider_with_failing_session()
+
+        chain = provider.get_chain("NIFTY", "2025-01-30")
+
+        # The chain itself is still valid and must still reach the caller:
+        # halting trading over a history write would be the wrong trade-off.
+        assert chain is not None
+
+        status = provider.persistence_status()
+        assert status["healthy"] is False
+        assert status["failures"] == 1
+        assert "disk is full" in status["last_error"]
+        assert status["last_error_at"] is not None
+
+    def test_persist_failure_count_accumulates(self):
+        provider = self._provider_with_failing_session()
+
+        for _ in range(3):
+            provider.get_chain("NIFTY", "2025-01-30")
+
+        assert provider.persistence_status()["failures"] == 3
+
+    def test_healthy_provider_reports_healthy(self):
+        session, sf = make_mock_session()
+        discovery = MagicMock()
+        discovery._provider._get = MagicMock(return_value=SAMPLE_V2_CHAIN)
+        discovery._parse_symbol = MagicMock(return_value=("nse", "NIFTY", "index"))
+        discovery.index_symbol = MagicMock(return_value="NSE_INDEX|NIFTY")
+
+        provider = UpstoxOptionChainProvider(discovery=discovery, session_factory=sf)
+        assert provider.persistence_status() == {
+            "healthy": True,
+            "failures": 0,
+            "last_error": None,
+            "last_error_at": None,
+        }
+
+        provider.get_chain("NIFTY", "2025-01-30")
+        assert provider.persistence_status()["healthy"] is True
+
+    def test_persist_raises_when_called_directly(self):
+        """``_persist`` itself must not swallow: only its caller knows whether
+        a lost snapshot should degrade the fetch or halt trading."""
+        provider = self._provider_with_failing_session()
+        snapshot = OptionChainSnapshot(
+            snapshot_id="abc123",
+            timestamp=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            provider="upstox",
+            underlying="NIFTY",
+            expiry="2025-01-30",
+            raw_json="{}",
+            validation_status="validated",
+            rows=[],
+        )
+        with pytest.raises(RuntimeError, match="disk is full"):
+            provider._persist(snapshot)
+
+    def test_persistence_status_is_observational(self):
+        """Must be safe to call from the API capability probe: no network, no
+        writes, no mutation of provider state."""
+        provider = self._provider_with_failing_session()
+        provider.get_chain("NIFTY", "2025-01-30")
+
+        before = provider.persistence_status()
+        again = provider.persistence_status()
+        assert before == again
+        # Connectivity probe is a separate concern and must not be conflated.
+        assert provider.is_healthy() is True
+
     def test_snapshot_persisted(self):
         """When session_factory provided, raw_json + rows are persisted."""
         session, sf = make_mock_session()
@@ -557,3 +649,64 @@ class TestHelpers:
         assert _infer_strike_interval([18400, 18500, 18600]) == 100.0
         assert _infer_strike_interval([18400]) == 0.0
         assert _infer_strike_interval([]) == 0.0
+
+
+class TestListExpiries:
+    """The provider's listing contract: real dates in, normalised dates out, and
+    an honest empty list whenever it cannot answer."""
+
+    @staticmethod
+    def _provider(list_expiries=None, raise_exc=None):
+        discovery = MagicMock()
+        if raise_exc is not None:
+            discovery.list_expiries.side_effect = raise_exc
+        else:
+            discovery.list_expiries.return_value = list_expiries or []
+        return UpstoxOptionChainProvider(discovery=discovery)
+
+    def test_returns_normalised_ascending_dates(self):
+        provider = self._provider(["2026-12-17", "2026-11-19"])
+        assert provider.list_expiries("NIFTY") == ["2026-11-19", "2026-12-17"]
+
+    def test_collapses_duplicates(self):
+        # The contract endpoint repeats a series across instruments; collapsing
+        # here means the UI dropdown cannot show the same date twice.
+        provider = self._provider(["2026-11-19", "2026-11-19", "2026-12-17"])
+        assert provider.list_expiries("NIFTY") == ["2026-11-19", "2026-12-17"]
+
+    def test_strips_exchange_prefix_and_normalises_case(self):
+        provider = self._provider(["2026-11-19"])
+        provider.list_expiries("NSE:BANKNIFTY")
+        provider._discovery.list_expiries.assert_called_with("BANKNIFTY")
+
+    def test_blank_underlying_never_reaches_discovery(self):
+        provider = self._provider(["2026-11-19"])
+        assert provider.list_expiries("") == []
+        assert provider.list_expiries("   ") == []
+        provider._discovery.list_expiries.assert_not_called()
+
+    def test_unparseable_values_are_discarded(self):
+        provider = self._provider(["2026-11-19", "not-a-date", "", None, "2026-1-1x"])
+        assert provider.list_expiries("NIFTY") == ["2026-11-19"]
+
+    def test_empty_list_when_unauthenticated(self):
+        """Auth failure is indistinguishable from "no expiries" at this layer, so
+        it must return empty rather than raising or inventing a date."""
+        provider = self._provider(raise_exc=RuntimeError("401 unauthorized"))
+        assert provider.list_expiries("NIFTY") == []
+
+    def test_discovery_without_the_capability_returns_empty(self):
+        discovery = MagicMock(spec=[])
+        provider = UpstoxOptionChainProvider(discovery=discovery)
+        assert provider.list_expiries("NIFTY") == []
+
+    def test_discovery_returning_none_returns_empty(self):
+        provider = self._provider(None)
+        provider._discovery.list_expiries.return_value = None
+        assert provider.list_expiries("NIFTY") == []
+
+    def test_listing_never_fetches_a_chain(self):
+        provider = self._provider(["2026-11-19"])
+        provider._discovery._provider._get.reset_mock()
+        provider.list_expiries("NIFTY")
+        provider._discovery._provider._get.assert_not_called()

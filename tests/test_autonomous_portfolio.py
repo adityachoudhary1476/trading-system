@@ -78,6 +78,27 @@ class FakeBroker:
             contract_size=kwargs.get("contract_size", 1),
             underlying=kwargs.get("underlying", "NIFTY"),
             opened_at=kwargs.get("opened_at"),
+            # Greeks anchors, mirroring the real Position so the delta-decay
+            # path is exercised through the same call shape production uses.
+            entry_delta=kwargs.get("entry_delta"),
+            last_delta=kwargs.get("last_delta"),
+            entry_iv=kwargs.get("entry_iv"),
+            last_iv=kwargs.get("last_iv"),
+            greeks_as_of=kwargs.get("greeks_as_of"),
+        )
+        pos.is_option = pos.option_type in ("CE", "PE")
+
+        def _delta_retention():
+            if pos.entry_delta is None or pos.last_delta is None:
+                return None
+            anchor = abs(float(pos.entry_delta))
+            if anchor <= 0.0:
+                return None
+            return abs(float(pos.last_delta)) / anchor
+
+        pos.delta_retention = _delta_retention
+        pos.has_greeks = lambda: (
+            pos.entry_delta is not None and pos.last_delta is not None
         )
         # Mirrors Position.holding_seconds so the time-stop path is exercised
         # through the same call shape production uses.
@@ -1145,10 +1166,13 @@ def test_portfolio_snapshot_is_persisted_for_cross_process_reads():
 def _hold(controller, **kwargs):
     """An open option position owned by a strategy that has gone silent."""
     broker = controller.control_center._broker
+    # Default to a call, but let a caller override the option type (or clear it
+    # with None to model a plain equity position).
+    option_type = kwargs.pop("option_type", "CE")
     pos = broker.add_position(
         kwargs.pop("symbol", "NFO:NIFTY_CE_1"),
         options_contract_id="NIFTY_CE_1",
-        option_type="CE",
+        option_type=option_type,
         strike=25000.0,
         **kwargs,
     )
@@ -1480,3 +1504,240 @@ def test_short_rally_is_a_loss_not_a_take_profit():
     assert portfolio._exit_reason(
         position=pos, strategy_id="momentum", opportunity_by_strategy={}
     ) == "strategy_exit_signal"  # fell through to the strategy rule, not take_profit
+
+
+# --------------------------------------------------------------------- #
+# Delta-decay exit (opt-in, off by default)
+# --------------------------------------------------------------------- #
+def _enable_delta_decay(monkeypatch, floor: float = 0.5) -> None:
+    """Switch on the delta-decay exit.
+
+    An environment variable, not a ``PaperDeploymentConfig`` field, for the same
+    reason as the time stop: ``deployment_identity`` hashes the whole config,
+    so a new field would change the id of every live deployment and orphan its
+    session, book and open positions.
+    """
+    monkeypatch.setenv("AUTONOMOUS_DELTA_DECAY_ENABLED", "1")
+    monkeypatch.setenv("AUTONOMOUS_DELTA_DECAY_FLOOR", str(floor))
+
+
+def test_delta_decay_is_inert_by_default(monkeypatch):
+    """Ships dark. With no opt-in, a collapsed position must be held.
+
+    The rule is unproven, so it must not change any behaviour until someone
+    deliberately turns it on.
+    """
+    monkeypatch.delenv("AUTONOMOUS_DELTA_DECAY_ENABLED", raising=False)
+    monkeypatch.delenv("AUTONOMOUS_DELTA_DECAY_FLOOR", raising=False)
+
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    # No price move at all, so the strategy bonus cannot fire and the only
+    # thing under test is whether delta decay is active.
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=100.0,
+        entry_delta=0.50, last_delta=0.05,
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # -3% is inside the 3% stop only if the config carries one; the default
+    # config does not, so without the opt-in this position is simply held.
+    # strategy_id is deliberately empty: a strategy that has gone quiet exits
+    # on its own bonus, which would mask whether delta decay fired at all.
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="", opportunity_by_strategy={}
+    ) is None
+
+
+def test_delta_decay_exits_when_exposure_has_collapsed(monkeypatch):
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.5)
+    _stub_exit_fill(controller)
+
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=99.0,
+        entry_delta=0.50, last_delta=0.10,  # 20% retained
+    )
+    assert pos.delta_retention() == pytest.approx(0.2)
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    results = portfolio.exit_positions(
+        spot_price=25_000.0, opportunity_by_strategy={}, session_id="sess-1"
+    )
+    assert results and results[0]["result"] == "exited"
+    assert results[0]["reason"] == "delta_decay"
+
+
+def test_delta_decay_holds_while_exposure_is_intact(monkeypatch):
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.5)
+
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=100.0,
+        entry_delta=0.50, last_delta=0.42,  # 84% retained
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # strategy_id is deliberately empty: a strategy that has gone quiet exits
+    # on its own bonus, which would mask whether delta decay fired at all.
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="", opportunity_by_strategy={}
+    ) is None
+
+
+def test_delta_decay_does_not_fire_when_greeks_are_unknown(monkeypatch):
+    """A position whose volatility could never be solved must be held.
+
+    Treating unknown greeks as "no decay" is the safe direction: the existing
+    thresholds still govern it. Treating them as collapsed would liquidate
+    every position on any tick where the maths could not run.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.5)
+
+    pos = _hold(controller, avg_entry_price=100.0, current_price=100.0)
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    assert pos.entry_delta is None and pos.last_delta is None
+    # strategy_id is deliberately empty: a strategy that has gone quiet exits
+    # on its own bonus, which would mask whether delta decay fired at all.
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="", opportunity_by_strategy={}
+    ) is None
+
+
+def test_delta_decay_needs_both_anchor_and_current_reading(monkeypatch):
+    """One point cannot express a change. With only an entry anchor the test
+    must decline rather than compare a delta against itself."""
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.5)
+
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=100.0,
+        entry_delta=0.50,  # no last_delta
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # strategy_id is deliberately empty: a strategy that has gone quiet exits
+    # on its own bonus, which would mask whether delta decay fired at all.
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="", opportunity_by_strategy={}
+    ) is None
+
+
+def test_delta_decay_never_overrides_the_pnl_floor(monkeypatch):
+    """The configured stop wins when both would fire.
+
+    Ordering guarantee: enabling delta decay may only close positions *sooner*
+    than the percentage rule would have, never later, so the hard floor can
+    never be loosened by turning this on.
+    """
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.5)
+    portfolio._deployment_config().stop_loss_pct = 0.03
+
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=95.0,  # -5%: stop_loss
+        entry_delta=0.50, last_delta=0.10,                      # and decayed
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="momentum", opportunity_by_strategy={}
+    ) == "stop_loss"
+
+
+def test_delta_decay_ignores_non_option_positions(monkeypatch):
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.5)
+
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=99.0,
+        option_type=None, entry_delta=0.5, last_delta=0.05,
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    # strategy_id is deliberately empty: a strategy that has gone quiet exits
+    # on its own bonus, which would mask whether delta decay fired at all.
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="", opportunity_by_strategy={}
+    ) is None
+
+
+def test_delta_decay_works_for_long_puts(monkeypatch):
+    """A put's delta is negative; the ratio must be on magnitudes."""
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.5)
+    _stub_exit_fill(controller)
+
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=99.0,
+        entry_delta=-0.40, last_delta=-0.10,
+    )
+    # The magnitudes match even though the signs differ.
+    assert pos.delta_retention() == pytest.approx(0.25)
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+
+    results = portfolio.exit_positions(
+        spot_price=25_000.0, opportunity_by_strategy={}, session_id="sess-1"
+    )
+    assert results and results[0]["reason"] == "delta_decay"
+
+
+def test_delta_decay_floor_is_configurable(monkeypatch):
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    _enable_delta_decay(monkeypatch, floor=0.9)
+
+    pos = _hold(
+        controller, avg_entry_price=100.0, current_price=99.0,
+        entry_delta=0.50, last_delta=0.40,  # 80% retained: under a 0.9 floor
+    )
+    portfolio._set_attribution("NIFTY_CE_1", "NFO:NIFTY_CE_1", "momentum")
+    assert portfolio._exit_reason(
+        position=pos, strategy_id="momentum", opportunity_by_strategy={}
+    ) == "delta_decay"
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "1", "-0.5", "2.0"])
+def test_bad_floor_falls_back_to_a_safe_default(monkeypatch, raw):
+    """A nonsensical floor must not exit everything or nothing."""
+    monkeypatch.setenv("AUTONOMOUS_DELTA_DECAY_ENABLED", "1")
+    monkeypatch.setenv("AUTONOMOUS_DELTA_DECAY_FLOOR", raw)
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    assert portfolio._delta_decay_floor() == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("1", True), ("true", True), ("YES", True), ("on", True),
+     ("0", False), ("false", False), ("", False), ("maybe", False)],
+)
+def test_enable_flag_parsing(monkeypatch, raw, expected):
+    monkeypatch.setenv("AUTONOMOUS_DELTA_DECAY_ENABLED", raw)
+    controller = FakeController()
+    portfolio = make_portfolio(controller)
+    assert portfolio._delta_decay_enabled() is expected
+
+
+def test_delta_decay_does_not_perturb_deployment_identity(monkeypatch):
+    """The regression this whole env-gating scheme exists to prevent: adding a
+    risk knob must not change any deployment's id, or its live session, book and
+    open positions are orphaned."""
+    from trading_system.paper.deployment import PaperDeploymentConfig
+
+    _enable_delta_decay(monkeypatch, floor=0.3)
+    cfg = PaperDeploymentConfig(execution_mode="paper")
+    dumped = cfg.model_dump(mode="json")
+    for forbidden in (
+        "delta_decay", "delta_decay_floor", "entry_delta", "last_delta",
+    ):
+        assert forbidden not in dumped

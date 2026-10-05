@@ -25,6 +25,7 @@ const PAPER_OPS = [
   { to: "/paper/positions", label: "Positions", icon: "◫" },
   { to: "/paper/sessions", label: "Sessions", icon: "◷" },
   { to: "/paper/autonomous", label: "Autonomous", icon: "✦" },
+  { to: "/paper/options", label: "Options", icon: "△" },
 ];
 
 const PAPER_MONITORING = [

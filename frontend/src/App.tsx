@@ -13,6 +13,7 @@ import { PaperOverview } from "@/pages/paper/PaperOverview";
 import { PaperDeployments } from "@/pages/paper/PaperDeployments";
 import { PaperDeploymentDetail } from "@/pages/paper/PaperDeploymentDetail";
 import { PaperStrategies } from "@/pages/paper/PaperStrategies";
+import { PaperOptionsAnalytics } from "@/pages/paper/PaperOptionsAnalytics";
 import { PaperSessions } from "@/pages/paper/PaperSessions";
 import { PaperPositions } from "@/pages/paper/PaperPositions";
 import { PaperEvents } from "@/pages/paper/PaperEvents";
@@ -70,6 +71,7 @@ export function App() {
             <Route path="sessions/:deploymentId" element={<PaperSessions />} />
             <Route path="positions" element={<PaperPositions />} />
             <Route path="positions/:deploymentId" element={<PaperPositions />} />
+            <Route path="options" element={<PaperOptionsAnalytics />} />
             <Route path="events" element={<PaperEvents />} />
             <Route path="events/:deploymentId" element={<PaperEvents />} />
             <Route path="risk" element={<PaperRiskHealth />} />

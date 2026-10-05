@@ -119,6 +119,15 @@ def _position_payload(position: Position) -> dict:
         "option_type": position.option_type,
         "contract_size": int(position.contract_size),
         "opened_at": position.opened_at,
+        # Greeks anchors. Held in the live book rather than recomputed on read,
+        # because ``entry_delta`` is a one-time measurement taken at the fill:
+        # reconstructing it from later market data would compare today's delta
+        # against itself and report no decay ever.
+        "entry_delta": position.entry_delta,
+        "last_delta": position.last_delta,
+        "entry_iv": position.entry_iv,
+        "last_iv": position.last_iv,
+        "greeks_as_of": position.greeks_as_of,
     }
 
 
@@ -291,6 +300,14 @@ def _position_from_payload(data: dict) -> Position:
         # unknown age is reported as unknown rather than as brand new, so a
         # time stop can refuse to fire on a guess.
         opened_at=data.get("opened_at"),
+        # Likewise absent on books written before greeks tracking existed. The
+        # defaults are None, which reads as "greeks unknown" and makes any
+        # delta-based exit decline to fire rather than guess.
+        entry_delta=data.get("entry_delta"),
+        last_delta=data.get("last_delta"),
+        entry_iv=data.get("entry_iv"),
+        last_iv=data.get("last_iv"),
+        greeks_as_of=data.get("greeks_as_of"),
     )
 
 

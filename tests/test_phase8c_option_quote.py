@@ -444,3 +444,96 @@ class TestIdentityIdempotency:
         assert q1.ltp == 180.0
         assert q2.ltp == 150.0
         assert q1.contract_id != q2.contract_id
+
+# --------------------------------------------------------------------------- #
+# K. Volatility inputs for the greeks path
+# --------------------------------------------------------------------------- #
+class TestQuoteVolatilityFields:
+    """Upstox returns the underlying price and option IVs in the same quote
+    payload the premium came from, so the greeks path gets them for free. The
+    requirement is that a *missing* value stays None rather than becoming a
+    default: a fabricated volatility silently yields confident, wrong greeks.
+    """
+
+    def _quote(self, payload_extra, symbol="NSE:NIFTY25DEC24900CE"):
+        resp = _make_quote_response(symbol=symbol)
+        resp["data"][symbol].update(payload_extra)
+        qp = CurrentOptionQuoteProvider(_make_mock_provider(quote_response=resp))
+        quote = qp.get_quote(_make_option(provider_symbol=symbol))
+        assert quote is not None
+        return quote
+
+    def test_snake_case_iv_keys_are_read(self):
+        quote = self._quote(
+            {"bid_iv": 14.2, "ask_iv": 15.8, "underlying_price": 25010.0}
+        )
+        # 14.2 and 15.8 are percentage points as sent by Upstox; the parser
+        # stores them as the decimal fractions Black-Scholes needs.
+        assert quote.bid_iv == pytest.approx(0.142)
+        assert quote.ask_iv == pytest.approx(0.158)
+        assert quote.underlying_price == pytest.approx(25010.0)
+        assert quote.implied_vol == pytest.approx(0.15)
+
+    def test_camel_case_iv_keys_are_read(self):
+        quote = self._quote(
+            {"bidIv": 13.0, "askIv": 13.6, "underlyingPrice": 24990.0}
+        )
+        assert quote.bid_iv == pytest.approx(0.13)
+        assert quote.ask_iv == pytest.approx(0.136)
+        assert quote.underlying_price == pytest.approx(24990.0)
+
+    def test_already_decimal_iv_passes_through(self):
+        """A provider that sends a fraction must not be divided by 100 again."""
+        quote = self._quote({"bid_iv": 0.2, "ask_iv": 0.3})
+        assert quote.bid_iv == pytest.approx(0.2)
+        assert quote.implied_vol == pytest.approx(0.25)
+
+    def test_absent_iv_stays_none(self):
+        quote = self._quote({})
+        assert quote.bid_iv is None
+        assert quote.ask_iv is None
+        assert quote.implied_vol is None
+        assert quote.underlying_price is None
+
+    def test_one_sided_iv_still_yields_a_mid(self):
+        quote = self._quote({"bid_iv": 14.0})
+        assert quote.implied_vol == pytest.approx(0.14)
+
+    def test_crossed_iv_is_rejected(self):
+        """bid > ask means a bad payload, not a real quote."""
+        quote = self._quote({"bid_iv": 20.0, "ask_iv": 10.0})
+        assert quote.implied_vol is None
+
+    def test_zero_iv_is_treated_as_absent(self):
+        """Upstox sends 0 for absent IV; a 0.0 volatility has no meaning and
+        would divide by zero in the greeks denominators."""
+        quote = self._quote({"bid_iv": 0.0, "ask_iv": 0.0})
+        assert quote.bid_iv is None
+        assert quote.ask_iv is None
+        assert quote.implied_vol is None
+
+    def test_negative_iv_is_treated_as_absent(self):
+        quote = self._quote({"bid_iv": -5.0, "ask_iv": 14.0})
+        assert quote.bid_iv is None
+        assert quote.implied_vol == pytest.approx(0.14)
+
+    def test_unparseable_iv_is_treated_as_absent(self):
+        quote = self._quote({"bid_iv": "n/a", "ask_iv": 14.0})
+        assert quote.bid_iv is None
+        assert quote.implied_vol == pytest.approx(0.14)
+
+    def test_volatility_fields_are_serialised(self):
+        quote = self._quote({"bid_iv": 14.0, "ask_iv": 16.0})
+        payload = quote.to_dict()
+        assert payload["bid_iv"] == pytest.approx(0.14)
+        assert payload["implied_vol"] == pytest.approx(0.15)
+        assert "underlying_price" in payload
+
+    def test_existing_quote_fields_unchanged(self):
+        """The IV extraction must not disturb the premium path."""
+        quote = self._quote({"bid_iv": 14.0, "ask_iv": 16.0})
+        assert quote.ltp == pytest.approx(180.0)
+        assert quote.bid == pytest.approx(179.0)
+        assert quote.ask == pytest.approx(181.0)
+        assert quote.oi == pytest.approx(100000)
+        assert quote.volume == pytest.approx(500)

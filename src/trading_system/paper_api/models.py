@@ -552,3 +552,109 @@ class OptionChainSnapshotResponse(BaseModel):
     validation_status: str = "validated"
     snapshot_id: Optional[str] = None
     fetched_at: Optional[str] = None
+
+class OptionGreeksRowResponse(BaseModel):
+    """Greeks and market data for one strike on one side of the chain.
+
+    Strictly observational: this row is derived from provider data and places no
+    order. Every greeks field is ``Optional`` and ``None`` means "could not be
+    computed", never 0.0 — a greeks table that renders 0.00 for an unsolvable
+    strike is indistinguishable from a genuinely zero-delta strike, and those two
+    mean opposite things.
+
+    ``iv_source`` records how ``implied_vol`` was obtained. ``"quote"`` is the
+    market's own bid/ask IV and carries the real skew; ``"solved"`` is volatility
+    inverted out of a single mid premium and is only as good as that mid.
+    """
+
+    strike: float
+    option_type: str  # "CE" or "PE"
+    instrument_key: Optional[str] = None
+    ltp: Optional[float] = None
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    oi: Optional[int] = None
+    change_oi: Optional[int] = None
+    implied_vol: Optional[float] = None
+    iv_source: Optional[str] = None
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega: Optional[float] = None
+    rho: Optional[float] = None
+    moneyness: Optional[str] = None  # "ITM" | "ATM" | "OTM"
+
+
+class OptionGreeksSummaryResponse(BaseModel):
+    """Aggregates over the analysed strike window.
+
+    Every total is paired with the row count behind it. Without that, a net delta
+    of 120.0 computed from 6 of 40 rows would be indistinguishable from one
+    computed from all 40.
+    """
+
+    atm_strike: Optional[float] = None
+    lower_strike: Optional[float] = None
+    upper_strike: Optional[float] = None
+    rows_total: int = 0
+    rows_with_greeks: int = 0
+    coverage: Optional[float] = None
+    call_delta_total: Optional[float] = None
+    put_delta_total: Optional[float] = None
+    net_delta: Optional[float] = None
+    gamma_total: Optional[float] = None
+    theta_total: Optional[float] = None
+    vega_total: Optional[float] = None
+    call_oi: Optional[int] = None
+    put_oi: Optional[int] = None
+    put_call_oi_ratio: Optional[float] = None
+
+
+class OptionsAnalyticsResponse(BaseModel):
+    """Per-strike greeks and window aggregates for an option chain.
+
+    Read-only and observational. It reports what the market looks like; it does
+    not enable options trading, register providers, or place orders.
+
+    The window is always explicit. A NIFTY weekly chain runs to several hundred
+    strikes whose greeks are numerically valid but economically meaningless, so
+    this covers a bounded band around the money and says in ``notes`` when it has
+    narrowed anything.
+    """
+
+    underlying: str
+    expiry: str
+    as_of: str
+    spot_price: Optional[float] = None
+    strike_interval: Optional[float] = None
+    window_strikes: Optional[int] = None
+    window_truncated: bool = False
+    rows: list[OptionGreeksRowResponse] = Field(default_factory=list)
+    summary: OptionGreeksSummaryResponse = Field(
+        default_factory=OptionGreeksSummaryResponse
+    )
+    notes: list[str] = Field(default_factory=list)
+
+
+class OptionExpiriesResponse(BaseModel):
+    """Expiries the exchange currently lists for an underlying.
+
+    Exists so a caller can pick an expiry instead of guessing one. Upstox's
+    chain endpoint requires ``expiry_date`` and 400s without it, so a guessed or
+    mistyped date surfaces as a bare failure — or, worse, silently resolves to a
+    different contract series.
+
+    ``expiries`` is ascending and future-only: greeks for an expired series are
+    undefined, and offering them would just invite a pointless request. The count
+    of dropped past expiries is in ``notes`` so nothing disappears silently.
+
+    ``source`` says where the list came from. ``"unavailable"`` with an empty
+    list means the provider could not be queried; it never means "no expiries
+    exist", because the provider does not invent an answer on failure.
+    """
+
+    underlying: str
+    expiries: list[str] = Field(default_factory=list)
+    count: int = 0
+    source: str = "provider"
+    notes: list[str] = Field(default_factory=list)

@@ -23,6 +23,8 @@ import type {
   HealthResponse,
   OrderIntentResponse,
   OptionsCapabilityResponse,
+  OptionsAnalyticsResponse,
+  OptionExpiriesResponse,
   PaperOrderIntent,
   PerformanceResponse,
   Phase22StrategySpec,
@@ -303,6 +305,44 @@ export const paperApi = {
     if (params?.limit) qs.set("limit", String(params.limit));
     const q = qs.toString();
     return get<AllocationResponse>(`/allocation${q ? `?${q}` : ""}`);
+  },
+
+  /**
+   * Per-strike greeks for a bounded band around the money. Read-only: it
+   * reports what the chain looks like and never places orders.
+   *
+   * `strikes` is the number of strikes either side of ATM. It is omitted when
+   * undefined so the backend applies its own default, and 0 is passed through as
+   * a real request for ATM-only rather than being treated as absent.
+   */
+  getOptionsAnalytics: (
+    deploymentId: string,
+    symbol: string,
+    params?: { expiry: string; strikes?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (params?.expiry) qs.set("expiry", params.expiry);
+    if (params?.strikes !== undefined) qs.set("strikes", String(params.strikes));
+    const q = qs.toString();
+    return get<OptionsAnalyticsResponse>(
+      `/deployments/${encodeURIComponent(deploymentId)}/options/analytics/` +
+        `${encodeURIComponent(symbol)}${q ? `?${q}` : ""}`,
+    );
+  },
+
+  /**
+   * Lists the expiries the exchange actually has for this underlying, so the
+   * UI can offer a dropdown instead of asking the user to type a date that may
+   * not exist. Read-only: this fetches a contract listing, not a chain.
+   */
+  getOptionExpiries: (
+    deploymentId: string,
+    symbol?: string,
+  ) => {
+    const qs = symbol ? `?symbol=${encodeURIComponent(symbol)}` : "";
+    return get<OptionExpiriesResponse>(
+      `/deployments/${encodeURIComponent(deploymentId)}/options/expiries${qs}`,
+    );
   },
 
   async request<T>(path: string, init?: RequestInit): Promise<T> {

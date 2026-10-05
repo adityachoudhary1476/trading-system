@@ -54,6 +54,49 @@ class Position:
     # playing out.
     opened_at: Optional[str] = None
 
+    # --- Greeks anchors (optional) ---
+    # Delta at entry, and the most recently computed delta. Their ratio is what
+    # tells you whether the position still expresses the view it was opened
+    # for: a 0.50-delta call that has decayed to 0.10 no longer carries the
+    # directional exposure that justified buying it, and a percentage stop
+    # cannot see that because premium loss alone does not distinguish ordinary
+    # decay from a broken thesis.
+    #
+    # ``entry_delta`` is the anchor and must be captured at or near the fill;
+    # recomputing it later from today's inputs would compare today's delta to
+    # itself and always report no decay. Both stay None when the inputs needed
+    # to solve volatility were unavailable, which callers must treat as
+    # "greeks unknown" rather than as zero exposure.
+    entry_delta: Optional[float] = None
+    last_delta: Optional[float] = None
+    entry_iv: Optional[float] = None
+    last_iv: Optional[float] = None
+    greeks_as_of: Optional[str] = None
+
+    def has_greeks(self) -> bool:
+        """True when both the entry anchor and a current reading exist.
+
+        A delta-decay test needs two points. With only one, any comparison
+        silently becomes either "no decay" or a ratio against zero, so the
+        honest answer is that the test cannot be evaluated.
+        """
+        return self.entry_delta is not None and self.last_delta is not None
+
+    def delta_retention(self) -> Optional[float]:
+        """|current delta| / |entry delta|, or None if unavailable.
+
+        1.0 means the position still carries its original directional exposure;
+        0.5 means half of it has decayed away. Returns None — never 0.0 — when
+        either point is missing, so an unmeasurable position is never confused
+        with one whose exposure has fully collapsed.
+        """
+        if not self.has_greeks():
+            return None
+        anchor = abs(float(self.entry_delta))
+        if anchor <= 0.0:
+            return None
+        return abs(float(self.last_delta)) / anchor
+
     def holding_seconds(self, now: Optional[datetime] = None) -> Optional[float]:
         """Seconds this position has been open, or None if unknown.
 
@@ -120,6 +163,12 @@ class Position:
             d["contract_size"] = self.contract_size
         if self.opened_at is not None:
             d["opened_at"] = self.opened_at
+        for field_name in (
+            "entry_delta", "last_delta", "entry_iv", "last_iv", "greeks_as_of",
+        ):
+            value = getattr(self, field_name)
+            if value is not None:
+                d[field_name] = value
         return d
 
 

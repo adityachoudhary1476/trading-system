@@ -60,6 +60,18 @@ def _to_float(v: Any) -> Optional[float]:
         return None
 
 
+def _normalise_iv(v: Any) -> Optional[float]:
+    """Convert raw chain IV to a decimal fraction via the shared authority.
+
+    Lazily imported for the same reason as in ``india.option_quotes``: importing
+    ``autonomous.greeks`` runs the ``autonomous`` package ``__init__``, which
+    imports the controller, which imports this module.
+    """
+    from ..autonomous.greeks import normalise_iv
+
+    return normalise_iv(v)
+
+
 def _to_int(v: Any) -> Optional[int]:
     if v is None:
         return None
@@ -189,6 +201,13 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
     ):
         self._discovery = discovery
         self._session_factory = session_factory  # Optional[Callable[[], Session]]
+        # Persistence health is tracked rather than swallowed. A snapshot that
+        # fails to write is a hole in the IV/OI history that every derived
+        # analytics figure (IV rank, percentile, max pain) is computed from, so
+        # the gap has to be visible rather than quietly accumulating.
+        self._persist_failures = 0
+        self._last_persist_error: Optional[str] = None
+        self._last_persist_error_at: Optional[str] = None
 
     # -- public protocol method --
     def get_chain(self, underlying: str, expiry: str) -> Optional[OptionsChain]:
@@ -209,7 +228,21 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
             return None  # malformed — fail closed
 
         if self._session_factory:
-            self._persist(result.snapshot)
+            try:
+                self._persist(result.snapshot)
+            except Exception as exc:  # noqa: BLE001
+                # Recorded, not fatal. The chain in hand is valid and trading
+                # must not stop because a history write failed, but the failure
+                # is latched so it can be surfaced by ``persistence_status``
+                # and the API capability probe. Silently discarding it here is
+                # what previously let IV/OI history rot unnoticed.
+                self._persist_failures += 1
+                self._last_persist_error = f"{type(exc).__name__}: {exc}"
+                self._last_persist_error_at = datetime.now(timezone.utc).isoformat()
+                logger.error(
+                    "option chain snapshot PERSIST FAILED (%d total) for %s: %s",
+                    self._persist_failures, symbol, exc,
+                )
 
         if not result.chain.call_quotes and not result.chain.put_quotes:
             return None  # no usable data — fail closed
@@ -265,6 +298,36 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
             if expiries:
                 return _normalize_expiry(expiries[0])
         return ""
+
+    def list_expiries(self, underlying: str) -> list[str]:
+        """Expiry dates (ISO, ascending) listed for ``underlying``.
+
+        Read-only and observational: it lists what the exchange has published so
+        a caller can choose one, without fetching a chain. Delegates to the
+        discovery layer's ``/option/contract`` lister.
+
+        Returns an empty list when the underlying cannot be resolved or the
+        provider is unauthenticated — it never fabricates an expiry date. A
+        guessed expiry would produce a chain request that either 404s or, worse,
+        silently resolves to a different contract series.
+        """
+        raw_symbol = (underlying or "").split(":")[-1].strip().upper()
+        if not raw_symbol:
+            return []
+        lister = getattr(self._discovery, "list_expiries", None)
+        if not callable(lister):
+            return []
+        try:
+            expiries = lister(raw_symbol)
+        except Exception:  # noqa: BLE001 - discovery is best-effort here
+            logger.exception("list_expiries failed for %s", raw_symbol)
+            return []
+        out: list[str] = []
+        for value in expiries or []:
+            iso = _normalize_expiry(value) if value else ""
+            if iso and _ISO_DATE_RE.match(iso):
+                out.append(iso)
+        return sorted(set(out))
 
     # -- normalize + validate --
     def _normalize(self, resp: dict, symbol: str, expiry: str) -> Optional[ChainFetchResult]:
@@ -412,8 +475,13 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
                     option_type=ot.value,
                     ltp=ltp,
                     change_oi=change_oi,
-                    bid_iv=bid_iv,
-                    ask_iv=ask_iv,
+                    # In-memory quotes carry decimal IV, matching the quote path
+                    # and Black-Scholes. The persisted NormalizedOptionRow above
+                    # deliberately keeps the provider's native percent units, so
+                    # existing history stays internally consistent rather than
+                    # mixing units across snapshots.
+                    bid_iv=_normalise_iv(bid_iv),
+                    ask_iv=_normalise_iv(ask_iv),
                 )
                 if ot == OptionType.CE:
                     call_quotes[quote.strike] = quote
@@ -455,26 +523,42 @@ class UpstoxOptionChainProvider(OptionsChainProvider):
 
     # -- persist --
     def _persist(self, snapshot: OptionChainSnapshot) -> None:
+        """Write a snapshot, or raise.
+
+        Deliberately does not swallow the exception. The caller needs to know a
+        hole was punched in the IV/OI history, and only the caller can decide
+        whether that should degrade the chain fetch or halt trading.
+        """
         from ..paper.option_chain_models import persist_snapshot
 
-        try:
-            with self._session_factory() as session:
-                persist_snapshot(
-                    session,
-                    snapshot_id=snapshot.snapshot_id,
-                    timestamp=snapshot.timestamp,
-                    provider=snapshot.provider,
-                    underlying=snapshot.underlying,
-                    expiry=snapshot.expiry,
-                    raw_json=snapshot.raw_json,
-                    validation_status=snapshot.validation_status,
-                    rows=snapshot.rows,
-                )
-                session.commit()
-        except Exception:
-            logger.exception(
-                "failed to persist option chain snapshot %s", snapshot.snapshot_id
+        with self._session_factory() as session:
+            persist_snapshot(
+                session,
+                snapshot_id=snapshot.snapshot_id,
+                timestamp=snapshot.timestamp,
+                provider=snapshot.provider,
+                underlying=snapshot.underlying,
+                expiry=snapshot.expiry,
+                raw_json=snapshot.raw_json,
+                validation_status=snapshot.validation_status,
+                rows=snapshot.rows,
             )
+            session.commit()
+
+    def persistence_status(self) -> dict:
+        """Report snapshot-persistence health.
+
+        Observational and side-effect free, so it is safe to call from the API
+        capability probe. ``healthy`` is False once any snapshot has failed to
+        persist: the provider may still serve live chain data, but the derived
+        IV/OI history is incomplete and anything computed from it is suspect.
+        """
+        return {
+            "healthy": self._persist_failures == 0,
+            "failures": self._persist_failures,
+            "last_error": self._last_persist_error,
+            "last_error_at": self._last_persist_error_at,
+        }
 
     # -- probe helper for _inspect_options_providers --
     def is_healthy(self) -> bool:

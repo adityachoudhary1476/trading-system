@@ -1206,12 +1206,19 @@ def _sweep_sl_tp_positions(
                 # hold the entry premium, P&L would read 0%, and no threshold
                 # could ever be reached.
                 underlying = dep.symbol.split(":")[-1] if ":" in dep.symbol else dep.symbol
+                # Fallback spot for the greeks pass, and only when the quote
+                # payload omits the underlying price. None rather than a
+                # placeholder: see _fetch_observed_spot_price.
+                observed_spot = _fetch_observed_spot_price(
+                    controller, getattr(dep, "symbol", ""), "1d"
+                )
                 try:
                     marked = controller.mark_option_positions_to_market(
                         deployment_id=dep.deployment_id,
                         underlying=underlying,
                         positions=list(positions),
                         max_age_seconds=_env_max_option_quote_age(),
+                        spot_price=observed_spot,
                     )
                     if marked < len(positions):
                         logger.warning(
@@ -1872,6 +1879,29 @@ def _fetch_current_spot_price(
     except Exception:  # noqa: BLE001
         pass
     return 25000.0
+
+
+def _fetch_observed_spot_price(
+    controller, symbol: str, timeframe: str
+) -> Optional[float]:
+    """Fetch the latest close for *symbol*, or None when there is no real price.
+
+    Same lookup as :func:`_fetch_current_spot_price` but without the 25000.0
+    placeholder, for callers where a plausible-looking wrong number is worse
+    than no number. The greeks path uses this: a fabricated spot yields
+    confident, entirely fictional deltas, which would then drive the
+    delta-decay exit. Unknown greeks are held; invented ones are traded on.
+    """
+    try:
+        center = controller.control_center
+        df = center.load_market_data(symbol, timeframe)
+        if df is not None and len(df) > 0:
+            price = float(df["close"].iloc[-1])
+            if price > 0.0:
+                return price
+    except Exception:  # noqa: BLE001
+        pass
+    return None
 
 
 # --------------------------------------------------------------------------- #

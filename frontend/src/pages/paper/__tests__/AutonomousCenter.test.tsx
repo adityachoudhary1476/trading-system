@@ -228,9 +228,17 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
       schema_version: 1,
     });
     render(<AutonomousCenter />);
+    // The standalone Deployments panel was removed; deployments now feed the
+    // Options Capability probe, so an empty list surfaces there instead.
     await waitFor(() => {
-      expect(screen.getByText("No active deployments")).toBeDefined();
+      expect(
+        screen.getByText(/No deployments available to probe for options capability/i),
+      ).toBeDefined();
     });
+    // An empty list must not leave the capability probe spinning forever.
+    expect(
+      screen.queryByText(/Probing options capability/i),
+    ).not.toBeInTheDocument();
   });
 
   it("renders deployments error state without crashing when API fails", async () => {
@@ -239,10 +247,14 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
     );
     render(<AutonomousCenter />);
     await waitFor(() => {
-      expect(screen.getByText("Deployments unavailable")).toBeDefined();
+      expect(screen.getByText("ACTIVE")).toBeDefined();
     });
     // The rest of the dashboard still renders — no crash, no missing bot section.
     expect(screen.getByText("ACTIVE")).toBeDefined();
+    // And the failure is reported rather than silently rendering as "no data".
+    expect(
+      screen.getByText(/Waiting for deployment data to probe options capability/i),
+    ).toBeDefined();
   });
 
   it("renders empty states when no data", async () => {
@@ -266,8 +278,12 @@ describe("AutonomousCenter — Autonomous Trading Operations Center", () => {
       expect(screen.getByText("ACTIVE")).toBeDefined();
     });
 
-    expect(screen.getByRole("button", { name: "Pause" })).toBeDefined();
-    expect(screen.getByRole("button", { name: "Stop" })).toBeDefined();
+    // Lifecycle is a single state-driven control: Start when not running,
+    // Stop when running. Pause/Resume buttons were deliberately removed.
+    expect(screen.getByRole("button", { name: "Stop autonomous" })).toBeDefined();
+    expect(
+      screen.queryByRole("button", { name: "Start autonomous" }),
+    ).not.toBeInTheDocument();
 
     expect(screen.getByText("Paper Autonomous Bot")).toBeDefined();
     expect(screen.getByText("paper")).toBeDefined();
@@ -498,7 +514,12 @@ describe("AutonomousCenter — regression: shape drift tolerance", () => {
     await waitFor(() => {
       expect(screen.getByText("ACTIVE")).toBeDefined();
     });
-    expect(screen.getByText(/Deployments unavailable/i)).toBeDefined();
+    // Shape drift in the deployments payload must degrade the capability
+    // section only; the bot summary stays rendered.
+    expect(screen.getByText("ACTIVE")).toBeDefined();
+    expect(
+      screen.getByText(/Waiting for deployment data to probe options capability/i),
+    ).toBeDefined();
   });
 
   it("does NOT crash when bot payload is missing deploy counts / status fields", async () => {
@@ -759,7 +780,7 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
       expect(screen.getByText("STOPPED")).toBeDefined();
     });
 
-    const startBtn = screen.getByRole("button", { name: "Start" });
+    const startBtn = screen.getByRole("button", { name: "Start autonomous" });
     expect(startBtn).toBeDefined();
     expect(startBtn).not.toBeDisabled();
   });
@@ -773,7 +794,7 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
       expect(screen.getByText("STOPPED")).toBeDefined();
     });
 
-    const startBtn = screen.getByRole("button", { name: "Start" });
+    const startBtn = screen.getByRole("button", { name: "Start autonomous" });
     fireEvent.click(startBtn);
 
     await waitFor(() => {
@@ -781,7 +802,7 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
     });
   });
 
-  it("RUNNING bot → Start button is not shown (Pause/Stop shown instead)", async () => {
+  it("RUNNING bot → Start button is not shown (Stop shown instead)", async () => {
     vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("running") });
 
     render(<AutonomousCenter />);
@@ -790,12 +811,15 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
       expect(screen.getByText("ACTIVE")).toBeDefined();
     });
 
-    expect(screen.queryByRole("button", { name: "Start" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Pause" })).toBeDefined();
-    expect(screen.getByRole("button", { name: "Stop" })).toBeDefined();
+    expect(screen.queryByRole("button", { name: "Start autonomous" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop autonomous" })).toBeDefined();
+    // Pause/Resume were deliberately removed in favour of the single
+    // state-driven control; nothing should reintroduce them silently.
+    expect(screen.queryByRole("button", { name: "Pause" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Resume" })).not.toBeInTheDocument();
   });
 
-  it("PAUSED bot → Resume button is enabled", async () => {
+  it("PAUSED bot → the start control is available so the bot can be resumed", async () => {
     vi.mocked(paperApi.getAutonomousBot).mockResolvedValue({ bot: mockBot("paused") });
 
     render(<AutonomousCenter />);
@@ -804,9 +828,17 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
       expect(screen.getByText("PAUSED")).toBeDefined();
     });
 
-    const resumeBtn = screen.getByRole("button", { name: "Resume" });
-    expect(resumeBtn).toBeDefined();
-    expect(resumeBtn).not.toBeDisabled();
+    // Resume is surfaced through the same control as start: any non-running
+    // state offers it. If someone reintroduces a separate Resume button this
+    // should be revisited, but the important guarantee — a paused bot can be
+    // driven back to running — is what is pinned here.
+    const startBtn = screen.getByRole("button", { name: "Start autonomous" });
+    expect(startBtn).not.toBeDisabled();
+
+    fireEvent.click(startBtn);
+    await waitFor(() => {
+      expect(paperApi.setAutonomousBotLifecycle).toHaveBeenCalledWith("start");
+    });
   });
 
   it("actionLoading disables the lifecycle button", async () => {
@@ -825,17 +857,18 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
       expect(screen.getByText("STOPPED")).toBeDefined();
     });
 
-    const startBtn = screen.getByRole("button", { name: "Start" });
+    const startBtn = screen.getByRole("button", { name: "Start autonomous" });
     fireEvent.click(startBtn);
 
-    // Button should be disabled while actionLoading is true
+    // While the lifecycle call is in flight the button swaps to a pending
+    // label, so query it by that name and assert it is disabled.
     await waitFor(() => {
-      // Re-query the button as it may be re-rendered
-      const btn = screen.getByRole("button", { name: "Start" });
-      expect(btn).toBeDisabled();
+      expect(screen.getByRole("button", { name: /Starting/ })).toBeDisabled();
     });
 
-    // Resolve and verify button re-enables
+    // Resolve and verify the control returns to its resting, enabled state.
+    // The lifecycle handler refetches the bot afterwards, and getAutonomousBot
+    // is still mocked as "stopped", so the control settles back on Start.
     resolveLifecycle!({
       success: true,
       message: "ok",
@@ -844,8 +877,9 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
     });
 
     await waitFor(() => {
-      const btn = screen.getByRole("button", { name: "Start" });
-      expect(btn).not.toBeDisabled();
+      expect(
+        screen.getByRole("button", { name: "Start autonomous" }),
+      ).not.toBeDisabled();
     });
   });
 
@@ -865,7 +899,7 @@ describe("AutonomousCenter — lifecycle button behavior", () => {
       expect(screen.getByText("STOPPED")).toBeDefined();
     });
 
-    const startBtn = screen.getByRole("button", { name: "Start" });
+    const startBtn = screen.getByRole("button", { name: "Start autonomous" });
     fireEvent.click(startBtn);
 
     await waitFor(() => {
