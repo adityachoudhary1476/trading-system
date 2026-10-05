@@ -504,8 +504,13 @@ def _position_matches(
 
     For BUY: already long with quantity >= target_qty.
     For SELL: already flat (qty <= 0) because Phase 23 never allows shorting.
+    For EXIT: already flat — a flatten intent is satisfied by a flat book, so
+    an EXIT that arrives after the position was already closed must not be
+    turned into a fresh short-SELL order.
     For option-aware matching, the caller should use _option_position_matches_contract.
     """
+    if action == "exit":
+        return position is None or float(position.qty) <= 0
     if position is None:
         return False
     qty = float(position.qty)
@@ -547,6 +552,108 @@ def _get_open_option_positions(center, deployment_id: str) -> list:
         return positions
     except Exception:  # noqa: BLE001
         return []
+
+
+def _active_books(controller) -> list[tuple]:
+    """``(deployment, session_id, runner)`` for every ACTIVE deployment.
+
+    Uses only the public control-center API, so a book is reached the same
+    way the persistence path reaches it.
+    """
+    from trading_system.paper.deployment import PaperDeploymentStatus
+
+    try:
+        center = controller.control_center
+        deployments = center.list_deployments()
+    except Exception:  # noqa: BLE001
+        return []
+    books: list[tuple] = []
+    for dep in deployments:
+        if dep.status != PaperDeploymentStatus.ACTIVE:
+            continue
+        try:
+            sid = center.find_session_for_deployment(dep.deployment_id)
+            if sid is None:
+                continue
+            runner = center.get_runner(sid)
+            if runner is None:
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        books.append((dep, sid, runner))
+    return books
+
+
+def _all_open_option_positions(controller, *, allowed_underlyings=None) -> list:
+    """Every open option position the bot holds across its active books.
+
+    Option positions are keyed by contract symbol, so per-symbol lookups (which
+    only ever see ``NSE:NIFTY``) miss them. Anything that must act on what is
+    actually held goes through here instead.
+    """
+    if allowed_underlyings is None:
+        allowed_underlyings = _env_option_underlyings()
+    held: list = []
+    for dep, _sid, runner in _active_books(controller):
+        try:
+            cfg = getattr(dep, "config", None)
+            if cfg is None or not getattr(cfg, "options_enabled", False):
+                continue
+            if allowed_underlyings:
+                symbol = str(getattr(dep, "symbol", "") or "")
+                underlying = symbol.split(":")[-1] if ":" in symbol else symbol
+                if underlying.upper() not in {u.upper() for u in allowed_underlyings}:
+                    continue
+            held.extend(
+                _get_open_option_positions(
+                    controller.control_center, dep.deployment_id
+                )
+            )
+        except Exception:  # noqa: BLE001
+            continue
+    return held
+
+
+def _has_open_equity_position(controller, symbol: str) -> bool:
+    """True when a book holds a non-option position in ``symbol``."""
+    if not symbol:
+        return False
+    for _dep, _sid, runner in _active_books(controller):
+        try:
+            pos = runner.broker.get_position(symbol)
+            if pos is not None and float(getattr(pos, "qty", 0.0) or 0.0) != 0.0:
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def _route_decision_to_options(controller, decision, option_intent) -> bool:
+    """Should this decision be executed by the option path?
+
+    Routing used to key purely on ``option_intent in ("CE", "PE")``. An EXIT
+    carries no intent — the contract is resolved from the position already
+    held — so every flatten signal fell through to the equity executor, which
+    submitted a SELL of the *underlying* symbol (``NSE:NIFTY``) while the
+    option contract stayed open. The route is now:
+
+      1. an explicit CE/PE intent  -> option path (entry, or narrowed exit);
+      2. not a sell/exit action     -> equity path;
+      3. an equity position in the decision's symbol -> equity path;
+      4. an open option position    -> option path (direction-agnostic close);
+      5. otherwise                  -> equity path (its flat-book guard turns
+         an EXIT with nothing to flatten into a no-op).
+    """
+    action = getattr(getattr(decision, "signal", None), "action", None)
+    action_value = str(getattr(action, "value", action) or "").strip().lower()
+    if option_intent in ("CE", "PE"):
+        return True
+    if action_value not in ("sell", "exit"):
+        return False
+    symbol = str(getattr(decision, "opportunity_symbol", "") or "")
+    if _has_open_equity_position(controller, symbol):
+        return False
+    return bool(_all_open_option_positions(controller))
 
 
 def _check_sl_tp_for_position(runner, position, ts):
@@ -1564,7 +1671,8 @@ def _execute_one_decision(
     from trading_system.execution.orders import OrderIntent, OrderType, Side
 
     symbol = decision.opportunity_symbol
-    action = decision.signal.action.value
+    _raw_action = getattr(decision.signal, "action", None)
+    action = str(getattr(_raw_action, "value", _raw_action) or "").strip().lower()
     timeframe = decision.selected_configuration.timeframe
     strategy_id = decision.selected_configuration.strategy_id
     ref_price = float(decision.signal.reference_price)
@@ -1580,6 +1688,25 @@ def _execute_one_decision(
     )
 
     center = controller.control_center
+
+    # --- Option-exit routing (before the per-symbol equity book lookup). ---
+    # An EXIT/SELL that belongs to an open option position must close the
+    # contract via the option path. The equity lookup below keys on the
+    # underlying symbol (``NSE:NIFTY``) and always reads flat while an option
+    # is open (contracts are keyed by contract symbol), so without this the
+    # EXIT either no-ops as "position_matches" or sells the wrong instrument
+    # while the contract stays open.
+    try:
+        _pre_intent = getattr(decision.signal, "option_intent", None)
+        if _route_decision_to_options(controller, decision, _pre_intent):
+            return _execute_one_option_decision(
+                controller,
+                decision,
+                spot_price=ref_price,
+                target_qty=target_qty,
+            )
+    except Exception:  # noqa: BLE001
+        pass
 
     # --- Locate (or create) an ACTIVE autonomous deployment. ---
     # The decision carries the factory strategy_id; the deployment row stores
@@ -2375,7 +2502,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
         d for d in decisions.decisions
         if d.is_valid
         and d.signal is not None
-        and d.signal.action.value in ("buy", "sell")
+        and str(getattr(d.signal.action, "value", d.signal.action) or "").strip().lower() in ("buy", "sell", "exit")
         and d.selected_configuration is not None
     ]
     if not eligible:
@@ -2411,7 +2538,7 @@ def _run_one_tick(controller, *, target_qty: float = DEFAULT_ORDER_QUANTITY) -> 
             continue
         seen.add(identity)
         try:
-            if option_intent in ("CE", "PE"):
+            if _route_decision_to_options(controller, decision, option_intent):
                 result = _execute_one_option_decision(
                     controller, decision,
                     spot_price=float(decision.signal.reference_price),

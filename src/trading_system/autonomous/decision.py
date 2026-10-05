@@ -56,6 +56,7 @@ from trading_system.strategy_factory.capability import (
 )
 from trading_system.strategy_factory.contract import (
     MarketState,
+    PositionState,
     StrategySignal,
 )
 from trading_system.strategy_factory.discovery import (
@@ -437,13 +438,35 @@ class StrategyDecisionEngine:
         config: SelectionConfig,
         *,
         data_provider: Optional[Callable[[str, str], Optional[pd.DataFrame]]] = None,
+        position_provider: Optional[Callable[[str], Optional[PositionState]]] = None,
     ) -> None:
         if not isinstance(config, SelectionConfig):
             raise TypeError("config must be a SelectionConfig")
         self.config = config
         self._provider = data_provider
+        # Point-in-time snapshot of what the bot already holds for a symbol.
+        # Without it every MarketState is built flat, ``current_position_side()``
+        # always reads 0, and the strategy's transition table can never reach
+        # EXIT -- it re-emits BUY for a position it already owns, or HOLD while
+        # the position should be closed. Optional so a caller that has no broker
+        # (pure research, unit tests) keeps the old flat behaviour.
+        self._position_provider = position_provider
         self._discovered: bool = False
         self._discovered_ids: list[str] = []
+
+    def _position_for(self, symbol: str) -> Optional[PositionState]:
+        """Resolve the live position for ``symbol``; ``None`` means flat.
+
+        Fail-closed: any provider failure reads as "flat", never as a
+        fabricated position -- a strategy must never be told it holds
+        something the book does not.
+        """
+        if self._position_provider is None:
+            return None
+        try:
+            return self._position_provider(symbol)
+        except Exception:  # noqa: BLE001 — fail closed to flat, never raise
+            return None
 
     # ------------------------------------------------------------------ #
     # Discovery
@@ -807,7 +830,7 @@ class StrategyDecisionEngine:
             timeframe=selected.timeframe,
             timestamp=bars.index[-1],
             bars=bars,
-            position=None,
+            position=self._position_for(symbol),
             lookahead_safe=True,
         )
 

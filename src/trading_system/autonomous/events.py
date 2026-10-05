@@ -38,6 +38,33 @@ class AutonomousEventType(str, Enum):
     POLICY_VIOLATION = "policy_violation"
     ERROR = "error"
 
+    # --- Option position exit lifecycle (open option position -> flat) -----
+    # EXIT_NOT_EVALUATED    an option position is open but this cycle could not
+    #                       evaluate its exit (no fresh data / no candidates /
+    #                       no eligible decision / strategy evaluation failed).
+    #                       Fail-visible: holding unnoticed is the failure mode
+    #                       these exist to prevent.
+    # EXIT_CONDITION_FALSE  the exit was evaluated and the strategy still says
+    #                       "stay in" -> the position is deliberately held.
+    # EXIT_SIGNAL_GENERATED the exit condition is true -> a sell-to-close is
+    #                       about to be built from the position's own identity.
+    # EXIT_REJECTED         fail-closed refusal before any order reached the
+    #                       broker (contract identity, quantity or LTP could
+    #                       not be reliably determined).
+    # SELL_SUBMITTED        the sell-to-close reached the paper broker.
+    # SELL_FILLED           the sell-to-close filled.
+    # SELL_FAILED           the sell-to-close was submitted but did not fill.
+    # POSITION_RECONCILED   post-fill broker state re-read: says whether the
+    #                       position is actually flat after the sale.
+    EXIT_NOT_EVALUATED = "exit_not_evaluated"
+    EXIT_CONDITION_FALSE = "exit_condition_false"
+    EXIT_SIGNAL_GENERATED = "exit_signal_generated"
+    EXIT_REJECTED = "exit_rejected"
+    SELL_SUBMITTED = "sell_submitted"
+    SELL_FILLED = "sell_filled"
+    SELL_FAILED = "sell_failed"
+    POSITION_RECONCILED = "position_reconciled"
+
 
 def make_autonomous_event_id(
     deployment_id: str,

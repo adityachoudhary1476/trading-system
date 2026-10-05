@@ -137,6 +137,58 @@ def _resolve_option_order_side(
     return _OPTION_ACTION_TO_SIDE.get(key)
 
 
+# Underlying names recognised in Indian index option symbols. Ordered
+# longest-first so BANKNIFTY is never swallowed by the NIFTY prefix.
+_OPTION_UNDERLYING_NAMES = (
+    "BANKNIFTY",
+    "FINNIFTY",
+    "MIDCPNIFTY",
+    "SENSEX",
+    "NIFTY",
+)
+
+
+def _underlying_name(raw: object) -> str:
+    """Normalise a symbol / contract id to its underlying name (``"NIFTY"``).
+
+    Accepts decision symbols (``NSE:NIFTY``), canonical contract ids
+    (``NFO:NIFTY|2026-10-06|22800|CE``) and provider symbols
+    (``NFO:NIFTY26OCT22800CE``). Trailing digits are dropped through the
+    prefix match, so ``NIFTY50`` and ``NIFTY`` compare equal -- the same
+    normalisation ``AutonomousPortfolio._underlying_symbol`` uses.
+
+    Returns ``""`` when nothing recognised is present. Callers must treat
+    ``""`` as "cannot identify" rather than as a match, or two unrelated
+    symbols would compare equal as empty strings.
+    """
+    text = str(raw or "").strip().upper()
+    if not text:
+        return ""
+    head = text.split("|", 1)[0]
+    if ":" in head:
+        head = head.split(":", 1)[1]
+    for name in _OPTION_UNDERLYING_NAMES:
+        if head.startswith(name):
+            return name
+    return ""
+
+
+def _contract_identity_payload(position: object) -> dict:
+    """The four fields that identify an option contract, plus held quantity.
+
+    Used as the payload of every ``EXIT_REJECTED`` / ``SELL_*`` event so an
+    operator can see *which* contract a refusal or fill was about without
+    having to reconstruct it from the underlying's spot price.
+    """
+    return {
+        "options_contract_id": getattr(position, "options_contract_id", None),
+        "strike": getattr(position, "strike", None),
+        "expiry": getattr(position, "expiry", None),
+        "option_type": getattr(position, "option_type", None),
+        "held_qty": getattr(position, "qty", None),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # AutonomousController — the primary orchestration service.
 # This is the "glue" that connects the autonomous layer to the existing
@@ -1109,6 +1161,86 @@ class AutonomousController(BaseModel):
     # Phase 5 -- Strategy Selection & Signal Generation
     # ------------------------------------------------------------------ #
 
+    # ------------------------------------------------------------------ #
+    # Live position context for strategy evaluation
+    # ------------------------------------------------------------------ #
+    def _position_state_for(self, symbol: str) -> Optional[Any]:
+        """Snapshot of what this bot already holds for ``symbol``.
+
+        Returns a ``PositionState`` (``side``: +1 long / -1 short) or ``None``
+        when the bot is flat for that symbol.
+
+        Why this exists: an option position is keyed in the paper book by its
+        *contract* symbol (``NFO:NIFTY26OCT22800CE``), never by the underlying
+        the decision is made on (``NSE:NIFTY``). A plain
+        ``broker.get_position(symbol)`` therefore always answers "flat" while
+        an option is open, so the strategy is told it holds nothing, its
+        transition table can never reach EXIT, and the option could only ever
+        be closed by a price threshold rather than by the strategy that opened
+        it. Option positions are matched on the underlying resolved from the
+        canonical contract id, so the exit decision sees the position the book
+        actually holds.
+
+        Fail-closed: any lookup failure reads as flat. A position is never
+        inferred, reconstructed from spot, or synthesised.
+        """
+        from ..strategy_factory.contract import PositionState
+
+        if not symbol:
+            return None
+        try:
+            deployments = self.control_center.list_deployments()
+        except Exception:  # noqa: BLE001 — fail closed to "flat"
+            return None
+
+        wanted = _underlying_name(symbol)
+        equity: Optional[Any] = None
+        option: Optional[Any] = None
+        for dep in deployments:
+            try:
+                sid = self.control_center.find_session_for_deployment(dep.deployment_id)
+                if sid is None:
+                    continue
+                runner = self.control_center.get_runner(sid)
+                if runner is None:
+                    continue
+                positions = list(runner.broker.positions().values())
+            except Exception:  # noqa: BLE001 — one bad book must not hide the rest
+                continue
+            for pos in positions:
+                try:
+                    qty = float(getattr(pos, "qty", 0.0) or 0.0)
+                except Exception:  # noqa: BLE001
+                    continue
+                if qty == 0.0:
+                    continue
+                if not getattr(pos, "is_option", False):
+                    if str(getattr(pos, "symbol", "")).upper() == symbol.upper():
+                        equity = pos
+                        break
+                elif option is None and wanted:
+                    pos_raw = getattr(pos, "options_contract_id", None) or getattr(
+                        pos, "symbol", None
+                    )
+                    if _underlying_name(pos_raw) == wanted:
+                        option = pos
+            if equity is not None:
+                break
+
+        chosen = equity if equity is not None else option
+        if chosen is None:
+            return None
+        qty = float(chosen.qty)
+        if qty == 0.0:
+            return None
+        entry = getattr(chosen, "avg_entry_price", 0.0) or 0.0
+        return PositionState(
+            symbol=str(getattr(chosen, "symbol", "")),
+            side=1 if qty > 0 else -1,
+            size=abs(qty),
+            entry_price=float(entry) if entry else None,
+        )
+
     def generate_strategy_decisions(
         self,
         compatibility_result: CompatibilityResult,
@@ -1140,6 +1272,10 @@ class AutonomousController(BaseModel):
         engine = StrategyDecisionEngine(
             sel_config,
             data_provider=self.control_center.load_market_data,
+            # Feed the live book into the strategy so an open position is
+            # visible at evaluation time; without it the transition table can
+            # only ever produce another entry signal for a position it holds.
+            position_provider=self._position_state_for,
         )
         return engine.generate_decisions(compatibility_result)
 
@@ -1639,12 +1775,33 @@ class AutonomousController(BaseModel):
 
         Returns ``OrderResult`` on success, ``None`` on any rejection/failure.
         """
+        is_exit = existing_position is not None
+
+        def _exit_reject(message: str) -> Optional[OrderResult]:
+            """Refuse an exit before it reaches the broker, and say why.
+
+            Every refusal site here returns ``None``; for an *exit* that bare
+            ``None`` was the only observable, so a position that could not be
+            sold was indistinguishable from one that was never attempted.
+            ``EXIT_REJECTED`` is the fail-closed, diagnosable counterpart: an
+            undeterminable contract identity, quantity or LTP must never
+            become a fabricated fill.
+            """
+            if is_exit:
+                self._record_event(
+                    AutonomousEventType.EXIT_REJECTED,
+                    symbol=getattr(decision, "opportunity_symbol", "") or "",
+                    message=message,
+                    payload=_contract_identity_payload(existing_position),
+                )
+            return None
+
         if self._safety_layer.kill_switch.is_halted:
             self._record_event(
                 AutonomousEventType.ERROR,
                 message=f"option execution blocked by kill switch (reason={self._safety_layer.kill_switch.reason})",
             )
-            return None
+            return _exit_reject("exit blocked: kill switch halted")
 
         # --- Resolve the broker side up-front, before any quote fetch ---
         # Rejecting a non-executable action here means a HOLD/typo can never be
@@ -1662,7 +1819,49 @@ class AutonomousController(BaseModel):
                     f"explicit_side={explicit_side!r} action={getattr(decision, 'action', None)!r}"
                 ),
             )
-            return None
+            return _exit_reject(
+                "exit rejected: non-executable action "
+                f"explicit_side={explicit_side!r} action={getattr(decision, 'action', None)!r}"
+            )
+
+        if is_exit:
+            # The exit signal exists and resolves to a sell-to-close. Recorded
+            # before any quote/identity work so a refusal later is visible as
+            # "signal generated -> rejected" rather than as silence.
+            self._record_event(
+                AutonomousEventType.EXIT_SIGNAL_GENERATED,
+                symbol=getattr(decision, "opportunity_symbol", "") or "",
+                message="exit signal generated for open option position",
+                payload={
+                    **_contract_identity_payload(existing_position),
+                    "side": side.value,
+                },
+            )
+            # --- Quantity must be determinable and must never over-sell ---
+            # An over-sized sell-to-close would drive the book through flat
+            # into a short, which Phase 23 forbids; refusing is the fail-closed
+            # answer.
+            try:
+                held_qty = float(getattr(existing_position, "qty", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                held_qty = None
+            if held_qty is None:
+                return _exit_reject(
+                    "exit rejected: existing position quantity is not numeric"
+                )
+            if held_qty == 0.0:
+                return _exit_reject(
+                    "exit rejected: existing position is already flat"
+                )
+            if float(order_quantity) <= 0.0:
+                return _exit_reject(
+                    f"exit rejected: order quantity {order_quantity!r} is not positive"
+                )
+            if float(order_quantity) > abs(held_qty):
+                return _exit_reject(
+                    "exit rejected: requested quantity "
+                    f"{float(order_quantity)} exceeds held quantity {abs(held_qty)}"
+                )
 
         if self._quote_provider is None:
             self._record_event(
@@ -1670,7 +1869,7 @@ class AutonomousController(BaseModel):
                 symbol=decision.opportunity_symbol,
                 message="option execution skipped: no quote provider attached",
             )
-            return None
+            return _exit_reject("exit rejected: no quote provider attached (LTP unknown)")
 
         # --- Resolve instrument + premium ---
         from trading_system.india.instruments import (
@@ -1698,7 +1897,9 @@ class AutonomousController(BaseModel):
                         symbol=decision.opportunity_symbol,
                         message="exit rejected: could not resolve instrument for existing position",
                     )
-                    return None
+                    return _exit_reject(
+                        "exit rejected: could not resolve instrument for existing position"
+                    )
 
                 quote = self._quote_provider.get_quote(instrument)
                 if quote is None:
@@ -1707,21 +1908,28 @@ class AutonomousController(BaseModel):
                         symbol=underlying,
                         message=f"failed to fetch exit premium for {pos_contract_id}",
                     )
-                    return None
+                    return _exit_reject(
+                        f"exit rejected: no LTP available for {pos_contract_id}"
+                    )
                 if not self._quote_provider.is_fresh(quote, max_age_seconds=max_quote_age_seconds):
                     self._record_event(
                         AutonomousEventType.ERROR,
                         symbol=underlying,
                         message=f"exit quote stale: age={quote.age_seconds:.0f}s for {pos_contract_id}",
                     )
-                    return None
+                    return _exit_reject(
+                        f"exit rejected: stale LTP for {pos_contract_id} "
+                        f"(age={quote.age_seconds:.0f}s)"
+                    )
             else:
                 self._record_event(
                     AutonomousEventType.ERROR,
                     symbol=decision.opportunity_symbol,
                     message="exit rejected: existing position missing contract metadata",
                 )
-                return None
+                return _exit_reject(
+                    "exit rejected: existing position missing contract metadata"
+                )
         else:
             # --- Phase 8B + 8C: discover + fetch premium ---
             from .options.model import OptionDirection
@@ -1798,7 +2006,7 @@ class AutonomousController(BaseModel):
                 symbol=instrument.underlying or decision.opportunity_symbol,
                 message=detail,
             )
-            return None
+            return _exit_reject(detail)
 
         # --- Deployment config checks ---
         # Skipped for exits: options_enabled, allowed_option_types and the
@@ -1842,7 +2050,9 @@ class AutonomousController(BaseModel):
                 symbol=instrument.underlying or decision.opportunity_symbol,
                 message="option execution skipped: no active session/deployment for broker",
             )
-            return None
+            return _exit_reject(
+                "exit rejected: no active session/deployment for broker"
+            )
 
         # Pre-compute values needed for idempotency replay and OrderIntent.
         # `side` was resolved (and validated) at the top of this method.
@@ -1920,7 +2130,9 @@ class AutonomousController(BaseModel):
                 symbol=instrument.underlying or decision.opportunity_symbol,
                 message=f"duplicate deployment key for {instrument.contract_id}",
             )
-            return None
+            return _exit_reject(
+                f"exit rejected: duplicate deployment key for {instrument.contract_id}"
+            )
         self._safety_layer.idempotency.mark_deployment(dep_key, sid)
 
         # --- Submit through the control center → PaperBroker ---
@@ -1935,6 +2147,13 @@ class AutonomousController(BaseModel):
                 symbol=instrument.underlying or decision.opportunity_symbol,
                 message=f"order submission rejected: {exc}",
             )
+            if is_exit:
+                self._record_event(
+                    AutonomousEventType.SELL_FAILED,
+                    symbol=instrument.underlying or decision.opportunity_symbol,
+                    message=f"sell-to-close failed at submission: {exc}",
+                    payload=_contract_identity_payload(existing_position),
+                )
             return None
         except Exception as exc:
             self._record_event(
@@ -1942,7 +2161,19 @@ class AutonomousController(BaseModel):
                 symbol=instrument.underlying or decision.opportunity_symbol,
                 message=f"order submission error: {exc}",
             )
+            if is_exit:
+                self._record_event(
+                    AutonomousEventType.SELL_FAILED,
+                    symbol=instrument.underlying or decision.opportunity_symbol,
+                    message=f"sell-to-close failed at submission: {exc}",
+                    payload=_contract_identity_payload(existing_position),
+                )
             return None
+
+        if is_exit:
+            self._record_exit_lifecycle(
+                result=result, session_id=sid, instrument_key=instrument.key
+            )
 
         self._record_event(
             AutonomousEventType.DEPLOYMENT_CREATED,
@@ -1965,6 +2196,97 @@ class AutonomousController(BaseModel):
 
         self.config.decision_count += 1
         return result
+
+    # ------------------------------------------------------------------ #
+    # Exit observability (SELL_* + reconciliation)
+    # ------------------------------------------------------------------ #
+    def _record_exit_lifecycle(
+        self, *, result: "OrderResult", session_id: Any, instrument_key: str
+    ) -> None:
+        """Record the sell-to-close outcome and re-read the book afterwards.
+
+        ``SELL_SUBMITTED`` / ``SELL_FILLED`` / ``SELL_FAILED`` say what the
+        order did; ``POSITION_RECONCILED`` then re-reads the broker position
+        so a fill that left the position open (idempotent replay, partial
+        fill, stale book) is visible as such instead of looking like a
+        completed exit. Reconciliation only ever reports what the book says —
+        it never rewrites it.
+        """
+        status = str(getattr(result, "status", ""))
+        base_payload = {
+            "order_id": getattr(result, "order_id", None),
+            "options_contract_id": getattr(result, "options_contract_id", None),
+            "strike": getattr(result, "strike", None),
+            "expiry": getattr(result, "expiry", None),
+            "option_type": getattr(result, "option_type", None),
+            "filled_quantity": getattr(result, "filled_quantity", None),
+            "avg_fill_price": getattr(result, "avg_fill_price", None),
+            "status": status,
+            "is_idempotent_replay": bool(
+                getattr(result, "is_idempotent_replay", False)
+            ),
+        }
+        symbol = getattr(result, "symbol", None) or instrument_key
+
+        self._record_event(
+            AutonomousEventType.SELL_SUBMITTED,
+            symbol=symbol,
+            message=f"sell-to-close submitted ({status})",
+            payload=dict(base_payload),
+        )
+        if status.upper() == "FILLED":
+            self._record_event(
+                AutonomousEventType.SELL_FILLED,
+                symbol=symbol,
+                message="sell-to-close filled",
+                payload=dict(base_payload),
+            )
+        else:
+            self._record_event(
+                AutonomousEventType.SELL_FAILED,
+                symbol=symbol,
+                message=f"sell-to-close did not fill (status={status})",
+                payload={
+                    **base_payload,
+                    "reject_reason": str(getattr(result, "reject_reason", "") or ""),
+                },
+            )
+
+        qty_after: Optional[float] = None
+        try:
+            runner = self.control_center.get_runner(session_id)
+            positions = runner.broker.positions() if runner is not None else {}
+            pos = positions.get(instrument_key)
+            if pos is not None:
+                qty_after = float(getattr(pos, "qty", 0.0) or 0.0)
+        except Exception:  # noqa: BLE001 — reconciliation must never raise
+            qty_after = None
+        closed = (qty_after == 0.0) if qty_after is not None else None
+        if closed is True:
+            message = "position reconciled flat after sell"
+        elif closed is False:
+            message = f"position NOT flat after sell (qty_after={qty_after})"
+        else:
+            message = "position state unreadable after sell (no reconciliation possible)"
+        self._record_event(
+            AutonomousEventType.POSITION_RECONCILED,
+            symbol=symbol,
+            message=message,
+            payload={**base_payload, "qty_after": qty_after, "closed": closed},
+        )
+        if closed is False:
+            # A filled sell that leaves the position open is exactly the
+            # silent-failure shape this lifecycle exists to prevent, so it is
+            # escalated rather than left buried in a payload.
+            self._record_event(
+                AutonomousEventType.ERROR,
+                symbol=symbol,
+                message=(
+                    "sell-to-close filled but the position is still open "
+                    f"(qty_after={qty_after}); reconciliation failed"
+                ),
+                payload={"order_id": base_payload["order_id"], "qty_after": qty_after},
+            )
 
     # ------------------------------------------------------------------ #
     # Inspect bot state
