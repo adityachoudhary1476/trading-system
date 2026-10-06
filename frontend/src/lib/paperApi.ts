@@ -114,32 +114,70 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    const err = parseError(body);
+    let err = parseError(body, res.status);
+    if (body === null) {
+      // Non-JSON error body (proxy 502, framework 500, etc.). Capture the raw
+      // text so the real message surfaces instead of a generic fallback.
+      try {
+        const raw = await res.text();
+        if (raw.trim()) {
+          err = { ...err, message: raw.trim().slice(0, 500) };
+        }
+      } catch {
+        // Keep the HTTP-status fallback from parseError.
+      }
+    }
     return { ok: false, error: err, status: res.status };
   }
 
   return { ok: true, data: body as T };
 }
 
-function parseError(body: unknown): ApiError {
-  if (
-    body &&
-    typeof body === "object" &&
-    "error" in body &&
-    body.error &&
-    typeof body.error === "object"
-  ) {
-    const e = body.error as Partial<ApiError> & { code?: unknown };
-    return {
-      code: typeof e.code === "string" ? e.code : "unknown_error",
-      message: typeof e.message === "string" ? e.message : "Unknown error",
-      details:
-        typeof e.details === "object" && e.details !== null
-          ? (e.details as Record<string, unknown>)
-          : undefined,
-    };
+function describeDetail(detail: unknown): string {
+  if (typeof detail === "string") return detail || "Request failed";
+  if (Array.isArray(detail)) {
+    const parts = detail
+      .map((d) => {
+        if (d && typeof d === "object" && "msg" in d) {
+          return String((d as { msg: unknown }).msg);
+        }
+        return String(d);
+      })
+      .filter((p) => p && p !== "undefined");
+    return parts.length ? parts.join("; ") : "Request failed";
   }
-  return { code: "unknown_error", message: "Unexpected error response" };
+  if (detail === null || detail === undefined) return "Request failed";
+  try {
+    return JSON.stringify(detail);
+  } catch {
+    return String(detail);
+  }
+}
+
+function parseError(body: unknown, status: number): ApiError {
+  if (body && typeof body === "object" && !Array.isArray(body)) {
+    const obj = body as Record<string, unknown>;
+    const candidate = obj.error;
+    if (candidate && typeof candidate === "object") {
+      const e = candidate as Partial<ApiError> & { code?: unknown };
+      return {
+        code: typeof e.code === "string" ? e.code : "unknown_error",
+        message: typeof e.message === "string" ? e.message : "Unknown error",
+        details:
+          typeof e.details === "object" && e.details !== null
+            ? (e.details as Record<string, unknown>)
+            : undefined,
+      };
+    }
+    // FastAPI / pydantic HTTPException shape: { "detail": "..." }.
+    if (obj.detail !== undefined) {
+      return { code: "http_error", message: describeDetail(obj.detail), details: undefined };
+    }
+  }
+  if (status) {
+    return { code: "http_error", message: `Request failed with HTTP ${status}`, details: undefined };
+  }
+  return { code: "http_error", message: "Request failed", details: undefined };
 }
 
 export function get<T>(path: string): Promise<ApiResult<T>> {
