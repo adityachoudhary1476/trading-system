@@ -1054,37 +1054,52 @@ class TestPositionGreeksAnchors:
     def test_as_dict_omits_unset_greeks(self):
         pos = Position(symbol="X", qty=1)
         payload = pos.as_dict()
-        assert "entry_delta" not in payload
-        assert "last_delta" not in payload
+        for field_name in (
+            "entry_delta", "last_delta", "entry_gamma", "last_gamma",
+            "entry_theta", "last_theta", "entry_vega", "last_vega",
+        ):
+            assert field_name not in payload
 
     def test_as_dict_includes_set_greeks(self):
         pos = Position(
             symbol="X", qty=1, entry_delta=0.5, last_delta=0.2,
-            entry_iv=0.15, last_iv=0.18, greeks_as_of="2026-01-08T09:30:00+00:00",
+            entry_iv=0.15, last_iv=0.18,
+            entry_gamma=0.01, last_gamma=0.02,
+            entry_theta=-1.5, last_theta=-2.0,
+            entry_vega=3.0, last_vega=4.0,
+            greeks_as_of="2026-01-08T09:30:00+00:00",
         )
         payload = pos.as_dict()
         assert payload["entry_delta"] == pytest.approx(0.5)
         assert payload["last_delta"] == pytest.approx(0.2)
         assert payload["entry_iv"] == pytest.approx(0.15)
+        assert payload["last_gamma"] == pytest.approx(0.02)
+        assert payload["last_theta"] == pytest.approx(-2.0)
+        assert payload["last_vega"] == pytest.approx(4.0)
         assert payload["greeks_as_of"] == "2026-01-08T09:30:00+00:00"
 
     def test_greeks_survive_a_book_round_trip(self, store):
         broker = PaperBroker(initial_cash=1_000_000.0)
         pos = _open_option(
             broker, "NSE:NIFTY", f"NSE:OPTIDX|{_future_expiry()}|25000.0|CE",
-            1, 120.0, 100.0,
+            2.0, 199.06615, 190.2,
         )
         pos.entry_delta = 0.52
         pos.last_delta = 0.21
         pos.entry_iv = 0.145
         pos.last_iv = 0.181
+        pos.entry_gamma = 0.011
+        pos.last_gamma = 0.023
+        pos.entry_theta = -1.4
+        pos.last_theta = -2.2
+        pos.entry_vega = 3.1
+        pos.last_vega = 4.3
         pos.greeks_as_of = "2026-01-08T09:30:00+00:00"
 
         book = book_from_broker(
             broker=broker, session_id="s", deployment_id="dep-greeks"
         )
         store.save_book(book)
-
         saved = store.get_book("s")
         assert saved is not None
         fresh = PaperBroker(initial_cash=1_000_000.0)
@@ -1094,6 +1109,12 @@ class TestPositionGreeksAnchors:
         assert restored.last_delta == pytest.approx(0.21)
         assert restored.entry_iv == pytest.approx(0.145)
         assert restored.last_iv == pytest.approx(0.181)
+        assert restored.entry_gamma == pytest.approx(0.011)
+        assert restored.last_gamma == pytest.approx(0.023)
+        assert restored.entry_theta == pytest.approx(-1.4)
+        assert restored.last_theta == pytest.approx(-2.2)
+        assert restored.entry_vega == pytest.approx(3.1)
+        assert restored.last_vega == pytest.approx(4.3)
         assert restored.greeks_as_of == "2026-01-08T09:30:00+00:00"
         assert restored.delta_retention() == pytest.approx(0.21 / 0.52)
 
@@ -1110,7 +1131,9 @@ class TestPositionGreeksAnchors:
         )
         for raw in book.positions:
             for key in (
-                "entry_delta", "last_delta", "entry_iv", "last_iv", "greeks_as_of",
+                "entry_delta", "last_delta", "entry_iv", "last_iv",
+                "entry_gamma", "last_gamma", "entry_theta", "last_theta",
+                "entry_vega", "last_vega", "greeks_as_of",
             ):
                 raw.pop(key, None)
 

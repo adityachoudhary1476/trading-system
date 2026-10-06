@@ -2709,6 +2709,10 @@ def run() -> int:
         )
         return 0
 
+    from trading_system.autonomous.bot_config import apply_greeks_production_defaults
+
+    apply_greeks_production_defaults()
+
     db_url = _env_db_url()
     if not db_url:
         logger.error(

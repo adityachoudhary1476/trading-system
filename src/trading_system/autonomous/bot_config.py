@@ -7,6 +7,8 @@ intelligence — pure domain model for the autonomous layer boundary.
 
 from __future__ import annotations
 
+import math
+import os
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Optional
@@ -91,6 +93,161 @@ class TradingSessionConstraints(BaseModel):
     )
 
 
+class GreeksPolicyConfig(BaseModel):
+    """Phase-by-phase switches for the greeks decision layer (decision D2).
+
+    Every field defaults to today's behaviour: the layer is inert until each
+    phase is opted into deliberately, so a bot that never sets an
+    AUTONOMOUS_GREEKS_* variable trades exactly as it did before the layer
+    existed, and any phase can be rolled back by unsetting one variable.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    enabled: bool = Field(
+        default=False,
+        description="Master switch: evaluate greeks and attach the trust verdict (phase 1).",
+    )
+    shadow: bool = Field(
+        default=False,
+        description="Phase 0: compute and record what the layer would do, changing nothing.",
+    )
+    target_delta: Optional[float] = Field(
+        default=None,
+        description="Phase 2: target delta for strike selection; None keeps the legacy price offset.",
+    )
+    delta_tolerance: float = Field(
+        default=0.10,
+        ge=0.0,
+        le=1.0,
+        description="Phase 2: half-width of the acceptable delta band around target_delta.",
+    )
+    target_delta_by_strategy: dict[str, float] = Field(
+        default_factory=dict,
+        description=(
+            "Phase 2: per strategy-family target delta. An entry overrides the "
+            "global target_delta for that strategy family; an unknown family "
+            "falls back to target_delta. Empty keeps the global target only."
+        ),
+    )
+    risk_sizing: bool = Field(
+        default=False,
+        description="Phase 3: size legs to a risk budget instead of a fixed contract count.",
+    )
+    risk_budget_pct: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Phase 3: max loss per position as a fraction of capital. None "
+            "falls back to max_position_allocation_pct so the risk budget is "
+            "never silently unbounded."
+        ),
+    )
+    portfolio_limits: bool = Field(
+        default=False,
+        description="Phase 4: enforce aggregated portfolio greek limits.",
+    )
+    max_net_delta: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description=(
+            "Phase 4 cap on abs(net portfolio delta). None leaves delta "
+            "uncapped; 0.0 is a real cap of no net delta."
+        ),
+    )
+    max_net_gamma: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Phase 4 cap on abs(net portfolio gamma). None leaves it uncapped.",
+    )
+    max_net_theta: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Phase 4 cap on abs(net portfolio theta). None leaves it uncapped.",
+    )
+    max_net_vega: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        description="Phase 4 cap on abs(net portfolio vega). None leaves it uncapped.",
+    )
+
+
+def greeks_policy_from_env() -> GreeksPolicyConfig:
+    """Build the greeks policy from AUTONOMOUS_GREEKS_* environment variables.
+
+    Mirrors the AUTONOMOUS_DELTA_DECAY_ENABLED convention in portfolio.py:
+    switches are read at call time and only the recognised truthy spellings
+    turn a phase on, so unset, empty or typo'd variables fail safe to "off"
+    and the feature ships dark. A malformed target delta degrades to None
+    instead of raising — a bad number must never stop the bot from starting.
+    """
+    return GreeksPolicyConfig(
+        enabled=_env_flag("AUTONOMOUS_GREEKS_ENABLED"),
+        shadow=_env_flag("AUTONOMOUS_GREEKS_SHADOW"),
+        target_delta=_env_float("AUTONOMOUS_GREEKS_TARGET_DELTA"),
+        risk_sizing=_env_flag("AUTONOMOUS_GREEKS_RISK_SIZING"),
+        risk_budget_pct=_env_float("AUTONOMOUS_GREEKS_RISK_BUDGET_PCT"),
+        portfolio_limits=_env_flag("AUTONOMOUS_GREEKS_PORTFOLIO_LIMITS"),
+        max_net_delta=_env_float("AUTONOMOUS_GREEKS_MAX_NET_DELTA"),
+        max_net_gamma=_env_float("AUTONOMOUS_GREEKS_MAX_NET_GAMMA"),
+        max_net_theta=_env_float("AUTONOMOUS_GREEKS_MAX_NET_THETA"),
+        max_net_vega=_env_float("AUTONOMOUS_GREEKS_MAX_NET_VEGA"),
+    )
+
+
+def _env_flag(name: str) -> bool:
+    """True only for the recognised truthy spellings; everything else off."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_float(name: str) -> Optional[float]:
+    """Parse an optional float; absent, blank, malformed or non-finite -> None.
+
+    NaN and infinity parse as floats but are useless in a delta band — they
+    would poison every comparison downstream — so they are treated as
+    malformed and the default stands.
+    """
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    return value if math.isfinite(value) else None
+
+
+# --------------------------------------------------------------------------- #
+# Greeks production defaults (decision D2)
+# --------------------------------------------------------------------------- #
+
+# Operator-agreed baseline for production. ``apply_greeks_production_defaults``
+# fills only variables the operator has not set, so the layer — and every phase
+# — stays reversible from the environment without a redeploy.
+GREEKS_PRODUCTION_DEFAULTS: dict[str, str] = {
+    "AUTONOMOUS_GREEKS_ENABLED": "true",
+    "AUTONOMOUS_GREEKS_SHADOW": "false",
+    "AUTONOMOUS_GREEKS_TARGET_DELTA": "0.50",
+    "AUTONOMOUS_GREEKS_RISK_SIZING": "true",
+    "AUTONOMOUS_GREEKS_PORTFOLIO_LIMITS": "true",
+    "AUTONOMOUS_GREEKS_MAX_NET_DELTA": "5.0",
+    "AUTONOMOUS_GREEKS_EXITS_ENABLED": "true",
+}
+
+
+def apply_greeks_production_defaults() -> None:
+    """Default the greeks decision layer ON for production processes.
+
+    Fills only variables the operator has not already set (``os.environ``
+    ``setdefault``), so any operator-supplied value — including a falsy one that
+    disables a phase — wins. Called at startup by the scheduler worker and by
+    the FastAPI API so a manual "Run tick now" behaves like the worker.
+    """
+    for name, value in GREEKS_PRODUCTION_DEFAULTS.items():
+        os.environ.setdefault(name, value)
+
+
 # --------------------------------------------------------------------------- #
 # Autonomous Bot Config — the complete policy model.
 # Note: USER_CONSTRAINTS are immutable; the AutonomousController must validate
@@ -125,7 +282,7 @@ class UserConstraints(BaseModel):
     )
     # Maximum simultaneous positions across all deployments managed by this bot.
     max_simultaneous_positions: int = Field(
-        default=1,
+        default=5,
         ge=1,
         description="Maximum number of open positions allowed across all bot deployments.",
     )
@@ -194,7 +351,7 @@ class AutonomousBotConfig(BaseModel):
         description="How the bot's instrument universe is defined.",
     )
     max_simultaneous_positions: int = Field(
-        default=1,
+        default=5,
         ge=1,
         description="Max open positions across all bot deployments.",
     )
@@ -232,6 +389,12 @@ class AutonomousBotConfig(BaseModel):
         default=None,
         ge=0,
         description="Autonomous decision interval in seconds. None = manual trigger only.",
+    )
+    # Greeks decision layer (phases 0-4). Off by default on every axis so the
+    # layer is behaviourally inert until an operator opts each phase in.
+    greeks_policy: GreeksPolicyConfig = Field(
+        default_factory=GreeksPolicyConfig,
+        description="Greeks decision-layer policy: shadow, target delta, risk sizing, limits.",
     )
 
     # ------------------------------------------------------------------ #

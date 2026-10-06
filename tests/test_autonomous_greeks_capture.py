@@ -45,6 +45,12 @@ def _pos(**kwargs):
         last_delta=None,
         entry_iv=None,
         last_iv=None,
+        entry_gamma=None,
+        last_gamma=None,
+        entry_theta=None,
+        last_theta=None,
+        entry_vega=None,
+        last_vega=None,
         greeks_as_of=None,
     )
     age = kwargs.pop("age_seconds", 0.0)
@@ -87,6 +93,33 @@ class TestEntryAnchoring:
         assert pos.entry_iv == pytest.approx(0.15)
         assert pos.last_iv == pytest.approx(0.15)
         assert pos.greeks_as_of is not None
+
+    def test_anchors_gamma_theta_and_vega_alongside_delta(self):
+        """All four greeks come from the one quote, anchored together.
+
+        The portfolio caps are measured against gamma/theta/vega as well as
+        delta, so those readings must be persisted with the same freshness rule
+        as delta rather than left to be recomputed against a later market.
+        """
+        pos = _capture(_pos(), _quote(), _ltp())
+        for name in ("gamma", "theta", "vega"):
+            entry = getattr(pos, f"entry_{name}")
+            last = getattr(pos, f"last_{name}")
+            assert entry is not None
+            assert last == pytest.approx(entry)
+        # An ATM call has positive gamma and negative theta; the sign is worth
+        # pinning because the caps judge net exposure, not magnitude.
+        assert pos.entry_gamma > 0.0
+        assert pos.entry_theta < 0.0
+
+    def test_late_anchor_records_current_wider_greeks_but_not_the_anchor(self):
+        pos = _capture(_pos(age_seconds=3 * 86400.0), _quote(), _ltp())
+        assert pos.entry_gamma is None
+        assert pos.entry_theta is None
+        assert pos.entry_vega is None
+        assert pos.last_gamma is not None
+        assert pos.last_theta is not None
+        assert pos.last_vega is not None
 
     def test_refuses_a_late_anchor_but_still_records_the_current_delta(self):
         """The trap this rule exists to prevent.
@@ -162,6 +195,9 @@ class TestSpotResolution:
                        spot_price=None)
         assert pos.entry_delta is None
         assert pos.last_delta is None
+        assert pos.last_gamma is None
+        assert pos.last_theta is None
+        assert pos.last_vega is None
         assert pos.greeks_as_of is None
 
     def test_uncomputeable_greeks_leave_the_position_untouched(self):

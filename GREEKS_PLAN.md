@@ -1,5 +1,10 @@
 # Plan: Greeks / OI / IV Analytics for NIFTY Options Paper Trading
 
+> **Scope note.** This document covers the *observational* greeks surface that has shipped.
+> Using greeks to **decide** trades — strike selection, sizing, portfolio limits, exits — is
+> specified separately in [`docs/GREEKS_DECISION_LAYER.md`](docs/GREEKS_DECISION_LAYER.md),
+> which is implemented (Phases 0–5, PAPER-only, env-gated and reversible).
+
 ## Status (updated)
 
 Shipped, paper-only, all deterministic:

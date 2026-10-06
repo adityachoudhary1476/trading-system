@@ -25,14 +25,19 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from math import sqrt, exp
-from typing import Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, Optional, Protocol
 
 from trading_system.execution.orders import OrderIntent, OrderType, Side
 from trading_system.india.instruments import OptionType
 from trading_system.strategy_factory.contract import SignalAction
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids any import cycle
+    from trading_system.autonomous.bot_config import GreeksPolicyConfig
+    from trading_system.autonomous.decision import TradingDecision
+    from trading_system.autonomous.greeks_policy import GreeksVerdict
 
 
 # --------------------------------------------------------------------------- #
@@ -263,6 +268,10 @@ class OptionsTradePlan:
     confidence: float
     signal_action: str           # "buy" / "sell" / "exit" / "hold"
     notes: str = ""
+    # Greeks decision layer (Phases 0-1). One verdict per leg, in leg order.
+    # Empty when the layer is disabled or the plan predates the layer, so a
+    # disabled layer leaves this field at its default and changes nothing.
+    greek_verdicts: tuple["GreeksVerdict", ...] = ()
 
     def to_order_intents(self) -> list[OrderIntent]:
         """Convert legs to ``OrderIntent`` objects for the ``PaperBroker``.
@@ -316,6 +325,17 @@ class OptionsTradePlan:
             "confidence": self.confidence,
             "signal_action": self.signal_action,
             "notes": self.notes,
+            "greek_verdicts": [
+                {
+                    "available": v.available,
+                    "iv_source": v.iv_source,
+                    "missing": list(v.missing),
+                    "fallback_reason": v.fallback_reason,
+                    "instrument_key": v.instrument_key,
+                    "delta": v.greeks.delta if v.greeks is not None else None,
+                }
+                for v in self.greek_verdicts
+            ],
         }
 
     @property
@@ -650,6 +670,25 @@ class OptionContractResolver:
 # Options Structure Builder — main Phase 8 entry point
 # --------------------------------------------------------------------------- #
 
+@dataclass(frozen=True)
+class _LayerContext:
+    """Per-call inputs for the greeks decision layer (Phases 2-3).
+
+    Set for the duration of a single ``build`` call and cleared in a
+    ``finally`` so one builder instance cannot leak selection parameters into
+    the next call. All fields are inert when the policy is off.
+    """
+
+    policy: Optional["GreeksPolicyConfig"] = None
+    now: Optional[datetime] = None
+    metrics: Optional[Any] = None
+    target_delta: Optional[float] = None
+    delta_tolerance: float = 0.10
+    risk_sizing: bool = False
+    risk_budget: Optional[float] = None
+    notional_cap: Optional[float] = None
+
+
 class OptionsStructureBuilder:
     """Converts a ``TradingDecision`` into an ``OptionsTradePlan``.
 
@@ -662,6 +701,7 @@ class OptionsStructureBuilder:
 
     def __init__(self) -> None:
         self._resolver = OptionContractResolver()
+        self._ctx: Optional[_LayerContext] = None
 
     def build(
         self,
@@ -670,6 +710,14 @@ class OptionsStructureBuilder:
         chain_provider: OptionsChainProvider,
         config: Optional[OptionsTradeConfig] = None,
         existing_positions: Optional[list[OptionLeg]] = None,
+        greeks_policy: Optional["GreeksPolicyConfig"] = None,
+        greeks_metrics: Optional[Any] = None,
+        now: Optional[datetime] = None,
+        target_delta: Optional[float] = None,
+        delta_tolerance: float = 0.10,
+        risk_sizing: bool = False,
+        risk_budget: Optional[float] = None,
+        notional_cap: Optional[float] = None,
     ) -> Optional[OptionsTradePlan]:
         """Build an ``OptionsTradePlan`` from a Phase 5 ``TradingDecision``.
 
@@ -685,9 +733,67 @@ class OptionsStructureBuilder:
         existing_positions
             Existing option legs for EXIT scenarios (Phase 8+). If ``None``
             and the signal is EXIT, an empty closing plan is returned.
+        greeks_policy
+            The greeks decision-layer policy (Phase 0/1). ``None`` or a
+            disabled policy leaves the plan byte-identical to the legacy path;
+            no greeks are computed and no clock is read.
+        greeks_metrics
+            Optional ``GreeksMetrics`` sink for per-decision counters. Ignored
+            when the policy is off.
+        now
+            Injected reference time (D5). Required for greeks to be usable; when
+            the policy is on but ``now`` is ``None`` the verdict degrades to
+            ``no_reference_time`` (unavailable) and the plan is unchanged.
+        target_delta
+            Phase 2 target delta for the near leg. ``None`` keeps the legacy
+            price-offset strike selection, so an unset value is byte-identical
+            to the pre-greeks builder.
+        delta_tolerance
+            Phase 2 half-width of the acceptable delta band around
+            ``target_delta``.
+        risk_sizing
+            Phase 3 switch: derive each leg's quantity from ``risk_budget`` and
+            ``notional_cap`` instead of ``config.max_contracts_per_leg``.
+        risk_budget
+            Phase 3 max loss per position in account currency.
+        notional_cap
+            Phase 3 max notional per position in account currency.
         """
         cfg = config or OptionsTradeConfig()
+        self._ctx = _LayerContext(
+            policy=greeks_policy,
+            now=now,
+            metrics=greeks_metrics,
+            target_delta=target_delta,
+            delta_tolerance=delta_tolerance,
+            risk_sizing=risk_sizing,
+            risk_budget=risk_budget,
+            notional_cap=notional_cap,
+        )
+        try:
+            return self._build_with_context(
+                decision=decision,
+                chain_provider=chain_provider,
+                cfg=cfg,
+                existing_positions=existing_positions,
+                greeks_policy=greeks_policy,
+                greeks_metrics=greeks_metrics,
+                now=now,
+            )
+        finally:
+            self._ctx = None
 
+    def _build_with_context(
+        self,
+        *,
+        decision: "TradingDecision",
+        chain_provider: OptionsChainProvider,
+        cfg: OptionsTradeConfig,
+        existing_positions: Optional[list[OptionLeg]],
+        greeks_policy: Optional["GreeksPolicyConfig"],
+        greeks_metrics: Optional[Any],
+        now: Optional[datetime],
+    ) -> Optional[OptionsTradePlan]:
         signal = decision.signal
         if signal is None or not decision.is_valid:
             return None
@@ -718,7 +824,8 @@ class OptionsStructureBuilder:
             if mapping.exit_strategy:
                 strategy = mapping.exit_strategy
             else:
-                return self._build_exit(decision, chain, cfg, existing_positions)
+                plan = self._build_exit(decision, chain, cfg, existing_positions)
+                return self._apply_greeks(plan, chain, greeks_policy, greeks_metrics, now)
         else:
             return None
 
@@ -741,7 +848,140 @@ class OptionsStructureBuilder:
             return None
 
         plan = builder(decision, chain, cfg, spot)
-        return plan
+        return self._apply_greeks(plan, chain, greeks_policy, greeks_metrics, now)
+
+    # ---------------------------------------------------------------- #
+    # Greeks decision layer (Phase 0 shadow / Phase 1 trust predicate)
+    # ---------------------------------------------------------------- #
+
+    def _apply_greeks(
+        self,
+        plan: Optional[OptionsTradePlan],
+        chain: OptionsChain,
+        policy: Optional["GreeksPolicyConfig"],
+        metrics: Optional[Any],
+        now: Optional[datetime],
+    ) -> Optional[OptionsTradePlan]:
+        """Attach one ``GreeksVerdict`` per leg when the layer is enabled.
+
+        Fail-open (D1): this never drops or rewrites a leg, never changes sizing
+        and never refuses the plan. When the policy is ``None`` or both
+        ``enabled`` and ``shadow`` are false it returns the *same* plan object,
+        so a disabled layer is byte-identical to the legacy path and adds no
+        clock reads or provider calls.
+        """
+        if plan is None or policy is None:
+            return plan
+        if not (getattr(policy, "enabled", False) or getattr(policy, "shadow", False)):
+            return plan
+
+        from dataclasses import replace as _replace
+
+        from trading_system.autonomous.greeks_policy import evaluate_candidate
+
+        verdicts: list["GreeksVerdict"] = []
+        for leg in plan.legs:
+            inst = leg.instrument
+            quote = chain.get_quote(inst.strike, inst.option_type)
+            verdict = evaluate_candidate(
+                instrument=inst, quote=quote, chain=chain, now=now
+            )
+            if verdict.instrument_key is None:
+                verdict = _replace(verdict, instrument_key=inst.contract_id)
+            verdicts.append(verdict)
+            if metrics is not None:
+                metrics.record_evaluated(verdict.available, verdict.fallback_reason)
+        return _replace(plan, greek_verdicts=tuple(verdicts))
+
+    # ---------------------------------------------------------------- #
+    # Phase 2 / Phase 3 — target-delta selection and risk-based sizing
+    # ---------------------------------------------------------------- #
+
+    def _near_instrument(
+        self,
+        *,
+        chain: OptionsChain,
+        option_type: OptionType,
+        cfg: OptionsTradeConfig,
+    ) -> Optional[OptionsInstrument]:
+        """Select the near leg by target delta, else fall back to the price offset.
+
+        Fail-open (D1): when no target delta is configured, the selection fails
+        or the quote is unusable, this delegates to the legacy
+        ``OptionContractResolver`` so the plan is unchanged.
+        """
+        ctx = self._ctx
+        target = ctx.target_delta if ctx is not None else None
+        if target is not None:
+            from trading_system.autonomous.greeks_selection import (
+                select_by_target_delta,
+            )
+
+            selection = select_by_target_delta(
+                chain=chain,
+                option_type=option_type,
+                target_delta=target,
+                delta_tolerance=ctx.delta_tolerance,
+                now=ctx.now,
+            )
+            if selection is not None:
+                if ctx.metrics is not None:
+                    ctx.metrics.record_strike_selected("target_delta")
+                return OptionsInstrument(
+                    underlying=chain.underlying,
+                    expiry=chain.expiry,
+                    strike=selection.strike,
+                    option_type=option_type,
+                    exchange="NFO",
+                )
+            if ctx.metrics is not None:
+                ctx.metrics.record_strike_selected("legacy")
+
+        if option_type == OptionType.CE:
+            return self._resolver.resolve_call(
+                chain=chain, moneyness_offset=cfg.moneyness_offset
+            )
+        return self._resolver.resolve_put(
+            chain=chain, moneyness_offset=cfg.moneyness_offset
+        )
+
+    def _leg_quantity(
+        self,
+        *,
+        chain: OptionsChain,
+        instrument: OptionsInstrument,
+        quote: OptionQuote,
+        cfg: OptionsTradeConfig,
+    ) -> float:
+        """Size a single-leg position from the risk budget (Phase 3, fail-open).
+
+        Returns ``config.max_contracts_per_leg`` unchanged unless risk sizing is
+        on, a usable greeks verdict exists and the budget yields at least one
+        contract. Multi-leg structures keep the legacy fixed quantity because a
+        leg's premium is not the structure's risk.
+        """
+        ctx = self._ctx
+        if ctx is None or not ctx.risk_sizing:
+            return cfg.max_contracts_per_leg
+
+        from trading_system.autonomous.greeks_policy import evaluate_candidate
+        from trading_system.autonomous.greeks_sizing import size_for_risk_budget
+
+        verdict = evaluate_candidate(
+            instrument=instrument, quote=quote, chain=chain, now=ctx.now
+        )
+        result = size_for_risk_budget(
+            verdict=verdict,
+            risk_budget=ctx.risk_budget if ctx.risk_budget is not None else 0.0,
+            notional_cap=ctx.notional_cap if ctx.notional_cap is not None else 0.0,
+            max_contracts=cfg.max_contracts_per_leg,
+            contract_multiplier=cfg.contract_multiplier,
+        )
+        if result is None or result.quantity <= 0:
+            return cfg.max_contracts_per_leg
+        if ctx.metrics is not None:
+            ctx.metrics.record_sizing(result.bound_by)
+        return float(result.quantity)
 
     # ---------------------------------------------------------------- #
     # Single-leg strategies
@@ -754,16 +994,16 @@ class OptionsStructureBuilder:
         cfg: OptionsTradeConfig,
         spot: float,
     ) -> Optional[OptionsTradePlan]:
-        inst = self._resolver.resolve_call(
-            chain=chain, moneyness_offset=cfg.moneyness_offset
-        )
+        inst = self._near_instrument(chain=chain, option_type=OptionType.CE, cfg=cfg)
         if inst is None:
             return None
         quote = chain.get_quote(inst.strike, OptionType.CE)
         if quote is None:
             return None
 
-        qty = cfg.max_contracts_per_leg
+        qty = self._leg_quantity(
+            chain=chain, instrument=inst, quote=quote, cfg=cfg
+        )
         premium = quote.ask
         cost = premium * qty
 
@@ -789,16 +1029,16 @@ class OptionsStructureBuilder:
         cfg: OptionsTradeConfig,
         spot: float,
     ) -> Optional[OptionsTradePlan]:
-        inst = self._resolver.resolve_put(
-            chain=chain, moneyness_offset=cfg.moneyness_offset
-        )
+        inst = self._near_instrument(chain=chain, option_type=OptionType.PE, cfg=cfg)
         if inst is None:
             return None
         quote = chain.get_quote(inst.strike, OptionType.PE)
         if quote is None:
             return None
 
-        qty = cfg.max_contracts_per_leg
+        qty = self._leg_quantity(
+            chain=chain, instrument=inst, quote=quote, cfg=cfg
+        )
         premium = quote.ask
         cost = premium * qty
 
@@ -829,7 +1069,7 @@ class OptionsStructureBuilder:
         spot: float,
     ) -> Optional[OptionsTradePlan]:
         """Buy call (near) + Sell call (far) — bullish debit spread."""
-        near = self._resolver.resolve_call(chain=chain, moneyness_offset=cfg.moneyness_offset)
+        near = self._near_instrument(chain=chain, option_type=OptionType.CE, cfg=cfg)
         if near is None:
             return None
         near_q = chain.get_quote(near.strike, OptionType.CE)
@@ -885,7 +1125,7 @@ class OptionsStructureBuilder:
         spot: float,
     ) -> Optional[OptionsTradePlan]:
         """Sell call (near) + Buy call (far) — bearish credit spread."""
-        near = self._resolver.resolve_call(chain=chain, moneyness_offset=cfg.moneyness_offset)
+        near = self._near_instrument(chain=chain, option_type=OptionType.CE, cfg=cfg)
         if near is None:
             return None
         near_q = chain.get_quote(near.strike, OptionType.CE)
@@ -945,7 +1185,7 @@ class OptionsStructureBuilder:
         spot: float,
     ) -> Optional[OptionsTradePlan]:
         """Sell put (near) + Buy put (far) — bullish credit spread."""
-        near = self._resolver.resolve_put(chain=chain, moneyness_offset=cfg.moneyness_offset)
+        near = self._near_instrument(chain=chain, option_type=OptionType.PE, cfg=cfg)
         if near is None:
             return None
         near_q = chain.get_quote(near.strike, OptionType.PE)
@@ -1001,7 +1241,7 @@ class OptionsStructureBuilder:
         spot: float,
     ) -> Optional[OptionsTradePlan]:
         """Buy put (near) + Sell put (far) — bearish debit spread."""
-        near = self._resolver.resolve_put(chain=chain, moneyness_offset=cfg.moneyness_offset)
+        near = self._near_instrument(chain=chain, option_type=OptionType.PE, cfg=cfg)
         if near is None:
             return None
         near_q = chain.get_quote(near.strike, OptionType.PE)

@@ -16,7 +16,7 @@ introduces a path to live/real order execution.
 
 from __future__ import annotations
 
-from typing import Any, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -104,6 +104,9 @@ from .safety import (
     SafetyResult,
     SafetyValidator,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from .bot_config import GreeksPolicyConfig
 
 
 # --------------------------------------------------------------------------- #
@@ -261,6 +264,7 @@ class AutonomousController(BaseModel):
     _instrument_repo: Optional[InstrumentRepository] = None
     _quote_provider: Optional[object] = None
     _portfolio: Optional[Any] = None
+    _greeks_metrics: Optional[Any] = None
 
     # ------------------------------------------------------------------ #
     # Construction
@@ -284,6 +288,8 @@ class AutonomousController(BaseModel):
             idempotency=IdempotencyGuard(),
         )
         self._options_builder = OptionsStructureBuilder()
+        from .greeks_metrics import GreeksMetrics
+        self._greeks_metrics = GreeksMetrics()
         self._persistence = persistence
         self._phase23_registry = phase23_registry
 
@@ -1291,6 +1297,186 @@ class AutonomousController(BaseModel):
         """
         self._chain_provider = provider
 
+    # ------------------------------------------------------------------ #
+    # Greeks decision layer (Phases 0-1)
+    # ------------------------------------------------------------------ #
+
+    def _effective_greeks_policy(self) -> "GreeksPolicyConfig":
+        """Static config overlaid by AUTONOMOUS_GREEKS_* env, env winning.
+
+        Environment is the rollout mechanism (D2): a phase switched on in the
+        environment overrides the static config, so rolling back is unsetting a
+        variable rather than redeploying. Both sources default to fully off, so
+        a bot that sets no variables and no config field keeps the legacy path.
+        """
+        from .bot_config import GreeksPolicyConfig, greeks_policy_from_env
+
+        base = getattr(self.config, "greeks_policy", None) or GreeksPolicyConfig()
+        env = greeks_policy_from_env()
+        return GreeksPolicyConfig(
+            enabled=base.enabled or env.enabled,
+            shadow=base.shadow or env.shadow,
+            target_delta=(
+                env.target_delta if env.target_delta is not None else base.target_delta
+            ),
+            delta_tolerance=base.delta_tolerance,
+            target_delta_by_strategy=dict(base.target_delta_by_strategy),
+            risk_sizing=base.risk_sizing or env.risk_sizing,
+            risk_budget_pct=(
+                env.risk_budget_pct
+                if env.risk_budget_pct is not None
+                else base.risk_budget_pct
+            ),
+            portfolio_limits=base.portfolio_limits or env.portfolio_limits,
+            max_net_delta=(
+                env.max_net_delta if env.max_net_delta is not None else base.max_net_delta
+            ),
+            max_net_gamma=(
+                env.max_net_gamma if env.max_net_gamma is not None else base.max_net_gamma
+            ),
+            max_net_theta=(
+                env.max_net_theta if env.max_net_theta is not None else base.max_net_theta
+            ),
+            max_net_vega=(
+                env.max_net_vega if env.max_net_vega is not None else base.max_net_vega
+            ),
+        )
+
+    @staticmethod
+    def _target_delta_for(
+        decision: "TradingDecision", policy: "GreeksPolicyConfig"
+    ) -> Optional[float]:
+        """Resolve the Phase 2 target delta for a decision's strategy family.
+
+        A ``target_delta_by_strategy`` entry overrides the global
+        ``target_delta``; an unknown or absent family falls back to the global
+        value, and an unset global keeps the legacy price-offset selection.
+        """
+        signal = getattr(decision, "signal", None)
+        strategy_id = getattr(signal, "strategy_id", "") if signal else ""
+        if not strategy_id:
+            selected = getattr(decision, "selected_configuration", None)
+            strategy_id = getattr(selected, "strategy_id", "") if selected else ""
+        if strategy_id and strategy_id in policy.target_delta_by_strategy:
+            return policy.target_delta_by_strategy[strategy_id]
+        return policy.target_delta
+
+    def _risk_budgets(
+        self, policy: "GreeksPolicyConfig"
+    ) -> tuple[float, float]:
+        """Derive Phase 3 (risk budget, notional cap) from capital and policy.
+
+        ``risk_budget_pct`` defaults to ``max_position_allocation_pct`` so the
+        risk budget is never silently unbounded.
+        """
+        capital = float(getattr(self.config, "capital_allocation", 0.0) or 0.0)
+        max_alloc = float(
+            getattr(self.config, "max_position_allocation_pct", 0.0) or 0.0
+        )
+        pct = (
+            policy.risk_budget_pct
+            if policy.risk_budget_pct is not None
+            else max_alloc
+        )
+        return capital * float(pct), capital * max_alloc
+
+    def _portfolio_greeks_breach(
+        self,
+        *,
+        positions: Any,
+        spot_price: Optional[float],
+        instrument: Any,
+        quote: Any,
+        signed_quantity: float,
+        option_type: Optional[str],
+        policy: "GreeksPolicyConfig",
+        now: Optional[Any] = None,
+    ) -> Optional[Any]:
+        """Phase 4: the first aggregate greek cap a prospective entry would break.
+
+        Aggregation and arithmetic only (D8): the current book is read from the
+        broker's positions, the candidate's greeks are priced from the same
+        quote the fill will use, and the verdict is a plain
+        ``PortfolioLimitBreach`` the caller can log and refuse on. Fails open on
+        any doubt -- no usable candidate greeks, an unreadable position or an
+        unexpected error all return ``None`` so an unmeasurable trade is never
+        blocked by this layer (D1).
+        """
+        from .greeks import normalise_iv
+        from .greeks import greeks_from_market_inputs
+        from .portfolio_greeks import (
+            PortfolioGreeksLimits,
+            PositionGreeks,
+            aggregate_positions,
+            check_portfolio_limits,
+        )
+
+        try:
+            limits = PortfolioGreeksLimits(
+                max_net_delta=policy.max_net_delta,
+                max_net_gamma=policy.max_net_gamma,
+                max_net_theta=policy.max_net_theta,
+                max_net_vega=policy.max_net_vega,
+            )
+            candidate_greeks = greeks_from_market_inputs(
+                spot=spot_price,
+                strike=getattr(instrument, "strike", None),
+                expiry=getattr(instrument, "expiry", None),
+                option_type=option_type,
+                ltp=getattr(quote, "ltp", None),
+                quote_iv=normalise_iv(getattr(quote, "implied_vol", None)),
+                now=now,
+            )
+            if candidate_greeks is None:
+                return None
+            candidate = PositionGreeks(
+                instrument_key=str(
+                    getattr(instrument, "contract_id", "")
+                    or getattr(instrument, "key", "")
+                ),
+                quantity=float(signed_quantity),
+                contract_size=float(getattr(instrument, "lot_size", 1) or 1.0),
+                delta=candidate_greeks.delta,
+                gamma=candidate_greeks.gamma,
+                theta=candidate_greeks.theta,
+                vega=candidate_greeks.vega,
+            )
+            current = aggregate_positions(positions)
+            return check_portfolio_limits(
+                current=current, candidate=candidate, limits=limits
+            )
+        except Exception:  # noqa: BLE001 — fail open, never block on greeks doubt
+            return None
+
+    @property
+    def greeks_metrics(self) -> Any:
+        """Phase 0/1 observability sink (counters + fallback rate)."""
+        return self._greeks_metrics
+
+    def _record_greeks_shadow(
+        self, plan: Optional[OptionsTradePlan], policy: "GreeksPolicyConfig"
+    ) -> None:
+        """Log each leg's shadow verdict when the layer is in shadow mode.
+
+        Nothing here acts on the verdict; it exists so Phase 0 can be soaked
+        and the fallback rate measured before any behaviour changes.
+        """
+        if plan is None or not getattr(policy, "shadow", False):
+            return
+        from .greeks_policy import shadow_decision
+
+        for verdict in plan.greek_verdicts:
+            payload = shadow_decision(verdict, policy)
+            self._record_event(
+                AutonomousEventType.DECISION_CREATED,
+                message=(
+                    f"greeks shadow {payload['instrument_key']}: "
+                    f"available={payload['greeks_available']} "
+                    f"iv_source={payload['iv_source']} "
+                    f"fallback={payload['fallback_reason']}"
+                ),
+            )
+
     def resolve_options_plan(
         self,
         decision: "TradingDecision",
@@ -1332,12 +1518,40 @@ class AutonomousController(BaseModel):
             return None
 
         cfg = config or DEFAULT_OPTIONS_CONFIG
-        return self._options_builder.build(
+        policy = self._effective_greeks_policy()
+        layer_on = policy.enabled or policy.shadow
+        now = None
+        if layer_on:
+            from datetime import datetime as _dt, timezone as _tz
+            now = _dt.now(_tz.utc)
+
+        target_delta = None
+        risk_sizing = False
+        risk_budget = None
+        notional_cap = None
+        if policy.enabled:
+            target_delta = self._target_delta_for(decision, policy)
+            if policy.risk_sizing:
+                risk_sizing = True
+                risk_budget, notional_cap = self._risk_budgets(policy)
+
+        plan = self._options_builder.build(
             decision=decision,
             chain_provider=provider,
             config=cfg,
             existing_positions=existing_positions,
+            greeks_policy=policy,
+            greeks_metrics=self._greeks_metrics if layer_on else None,
+            now=now,
+            target_delta=target_delta,
+            delta_tolerance=policy.delta_tolerance,
+            risk_sizing=risk_sizing,
+            risk_budget=risk_budget,
+            notional_cap=notional_cap,
         )
+        if layer_on:
+            self._record_greeks_shadow(plan, policy)
+        return plan
 
     # ------------------------------------------------------------------ #
     # Phase 8B — Current-market option candidate discovery
@@ -1620,6 +1834,11 @@ class AutonomousController(BaseModel):
         decay test would silently compare a delta with itself, always reporting
         no decay. Refusing to anchor late keeps that failure mode unreachable
         rather than merely unlikely.
+
+        Delta, gamma, theta and vega are all captured from the one quote, and
+        the same anchor/freshness rule governs all four, so the portfolio
+        limits are measured against a single coherent snapshot rather than a
+        mix of vintages.
         """
         from datetime import datetime as _dt, timezone as _tz
 
@@ -1648,8 +1867,14 @@ class AutonomousController(BaseModel):
                 if age is not None and age <= _GREEKS_ANCHOR_WINDOW_SECONDS:
                     pos.entry_delta = greeks.delta
                     pos.entry_iv = greeks.implied_vol
+                    pos.entry_gamma = greeks.gamma
+                    pos.entry_theta = greeks.theta
+                    pos.entry_vega = greeks.vega
             pos.last_delta = greeks.delta
             pos.last_iv = greeks.implied_vol
+            pos.last_gamma = greeks.gamma
+            pos.last_theta = greeks.theta
+            pos.last_vega = greeks.vega
             pos.greeks_as_of = _dt.now(_tz.utc).isoformat()
         except AttributeError:
             # A position stand-in that does not accept the greeks attributes.
@@ -2056,6 +2281,53 @@ class AutonomousController(BaseModel):
 
         # Pre-compute values needed for idempotency replay and OrderIntent.
         # `side` was resolved (and validated) at the top of this method.
+
+        # --- Phase 4: aggregate portfolio greek limits (entries only) ---
+        # A book-level cap constrains *new* risk. Applying it to an exit would
+        # trap exposure the cap exists to limit, so -- like the other entry
+        # policy above -- it runs only when opening. Fails open: an unavailable
+        # book or unpriceable candidate lets the legacy path proceed.
+        if not is_exit:
+            policy = self._effective_greeks_policy()
+            if policy.enabled and policy.portfolio_limits:
+                from datetime import datetime as _dt, timezone as _tz
+
+                positions: list[Any] = []
+                try:
+                    runner = self.control_center.get_runner(sid)
+                    if runner is not None:
+                        positions = list(runner.broker.positions().values())
+                except Exception:  # noqa: BLE001 — unreadable book fails open
+                    positions = []
+                signed_quantity = (
+                    float(order_quantity)
+                    if str(getattr(side, "value", "")).lower() == "buy"
+                    else -float(order_quantity)
+                )
+                breach = self._portfolio_greeks_breach(
+                    positions=positions,
+                    spot_price=spot_price,
+                    instrument=instrument,
+                    quote=quote,
+                    signed_quantity=signed_quantity,
+                    option_type=option_type,
+                    policy=policy,
+                    now=_dt.now(_tz.utc),
+                )
+                if breach is not None:
+                    if self._greeks_metrics is not None:
+                        self._greeks_metrics.record_limit_blocked(breach.limit_name)
+                    self._record_event(
+                        AutonomousEventType.POLICY_VIOLATION,
+                        symbol=instrument.underlying or decision.opportunity_symbol,
+                        message=(
+                            f"option entry blocked by portfolio greek limit "
+                            f"{breach.limit_name}: "
+                            f"{breach.metric}={breach.projected:.4f} exceeds "
+                            f"{breach.limit:.4f} (current {breach.current:.4f})"
+                        ),
+                    )
+                    return None
 
         # --- Feed premium to PaperBroker BEFORE order submission ---
         # This sets _last_price so the broker has a current market price for

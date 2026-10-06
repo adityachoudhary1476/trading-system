@@ -35,6 +35,17 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     logger.info("Starting trading system backend in %s mode", settings.environment)
 
+    # Production runs the greeks decision layer on by default so the API's
+    # manual "Run tick now" matches the scheduler worker. Development/test
+    # processes keep the shipped-dark default and are left untouched.
+    if settings.environment.strip().lower() == "production":
+        from trading_system.autonomous.bot_config import (
+            apply_greeks_production_defaults,
+        )
+
+        apply_greeks_production_defaults()
+        logger.info("Greeks decision layer defaults applied (production)")
+
     # Initialize trading runtime if LIVE_PIPELINE_ENABLED is set
     # The runtime is started on-demand when the first analysis request comes in
     # or when explicitly configured to start at startup

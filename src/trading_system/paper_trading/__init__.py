@@ -67,10 +67,22 @@ class Position:
     # itself and always report no decay. Both stay None when the inputs needed
     # to solve volatility were unavailable, which callers must treat as
     # "greeks unknown" rather than as zero exposure.
+    #
+    # Gamma, theta and vega are captured from the same quote as delta and held
+    # for the same reason: a net-exposure cap must be measured against what the
+    # book actually carries, and recomputing on read would use a later market
+    # than the position was priced at. They follow the same None-means-unknown
+    # contract as delta.
     entry_delta: Optional[float] = None
     last_delta: Optional[float] = None
     entry_iv: Optional[float] = None
     last_iv: Optional[float] = None
+    entry_gamma: Optional[float] = None
+    last_gamma: Optional[float] = None
+    entry_theta: Optional[float] = None
+    last_theta: Optional[float] = None
+    entry_vega: Optional[float] = None
+    last_vega: Optional[float] = None
     greeks_as_of: Optional[str] = None
 
     def has_greeks(self) -> bool:
@@ -164,7 +176,9 @@ class Position:
         if self.opened_at is not None:
             d["opened_at"] = self.opened_at
         for field_name in (
-            "entry_delta", "last_delta", "entry_iv", "last_iv", "greeks_as_of",
+            "entry_delta", "last_delta", "entry_iv", "last_iv",
+            "entry_gamma", "last_gamma", "entry_theta", "last_theta",
+            "entry_vega", "last_vega", "greeks_as_of",
         ):
             value = getattr(self, field_name)
             if value is not None:

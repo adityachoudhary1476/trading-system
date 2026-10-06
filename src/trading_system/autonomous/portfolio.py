@@ -1042,6 +1042,13 @@ class AutonomousPortfolio:
         if self._delta_decay_breached(position):
             return "delta_decay"
 
+        # --- 3c. Greeks-aware exits (opt-in, off by default). Same placement
+        # rule as delta decay: after the configured P&L thresholds so an
+        # optional greeks rule can only close a position sooner, never later.
+        greeks_reason = self._greeks_exit_reason(position)
+        if greeks_reason is not None:
+            return greeks_reason
+
         # --- 4. Strategy-dependent bonuses.
         if strategy_id:
             opportunity = opportunity_by_strategy.get(strategy_id)
@@ -1267,6 +1274,52 @@ class AutonomousPortfolio:
         if retention is None:
             return False
         return retention < self._delta_decay_floor()
+
+    def _greeks_exit_reason(self, position: Any) -> Optional[str]:
+        """The first greeks exit rule that fires for a position, or None.
+
+        Phase 5 wraps ``evaluate_greeks_exit`` with the two env gates that ship
+        it dark: the master greeks switch and the exits switch must both be
+        truthy, mirroring the delta-decay convention so this stays byte-for-byte
+        inert until opted into. The position is read defensively -- only the
+        facts the book persists (entry/last IV, entry/last delta, age) are
+        offered, and anything unreadable keeps the position under the existing
+        thresholds rather than liquidating it on a guess.
+        """
+        from .greeks_exits import (
+            ExitGreeksInput,
+            GreeksExitConfig,
+            evaluate_greeks_exit,
+            greeks_exits_enabled,
+            iv_crush_floor,
+            iv_crush_min_holding_seconds,
+        )
+
+        if not greeks_exits_enabled():
+            return None
+        holding_seconds = None
+        if hasattr(position, "holding_seconds"):
+            try:
+                holding_seconds = position.holding_seconds(now=self._now())
+            except Exception:  # noqa: BLE001
+                holding_seconds = None
+        greeks = ExitGreeksInput(
+            is_option=getattr(position, "is_option", False) is True,
+            entry_delta=getattr(position, "entry_delta", None),
+            last_delta=getattr(position, "last_delta", None),
+            entry_iv=getattr(position, "entry_iv", None),
+            last_iv=getattr(position, "last_iv", None),
+            holding_seconds=holding_seconds,
+        )
+        config = GreeksExitConfig(
+            iv_crush_enabled=True,
+            iv_crush_floor=iv_crush_floor(),
+            min_holding_seconds=iv_crush_min_holding_seconds(),
+        )
+        exit_decision = evaluate_greeks_exit(greeks=greeks, config=config)
+        if exit_decision is None:
+            return None
+        return exit_decision.reason
 
     @staticmethod
     def _underlying_symbol(position_symbol: str) -> str:

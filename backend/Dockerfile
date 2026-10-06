@@ -4,7 +4,8 @@ FROM python:3.11-slim
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app/src:/app/backend
+    PYTHONPATH=/app/src:/app/backend \
+    ENVIRONMENT=production
 
 # Create non-root user
 RUN groupadd -r appuser && useradd -r -g appuser appuser

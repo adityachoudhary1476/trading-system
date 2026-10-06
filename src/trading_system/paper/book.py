@@ -42,9 +42,11 @@ if TYPE_CHECKING:  # pragma: no cover - import cycle avoidance
     from ..execution.paper_broker import PaperBroker
 
 # v2 added the runner bar watermark (``last_processed_bar_timestamp``,
-# ``bar_count``) and per-position ``opened_at``. v1 books are still readable:
-# a missing watermark is reported as "unknown", never as "nothing processed".
-BOOK_SCHEMA_VERSION = 2
+# ``bar_count``) and per-position ``opened_at``. v3 adds the per-position
+# gamma/theta/vega anchors alongside the existing delta/IV ones; the new fields
+# are additive, so older books are still readable and simply report them as
+# absent (unknown), never as zero exposure.
+BOOK_SCHEMA_VERSION = 3
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +129,12 @@ def _position_payload(position: Position) -> dict:
         "last_delta": position.last_delta,
         "entry_iv": position.entry_iv,
         "last_iv": position.last_iv,
+        "entry_gamma": position.entry_gamma,
+        "last_gamma": position.last_gamma,
+        "entry_theta": position.entry_theta,
+        "last_theta": position.last_theta,
+        "entry_vega": position.entry_vega,
+        "last_vega": position.last_vega,
         "greeks_as_of": position.greeks_as_of,
     }
 
@@ -307,6 +315,12 @@ def _position_from_payload(data: dict) -> Position:
         last_delta=data.get("last_delta"),
         entry_iv=data.get("entry_iv"),
         last_iv=data.get("last_iv"),
+        entry_gamma=data.get("entry_gamma"),
+        last_gamma=data.get("last_gamma"),
+        entry_theta=data.get("entry_theta"),
+        last_theta=data.get("last_theta"),
+        entry_vega=data.get("entry_vega"),
+        last_vega=data.get("last_vega"),
         greeks_as_of=data.get("greeks_as_of"),
     )
 
