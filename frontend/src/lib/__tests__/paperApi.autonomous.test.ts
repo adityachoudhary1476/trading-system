@@ -28,7 +28,7 @@ describe("paperApi — autonomous endpoint contracts", () => {
     await paperApi.getAutonomousBot();
     const init = fetchMock.mock.calls[0][1];
     expect(init.method ?? "GET").toBe("GET");
-    expect(fetchMock.mock.calls[0][0]).toContain("/api/paper/autonomous/bot");
+    expect(fetchMock.mock.calls[0][0]).toContain("/autonomous/bot");
   });
 
   it("getAutonomousScan uses GET", async () => {
@@ -69,7 +69,7 @@ describe("paperApi — autonomous endpoint contracts", () => {
     await paperApi.getAutonomousDecisions();
     const init = fetchMock.mock.calls[0][1];
     expect(init.method).toBe("POST");
-    expect(fetchMock.mock.calls[0][0]).toContain("/api/paper/autonomous/decide");
+    expect(fetchMock.mock.calls[0][0]).toContain("/autonomous/decide");
   });
 
   it("setAutonomousBotLifecycle uses POST", async () => {
@@ -83,7 +83,7 @@ describe("paperApi — autonomous endpoint contracts", () => {
     await paperApi.setAutonomousBotLifecycle("start");
     const init = fetchMock.mock.calls[0][1];
     expect(init.method).toBe("POST");
-    expect(fetchMock.mock.calls[0][0]).toContain("/api/paper/autonomous/bot/start");
+    expect(fetchMock.mock.calls[0][0]).toContain("/autonomous/bot/start");
   });
 
   it("stopAutonomousDeployment uses POST", async () => {
@@ -98,7 +98,33 @@ describe("paperApi — autonomous endpoint contracts", () => {
     const init = fetchMock.mock.calls[0][1];
     expect(init.method).toBe("POST");
     expect(fetchMock.mock.calls[0][0]).toContain(
-      "/api/paper/autonomous/deployments/dep-123/stop",
+      "/autonomous/deployments/dep-123/stop",
     );
+  });
+
+  describe("paperApi — loopback dev base (VITE_PAPER_API_URL)", () => {
+    it("getAutonomousBot still uses the route path under a loopback base", async () => {
+      fetchMock.mockResolvedValue({
+        status: 200,
+        ok: true,
+        headers: { get: () => "application/json" },
+        json: async () => ({ bot: { bot_id: "b", state: "running" } }),
+      });
+      const { paperApi } = await import("../paperApi");
+      await paperApi.getAutonomousBot();
+      expect(fetchMock.mock.calls[0][0]).toContain("/autonomous/bot");
+    });
+
+    it("buildPaperApiUrl omits the /api/paper prefix for a loopback base", async () => {
+      const { buildPaperApiUrl } = await import("../paperApi");
+      expect(buildPaperApiUrl("http://127.0.0.1:8765", "/autonomous/bot")).toBe(
+        "http://127.0.0.1:8765/autonomous/bot",
+      );
+    });
+
+    it("buildPaperApiUrl keeps the /api/paper prefix for same-origin (proxy chain)", async () => {
+      const { buildPaperApiUrl } = await import("../paperApi");
+      expect(buildPaperApiUrl("", "/autonomous/bot")).toBe("/api/paper/autonomous/bot");
+    });
   });
 });

@@ -61,11 +61,22 @@ function baseUrl(): string {
   return DEFAULT_BASE;
 }
 
+/**
+ * A loopback dev base (VITE_PAPER_API_URL=http://127.0.0.1:8765) is the
+ * standalone paper-api server, which serves the router paths at the root
+ * (e.g. /autonomous/bot). Same-origin /api/paper/* targets the FastAPI
+ * backend (dev proxy or Vercel → Railway), which mounts the router under
+ * the /api/paper prefix.
+ */
+export function buildPaperApiUrl(base: string, path: string): string {
+  return base ? `${base}${path}` : `${PAPER_API_PREFIX}${path}`;
+}
+
 async function request<T>(
   path: string,
   init?: RequestInit,
 ): Promise<ApiResult<T>> {
-  const url = `${baseUrl()}${PAPER_API_PREFIX}${path}`;
+  const url = buildPaperApiUrl(baseUrl(), path);
 
   let authHeaders: Record<string, string> = {};
   try {
