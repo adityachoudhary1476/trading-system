@@ -56,11 +56,11 @@ def test_book_captures_every_position_not_just_one():
     """
     broker = PaperBroker(initial_cash=100_000.0)
     _open_option(
-        broker, "NSE:NSE_FO|40716", "NSE:NIFTY50|2026-10-06|22800|PE",
+        broker, "NSE:NSE_FO|40716", f"NSE:NIFTY50|{_future_expiry()}|22800|PE",
         2.0, 199.06615, 190.2,
     )
     _open_option(
-        broker, "NSE:NSE_FO|40712", "NSE:NIFTY|2026-10-06|22750|CE",
+        broker, "NSE:NSE_FO|40712", f"NSE:NIFTY|{_future_expiry()}|22750|CE",
         1.0, 171.335625, 181.3,
     )
 
@@ -75,7 +75,7 @@ def test_book_captures_every_position_not_just_one():
     # Option contract metadata is what lets the exit path resolve the
     # underlying after a restart, so it must survive.
     pe = next(p for p in book.positions if p["symbol"] == "NSE:NSE_FO|40716")
-    assert pe["options_contract_id"] == "NSE:NIFTY50|2026-10-06|22800|PE"
+    assert pe["options_contract_id"] == f"NSE:NIFTY50|{_future_expiry()}|22800|PE"
     assert pe["contract_size"] == 65
     assert pe["option_type"] == "PE"
 
@@ -88,7 +88,7 @@ def test_book_does_not_round_values():
     """
     broker = PaperBroker(initial_cash=100_000.0)
     _open_option(
-        broker, "NSE:NSE_FO|1", "NSE:NIFTY|2026-10-06|22750|CE",
+        broker, "NSE:NSE_FO|1", f"NSE:NIFTY|{_future_expiry()}|22750|CE",
         3.0, 171.333333333, 181.7777777,
     )
     book = book_from_broker(broker=broker, session_id="s", deployment_id="d")
@@ -104,11 +104,11 @@ def test_book_does_not_round_values():
 def test_round_trip_restores_positions_cash_and_realized_pnl():
     broker = PaperBroker(initial_cash=100_000.0)
     _open_option(
-        broker, "NSE:NSE_FO|40716", "NSE:NIFTY50|2026-10-06|22800|PE",
+        broker, "NSE:NSE_FO|40716", f"NSE:NIFTY50|{_future_expiry()}|22800|PE",
         2.0, 199.06615, 190.2,
     )
     _open_option(
-        broker, "NSE:NSE_FO|40712", "NSE:NIFTY|2026-10-06|22750|CE",
+        broker, "NSE:NSE_FO|40712", f"NSE:NIFTY|{_future_expiry()}|22750|CE",
         1.0, 171.335625, 181.3,
     )
     broker._realized_pnl = -166.69  # realized on a leg closed earlier
@@ -129,7 +129,7 @@ def test_round_trip_restores_positions_cash_and_realized_pnl():
         "without it silently rewrites reported P&L"
     )
     pe = fresh.positions()["NSE:NSE_FO|40716"]
-    assert pe.options_contract_id == "NSE:NIFTY50|2026-10-06|22800|PE"
+    assert pe.options_contract_id == f"NSE:NIFTY50|{_future_expiry()}|22800|PE"
     assert pe.contract_size == 65
 
 
@@ -144,9 +144,9 @@ def test_round_trip_preserves_the_fill_ledger():
         quantity=2.0,
         order_type="MARKET",
         current_price=199.06615,
-        options_contract_id="NSE:NIFTY50|2026-10-06|22800|PE",
+        options_contract_id=f"NSE:NIFTY50|{_future_expiry()}|22800|PE",
         strike=22800.0,
-        expiry="2026-10-06",
+        expiry=f"{_future_expiry()}",
         option_type="PE",
         contract_size=65,
     )
@@ -168,7 +168,7 @@ def test_malformed_ledger_row_does_not_cost_the_book():
     """One bad ledger row must not cost the positions that protect capital."""
     broker = PaperBroker(initial_cash=100_000.0)
     _open_option(
-        broker, "NSE:NSE_FO|40716", "NSE:NIFTY50|2026-10-06|22800|PE",
+        broker, "NSE:NSE_FO|40716", f"NSE:NIFTY50|{_future_expiry()}|22800|PE",
         2.0, 199.06615, 190.2,
     )
     book = book_from_broker(broker=broker, session_id="s", deployment_id="d")
@@ -271,7 +271,7 @@ def test_save_book_is_upsert_not_refused(store):
     assert store.get_book("s") is not None
 
     _open_option(
-        broker, "NSE:NSE_FO|1", "NSE:NIFTY|2026-10-06|22750|CE", 1.0, 100.0, 110.0
+        broker, "NSE:NSE_FO|1", f"NSE:NIFTY|{_future_expiry()}|22750|CE", 1.0, 100.0, 110.0
     )
     updated = book_from_broker(broker=broker, session_id="s", deployment_id="d")
     store.save_book(updated)  # must NOT raise
@@ -288,7 +288,7 @@ def test_save_book_preserves_created_at_across_updates(store):
     created = store.get_book("s").created_at
 
     _open_option(
-        broker, "NSE:NSE_FO|1", "NSE:NIFTY|2026-10-06|22750|CE", 1.0, 100.0, 110.0
+        broker, "NSE:NSE_FO|1", f"NSE:NIFTY|{_future_expiry()}|22750|CE", 1.0, 100.0, 110.0
     )
     store.save_book(book_from_broker(broker=broker, session_id="s", deployment_id="d"))
 
@@ -362,11 +362,11 @@ def test_open_positions_survive_a_restart(tmp_path):
     )
     sid = center.attach_runner(deployment.deployment_id, runner)
     _open_option(
-        broker, "NSE:NSE_FO|40716", "NSE:NIFTY50|2026-10-06|22800|PE",
+        broker, "NSE:NSE_FO|40716", f"NSE:NIFTY50|{_future_expiry()}|22800|PE",
         2.0, 199.06615, 190.2,
     )
     _open_option(
-        broker, "NSE:NSE_FO|40712", "NSE:NIFTY|2026-10-06|22750|CE",
+        broker, "NSE:NSE_FO|40712", f"NSE:NIFTY|{_future_expiry()}|22750|CE",
         1.0, 171.335625, 181.3,
     )
     assert center.save_live_book(sid) is True
@@ -388,7 +388,7 @@ def test_open_positions_survive_a_restart(tmp_path):
     assert restored_runner.broker.account().cash == pytest.approx(expected_cash)
     assert (
         live["NSE:NSE_FO|40716"].options_contract_id
-        == "NSE:NIFTY50|2026-10-06|22800|PE"
+        == f"NSE:NIFTY50|{_future_expiry()}|22800|PE"
     )
 
 
@@ -473,7 +473,7 @@ def test_book_is_persisted_even_when_the_tick_raises(monkeypatch):
     # A real broker with a real open position, as if an order had just filled.
     broker = PaperBroker(initial_cash=100000.0)
     _open_option(
-        broker, "NSE:NSE_FO|1", "NSE:NIFTY|2026-10-06|22800|PE", 2, 100.0, 101.0
+        broker, "NSE:NSE_FO|1", f"NSE:NIFTY|{_future_expiry()}|22800|PE", 2, 100.0, 101.0
     )
     book = book_from_broker(
         broker=broker, session_id="s1", deployment_id="dep-1"
@@ -513,7 +513,7 @@ def test_book_is_persisted_even_when_the_tick_raises(monkeypatch):
 
     def _fill_then_crash(*_a, **_k):
         _open_option(
-            broker, "NSE:NSE_FO|2", "NSE:NIFTY|2026-10-06|22750|CE", 1, 50.0, 51.0
+            broker, "NSE:NSE_FO|2", f"NSE:NIFTY|{_future_expiry()}|22750|CE", 1, 50.0, 51.0
         )
         raise RuntimeError("tick exploded after submitting the order")
 
@@ -590,7 +590,7 @@ def test_repeated_deployment_post_does_not_wipe_open_positions(tmp_path):
     # The bot opens a position on the live runner.
     live = center.get_runner(sid)
     _open_option(
-        live.broker, "NSE:NSE_FO|40716", "NSE:NIFTY50|2026-10-06|22800|PE",
+        live.broker, "NSE:NSE_FO|40716", f"NSE:NIFTY50|{_future_expiry()}|22800|PE",
         2.0, 199.06615, 190.2,
     )
     assert set(live.broker.positions()) == {"NSE:NSE_FO|40716"}

@@ -53,17 +53,63 @@ def mock_auth():
 
 
 @pytest.fixture
-def client():
+def no_upstox_creds(monkeypatch):
+    """Build the paper API with no authenticated market-data provider.
+
+    Production reads Upstox credentials from ``backend/.env``, and the Upstox
+    provider additionally falls back to ``os.environ``. A developer or CI host
+    may legitimately have those set, but the tests in this module assert the
+    ``no market-data provider configured`` and fail-closed contracts, so we
+    force the adapter's settings to carry no credentials and rebuild the
+    router singleton. This keeps the assertions deterministic (and avoids the
+    real network calls the authenticated bootstrap would make).
+    """
+    from config import Settings, get_settings
+    import routes.paper_api as paper_api_mod
+
+    # Force the trading_system package's lazy dotenv loading to run *before* we
+    # scrub the environment. Importing the Upstox provider (as the adapter does
+    # on first build) triggers ``trading_system.config.settings`` — which calls
+    # ``load_dotenv`` and would otherwise re-populate os.environ with the .env
+    # credentials *after* monkeypatch.delenv has already run.
+    import trading_system.india.upstox  # noqa: F401
+
+    def _no_creds_settings() -> Settings:
+        # Init kwargs outrank both os.environ and backend/.env.
+        return Settings(upstox_client_id="", upstox_service_account_token="")
+
+    get_settings.cache_clear()
+    monkeypatch.setattr(paper_api_mod, "get_settings", _no_creds_settings)
+    for var in (
+        "UPSTOX_CLIENT_ID",
+        "UPSTOX_ACCESS_TOKEN",
+        "UPSTOX_SERVICE_ACCOUNT_TOKEN",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    _reset_paper_singleton()
+    try:
+        yield
+    finally:
+        _reset_paper_singleton()
+        get_settings.cache_clear()
+
+
+@pytest.fixture
+def client(no_upstox_creds):
     """TestClient backed by the production FastAPI app."""
+    _reset_paper_singleton()
     return TestClient(app)
 
 
 @pytest.fixture
-def isolated_client(tmp_path, monkeypatch):
+def isolated_client(tmp_path, no_upstox_creds, monkeypatch):
     """TestClient with a fresh temp SQLite DB for the paper API."""
+    from config import get_settings
+
     _reset_paper_singleton()
     db_path = tmp_path / "test_paper.db"
     monkeypatch.setenv("MARKET_DATA_DB_URL", f"sqlite:///{db_path}")
+    get_settings.cache_clear()
     _reset_paper_singleton()
     with TestClient(app) as c:
         yield c
@@ -500,12 +546,14 @@ class TestAutonomousWiring:
             "options data"
         )
 
-    def test_market_data_callable_is_fail_closed(self):
+    def test_market_data_callable_is_fail_closed(self, no_upstox_creds):
         """The market_data_callable must return None when Upstox is unauthenticated.
 
         This guarantees that scanners reject every symbol as MISSING_MARKET_DATA
         rather than fabricating data — the production fail-closed contract.
         """
+        # ``no_upstox_creds`` clears credentials from both settings and the
+        # environment; the provider patch below is a belt-and-braces guard.
         # Patch the provider to a known-unauthenticated state.
         from trading_system.india import upstox as upstox_mod
         original_provider = upstox_mod.UpstoxMarketDataProvider

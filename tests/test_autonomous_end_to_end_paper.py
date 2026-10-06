@@ -969,8 +969,12 @@ class TestRealSchedulerTickExecutes:
         """Idempotency across ticks: a repeated signal must not stack orders.
 
         The per-tick ``seen`` set only dedupes within one tick. Across ticks
-        the durable ``client_order_id`` is the real guard, and this is the
-        only place that behaviour is observed on a genuine tick.
+        the durable ``client_order_id`` is the backstop, but the primary guard
+        is now the live book fed into the decision pipeline
+        (``generate_strategy_decisions``'s ``position_provider``): a position
+        the bot already holds resolves to HOLD, so a second entry is never
+        even proposed. This test pins the observable invariant - "no second
+        fill" - on both the submissions and the position size.
 
         Asserted on the submission, not on the raw position size. The tick
         also runs ``_run_portfolio_tick``, a second decision engine sharing the
@@ -1005,21 +1009,16 @@ class TestRealSchedulerTickExecutes:
         second = autonomous_scheduler._run_one_tick(controller)
         assert second["result"] == "executed", second
 
-        # Same signal -> same identity -> no new order. The replay path
-        # short-circuits on the durable store before it resolves an order, so
-        # it reports the signal_id but no order_id; the signal_id is the key.
-        replays = [
-            s
+        # The repeated signal must not produce a fresh fill. With the live book
+        # visible to the decision pipeline the signal resolves to HOLD, so the
+        # second tick proposes no entry at all; a replay (``already_executed``)
+        # would be the other acceptable outcome if a signal ever did get
+        # through. Both are "no second fill".
+        assert not any(
+            s.get("result") == "submitted"
+            and s.get("is_idempotent_replay") is False
             for s in second["submissions"]
-            if s.get("result") in ("submitted", "already_executed")
-        ]
-        assert replays, second["submissions"]
-        assert all(
-            s["signal_id"] == first_order["signal_id"] for s in replays
-        ), f"a repeated signal produced a different identity: {replays}"
-        assert all(
-            s.get("result") == "already_executed" for s in replays
-        ), f"a repeated signal placed a second order: {replays}"
+        ), f"a repeated signal placed a second order: {second['submissions']}"
 
         # The durable record still points at the single original order, and the
         # position never grew.

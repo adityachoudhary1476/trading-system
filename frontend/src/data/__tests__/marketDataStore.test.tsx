@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { renderHook, act, render, screen, cleanup } from "@testing-library/react";
+import { renderHook, act, render, screen, cleanup, waitFor } from "@testing-library/react";
 import { marketDataStore, LIVE_QUOTE_POLL_INTERVAL_MS, DEFAULT_POLL_INTERVAL_MS } from "../marketDataStore";
 import { useQuote, useMarketStatus, usePriceDelta, useLiveMarketState } from "../useQuote";
 import { QuoteHeader } from "@/components/market/QuoteAndMetrics";
@@ -234,13 +234,21 @@ describe("useMarketStatus hook", () => {
 
 describe("QuoteHeader freshness badge", () => {
   it("renders a 'fresh' badge once a quote arrives", async () => {
+    // Use a generous staleness window so the badge cannot demote to
+    // "stale" while the test is waiting under load. The point of this
+    // test is the label once a quote arrives, not short-window staleness.
+    marketDataStore.configure({ pollIntervalMs: 50, staleAfterMs: 10_000 });
     setQuote(async (s) => makeQuote(100, s));
     render(<QuoteHeader symbol="NSE:SBIN" />);
-    await wait(60);
-    const badge = screen.getByTestId("freshness");
-    expect(badge.textContent).toMatch(/Updated/);
+    await waitFor(
+      () =>
+        expect(screen.getByTestId("freshness").textContent).toMatch(/Updated/),
+      { timeout: 2000 },
+    );
     // The freshness class lives on the parent div (.freshness)
-    expect(badge.parentElement?.classList.contains("fresh")).toBe(true);
+    expect(
+      screen.getByTestId("freshness").parentElement?.classList.contains("fresh"),
+    ).toBe(true);
   });
 
   it("renders 'stale' when no recent successful fetch", async () => {

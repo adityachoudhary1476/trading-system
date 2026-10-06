@@ -102,7 +102,8 @@ class TestPaperDeploymentMigration:
 
     Note: The test fixture creates a legacy DB at schema version 2 (pre-Phase 8).
     Since Phase 23 (schema v4) is now also present, ``ensure_schema_current``
-    runs both v2→v3 and v3→v4 migrations in one call, returning version 4.
+    runs both v2→v3 and v3→v4 migrations (and any later steps) in one call,
+    returning the current schema version.
     """
 
     def test_create_all_does_not_add_missing_columns(self, legacy_db):
@@ -125,8 +126,8 @@ class TestPaperDeploymentMigration:
         and v3→v4 adds the 7 Phase 23 heartbeat columns."""
         from trading_system.research.evidence import EvidenceStore
         version = EvidenceStore(legacy_db).ensure_schema_current()
-        # Both migrations run; final version is 4 (Phase 23).
-        assert version == 4
+        # Both migrations run; final version is the current schema version.
+        assert version == EvidenceStore.CURRENT_SCHEMA_VERSION
         inspector = inspect(legacy_db)
         cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
         # Phase 8 columns
@@ -147,10 +148,10 @@ class TestPaperDeploymentMigration:
         from trading_system.research.evidence import EvidenceStore
         store = EvidenceStore(legacy_db)
         first = store.ensure_schema_current()
-        assert first == 4
-        # Second call: must not raise.
+        assert first == EvidenceStore.CURRENT_SCHEMA_VERSION
+        
         second = store.ensure_schema_current()
-        assert second == 4
+        assert second == EvidenceStore.CURRENT_SCHEMA_VERSION
         inspector = inspect(legacy_db)
         cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
         assert "options_enabled" in cols
@@ -422,7 +423,7 @@ class TestStrategyParametersJsonHotfix:
         from trading_system.research.evidence import EvidenceStore
         store = EvidenceStore(engine)
         version = store.ensure_schema_current()
-        assert version == 4
+        assert version == EvidenceStore.CURRENT_SCHEMA_VERSION
 
         inspector = inspect(engine)
         cols = {c["name"] for c in inspector.get_columns("paper_deployments")}

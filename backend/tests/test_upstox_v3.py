@@ -414,7 +414,10 @@ class TestUpstoxV3WebSocket:
         assert event.ltp == 100.5
         assert event.close == 99.5
         assert event.symbol == "NSE_EQ|INE020B01018"
-        assert event.exchange == "NSE_EQ"
+        # The exchange is normalized to the V2 form ("NSE", not the raw V3
+        # segment "NSE_EQ") so the same instrument is reported identically
+        # whichever transport produced it.
+        assert event.exchange == "NSE"
 
     def test_normalize_full_feed(self):
         ws = UpstoxV3WebSocket(

@@ -80,7 +80,7 @@ class TestPhase23MigrationSQLite:
         from trading_system.research.evidence import EvidenceStore
         
         version = EvidenceStore(sqlite_legacy_db).ensure_schema_current()
-        assert version == 4
+        assert version == EvidenceStore.CURRENT_SCHEMA_VERSION
         
         inspector = inspect(sqlite_legacy_db)
         cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
@@ -100,10 +100,10 @@ class TestPhase23MigrationSQLite:
         
         store = EvidenceStore(sqlite_legacy_db)
         first = store.ensure_schema_current()
-        assert first == 4
+        assert first == EvidenceStore.CURRENT_SCHEMA_VERSION
         
         second = store.ensure_schema_current()
-        assert second == 4
+        assert second == EvidenceStore.CURRENT_SCHEMA_VERSION
         
         inspector = inspect(sqlite_legacy_db)
         cols = {c["name"] for c in inspector.get_columns("paper_deployments")}
@@ -174,7 +174,7 @@ class TestPhase23MigrationPostgreSQLDDL:
                 result = store.ensure_schema_current()
                 
                 # Verify TIMESTAMPTZ was used in DDL
-                assert result == 4
+                assert result == EvidenceStore.CURRENT_SCHEMA_VERSION
                 
                 # Check that all timestamp columns use TIMESTAMPTZ
                 timestamp_cols = [
@@ -231,7 +231,7 @@ class TestPhase23MigrationPostgreSQLDDL:
                 
                 result = store.ensure_schema_current()
                 
-                assert result == 4
+                assert result == EvidenceStore.CURRENT_SCHEMA_VERSION
                 
                 # Check that all timestamp columns use DATETIME for SQLite
                 timestamp_cols = [
